@@ -3,14 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 
-from .blocks.fpn import FPN, DsBnRelu
-from .blocks.cbam import CBAM
+from .backbone.mobilenetv2 import mobilenet_v2
 from .blocks.adapter import DINOV3Wrapper, DenseAdapterLite
+from .blocks.cbam import CBAM
 from .blocks.change_prior import AdaptiveChangePriorPyramid
 from .blocks.diffatts import TransformerBlock
+from .blocks.fpn import FPN, DsBnRelu
+from .blocks.light_cross_gate import LightCrossGateFusion
 from .blocks.pair_local import PairLocalPyramid
 from .blocks.refine import LearnableSoftMorph
-from .backbone.mobilenetv2 import mobilenet_v2
 
 
 def get_backbone(backbone_name):
@@ -34,11 +35,6 @@ class PyramidFeatureFusion(nn.Module):
         hidden_dim=256,
     ):
         super().__init__()
-        self.in_dims = in_dims
-        self.dense_dim = dense_dim
-        self.hidden_dim = hidden_dim
-        self.patch_size = patch_size
-
         self.c4 = nn.Sequential(
             DsBnRelu(in_dims[3] + hidden_dim, in_dims[3]), CBAM(in_dims[3], 8)
         )
@@ -53,26 +49,13 @@ class PyramidFeatureFusion(nn.Module):
         )
 
     def forward(self, feas, ds_feas):
-        # process backbone (CNN) features
-        x1, x2, x3, x4 = (
-            feas  # [B, 128, 64, 64], [B, 128, 32, 32], [B, 128, 16, 16], [B, 128, 8, 8]
-        )
-        a1, a2, a3, a4 = (
-            ds_feas  # [B, 256, 64, 64], [B, 256, 32, 32], [B, 256, 16, 16], [B, 256, 8, 8]
-        )
+        x1, x2, x3, x4 = feas
+        a1, a2, a3, a4 = ds_feas
 
-        x4 = torch.cat([x4, a4], 1)
-        x4 = self.c4(x4)
-
-        x3 = torch.cat([x3, a3], 1)
-        x3 = self.c3(x3)
-
-        x2 = torch.cat([x2, a2], 1)
-        x2 = self.c2(x2)
-
-        x1 = torch.cat([x1, a1], 1)
-        x1 = self.c1(x1)
-
+        x4 = self.c4(torch.cat([x4, a4], 1))
+        x3 = self.c3(torch.cat([x3, a3], 1))
+        x2 = self.c2(torch.cat([x2, a2], 1))
+        x1 = self.c1(torch.cat([x1, a1], 1))
         return x1, x2, x3, x4
 
 
@@ -90,7 +73,6 @@ class Encoder(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.backbone_name = backbone
         self.backbone = get_backbone(backbone)
         self.fpn = FPN(
             in_channels=self.backbone.channels[-4:],
@@ -101,14 +83,14 @@ class Encoder(nn.Module):
         )
         dense_out_dim = fpn_channels * 2
         self.dino = DINOV3Wrapper(
-    weights_path=dino_weight,
-    device=device,
-    extract_ids=extract_ids,
-    use_lora=kwargs.get("dino_lora", False),
-    lora_r=kwargs.get("dino_lora_r", 8),
-    lora_alpha=kwargs.get("dino_lora_alpha", 16),
-    lora_dropout=kwargs.get("dino_lora_dropout", 0.05),
-)
+            weights_path=dino_weight,
+            device=device,
+            extract_ids=extract_ids,
+            use_lora=kwargs.get("dino_lora", False),
+            lora_r=kwargs.get("dino_lora_r", 8),
+            lora_alpha=kwargs.get("dino_lora_alpha", 16),
+            lora_dropout=kwargs.get("dino_lora_dropout", 0.05),
+        )
         self.dense_adp = DenseAdapterLite(
             in_dim=1024, out_dim=dense_out_dim, bottleneck=fpn_channels // 2
         )
@@ -121,7 +103,7 @@ class Encoder(nn.Module):
 
     def forward_local(self, x):
         fea = self.backbone.forward(x)
-        return self.fpn(fea[-4:])  # p2, p3, p4, p5
+        return self.fpn(fea[-4:])
 
     def forward_dense(self, x):
         ds_fea = self.dino(x)
@@ -131,31 +113,9 @@ class Encoder(nn.Module):
         return self.pff(local_feas, ds_feas)
 
     def forward(self, x):
-        """
-        x1: [B, 3, H, W]
-        x2: [B, 3, H, W]
-        return: [B, 1, H, W]
-        """
         local_feas = self.forward_local(x)
         ds_fea = self.forward_dense(x)
         return self.fuse_pyramid(local_feas, ds_fea)
-
-
-class FuseGated(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.gate = nn.Sequential(nn.Conv2d(2 * dim, dim, 1, bias=True), nn.Sigmoid())
-        self.mix = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.SiLU(inplace=True),
-        )
-
-    def forward(self, x1, x2):
-        x1 = F.interpolate(x1, size=x2.shape[-2:], mode="bilinear", align_corners=False)
-        g = self.gate(torch.cat([x1, x2], dim=1))
-        fused = x2 + g * x1
-        return self.mix(fused)
 
 
 class Detector(nn.Module):
@@ -163,6 +123,10 @@ class Detector(nn.Module):
         self,
         fpn_channels=128,
         n_layers=[1, 1, 1, 1],
+        crossgate_attn_dim=64,
+        crossgate_num_heads=4,
+        crossgate_window_size=5,
+        crossgate_gamma_init=0.1,
         **kwargs,
     ):
         super().__init__()
@@ -178,9 +142,27 @@ class Detector(nn.Module):
                 norm_groups=kwargs.get("acpc_norm_groups", 8),
                 residual_scale=kwargs.get("acpc_residual_scale", 0.05),
             )
-        self.p5_to_p4 = FuseGated(fpn_channels)
-        self.p4_to_p3 = FuseGated(fpn_channels)
-        self.p3_to_p2 = FuseGated(fpn_channels)
+        self.p5_to_p4 = LightCrossGateFusion(
+            dim=fpn_channels,
+            attn_dim=crossgate_attn_dim,
+            num_heads=crossgate_num_heads,
+            window_size=crossgate_window_size,
+            gamma_init=crossgate_gamma_init,
+        )
+        self.p4_to_p3 = LightCrossGateFusion(
+            dim=fpn_channels,
+            attn_dim=crossgate_attn_dim,
+            num_heads=crossgate_num_heads,
+            window_size=crossgate_window_size,
+            gamma_init=crossgate_gamma_init,
+        )
+        self.p3_to_p2 = LightCrossGateFusion(
+            dim=fpn_channels,
+            attn_dim=crossgate_attn_dim,
+            num_heads=crossgate_num_heads,
+            window_size=crossgate_window_size,
+            gamma_init=crossgate_gamma_init,
+        )
 
         self.tb5 = nn.Sequential(
             *[
@@ -258,7 +240,6 @@ class Detector(nn.Module):
         return tuple(torch.abs(feat1 - feat2) for feat1, feat2 in zip(x1s, x2s))
 
     def forward(self, x1s, x2s, size=(256, 256)):
-        ### Extract backbone features
         diff_p2, diff_p3, diff_p4, diff_p5 = self._build_change_priors(x1s, x2s)
 
         fea_p5 = self.tb5(diff_p5)
@@ -273,19 +254,10 @@ class Detector(nn.Module):
         fea_p2 = self.tb2(fea_p2)
         pred_p2 = self.p2_head(fea_p2)
 
-        pred_p2 = F.interpolate(
-            pred_p2, size=size, mode="bilinear", align_corners=False
-        )
-        pred_p3 = F.interpolate(
-            pred_p3, size=size, mode="bilinear", align_corners=False
-        )
-        pred_p4 = F.interpolate(
-            pred_p4, size=size, mode="bilinear", align_corners=False
-        )
-        pred_p5 = F.interpolate(
-            pred_p5, size=size, mode="bilinear", align_corners=False
-        )
-
+        pred_p2 = F.interpolate(pred_p2, size=size, mode="bilinear", align_corners=False)
+        pred_p3 = F.interpolate(pred_p3, size=size, mode="bilinear", align_corners=False)
+        pred_p4 = F.interpolate(pred_p4, size=size, mode="bilinear", align_corners=False)
+        pred_p5 = F.interpolate(pred_p5, size=size, mode="bilinear", align_corners=False)
         return pred_p2, pred_p3, pred_p4, pred_p5
 
 
@@ -329,17 +301,13 @@ class ChangeModel(nn.Module):
 
     @torch.inference_mode()
     def _forward(self, x1, x2):
-        # for inference
         fea1, fea2 = self._encode_pair(x1, x2)
         pred, _, _, _ = self.detector(fea1, fea2, x1.shape[-2:])
         pred = self.refiner(pred)
         return pred
 
     def forward(self, x1, x2):
-        # for training
-        ## change detection
         fea1, fea2 = self._encode_pair(x1, x2)
-
         preds = self.detector(fea1, fea2, x1.shape[-2:])
         final_pred = self.refiner(preds[0])
-        return final_pred, preds  # pred, pred_p2, pred_p3, pred_p4, pred_p5
+        return final_pred, preds

@@ -13,8 +13,8 @@ import torch.optim as optim
 from tqdm import tqdm
 
 from data.cd_dataset import DataLoader
-from model.create_ChangeDINO import create_model
-from option import Options
+from model.create_ChangeDINO_crossgate import create_model
+from option_crossgate import Options
 from util.metric_tool import ConfuseMatrixMeter, cm2score
 from util.util import de_norm, make_numpy_grid
 
@@ -183,7 +183,6 @@ class Trainval(object):
                     data["img2"].to(self.device, non_blocking=True),
                     data["cd_label"].to(self.device, non_blocking=True),
                 )
-
                 loss = focal * self.alpha + dice
                 (loss / accum_steps).backward()
 

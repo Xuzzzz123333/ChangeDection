@@ -1,19 +1,17 @@
-from .ChangeDINO import ChangeModel
-import torch
-from torch import nn
-import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
-from einops import rearrange
 import os
+
+import torch
 import torch.optim as optim
-from .loss.focal import FocalLoss
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from .ChangeDINO_crossgate import ChangeModel
 from .loss.dice import DICELoss
+from .loss.focal import FocalLoss
 
 
 def get_model(backbone_name="mobilenetv2", fpn_channels=128, n_layers=[1, 1, 1], **kwargs):
-    model = ChangeModel(backbone_name, fpn_channels, n_layers=n_layers, **kwargs)
-    # print(model)
-    return model
+    return ChangeModel(backbone_name, fpn_channels, n_layers=n_layers, **kwargs)
 
 
 class Model(nn.Module):
@@ -46,6 +44,10 @@ class Model(nn.Module):
             dino_lora_r=opt.dino_lora_r,
             dino_lora_alpha=opt.dino_lora_alpha,
             dino_lora_dropout=opt.dino_lora_dropout,
+            crossgate_attn_dim=opt.crossgate_attn_dim,
+            crossgate_num_heads=opt.crossgate_num_heads,
+            crossgate_window_size=opt.crossgate_window_size,
+            crossgate_gamma_init=opt.crossgate_gamma_init,
             pairlocal_enable=opt.pairlocal_enable,
             pairlocal_stage_modes=opt.pairlocal_stage_modes,
             pairlocal_hidden_ratio=opt.pairlocal_hidden_ratio,
@@ -109,7 +111,8 @@ class Model(nn.Module):
             dino_trainable = [
                 (name, numel)
                 for name, numel in trainable
-                if name.startswith("encoder.dino.model.") or name.startswith("module.encoder.dino.model.")
+                if name.startswith("encoder.dino.model.")
+                or name.startswith("module.encoder.dino.model.")
             ]
             lora_trainable = [
                 (name, numel)
@@ -117,12 +120,18 @@ class Model(nn.Module):
                 if ".lora_" in name
             ]
             print(f"trainable DINO tensors: {len(dino_trainable)}")
-            print(f"trainable DINO parameters total: {sum(numel for _, numel in dino_trainable)}")
+            print(
+                f"trainable DINO parameters total: {sum(numel for _, numel in dino_trainable)}"
+            )
             print(f"trainable LoRA tensors: {len(lora_trainable)}")
-            print(f"trainable LoRA parameters total: {sum(numel for _, numel in lora_trainable)}")
+            print(
+                f"trainable LoRA parameters total: {sum(numel for _, numel in lora_trainable)}"
+            )
 
             if not lora_trainable:
-                raise RuntimeError("LoRA is enabled, but no trainable LoRA parameters were found.")
+                raise RuntimeError(
+                    "LoRA is enabled, but no trainable LoRA parameters were found."
+                )
 
             preview_limit = 12
             print("sample trainable LoRA parameter names:")
@@ -137,13 +146,11 @@ class Model(nn.Module):
         for i in range(len(preds)):
             focal += self.focal(preds[i], label)
             dice += 0.5 * self.dice(preds[i], label)
-
         return final_pred, focal, dice
 
     @torch.inference_mode()
     def inference(self, x1, x2):
-        pred = self._unwrap_model(self.model)._forward(x1, x2)
-        return pred
+        return self._unwrap_model(self.model)._forward(x1, x2)
 
     def load_ckpt(self, network, optimizer, name, backbone):
         save_filename = "%s_%s_best.pth" % (name, backbone)
@@ -162,12 +169,9 @@ class Model(nn.Module):
                 f"Expected: {save_path}\n"
                 f"Available in save_dir: {existing if existing else 'None'}"
             )
-        else:
-            checkpoint = torch.load(
-                save_path, map_location=self.device, weights_only=True
-            )
-            self._unwrap_model(network).load_state_dict(checkpoint["network"], strict=False)
-            print("load pre-trained")
+        checkpoint = torch.load(save_path, map_location=self.device, weights_only=True)
+        self._unwrap_model(network).load_state_dict(checkpoint["network"], strict=False)
+        print("load pre-trained")
 
     def save_ckpt(self, network, optimizer, model_name, backbone):
         save_filename = "%s_%s_best.pth" % (model_name, backbone)
@@ -197,5 +201,4 @@ def create_model(opt):
     model = Model(opt)
     if opt.is_main_process:
         print("model [%s] was created" % model.name())
-
     return model.cuda()

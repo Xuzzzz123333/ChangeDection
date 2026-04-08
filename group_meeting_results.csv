@@ -1,0 +1,4 @@
+Method,Key Setting,Acc,mIoU,mF1,IoU_1,F1_1
+ChangeDINO-native256,"256x256 non-overlap patch, original pipeline",99.1949,92.1889,95.7988,85.2220,92.0215
+ChangeDINO + LoRA r=4,"DINOv3 full LoRA",99.2276,92.5237,95.9920,85.8578,92.3908
+ChangeDINO + LoRA r=8,"DINOv3 full LoRA",99.2299,92.5003,95.9783,85.8084,92.3622

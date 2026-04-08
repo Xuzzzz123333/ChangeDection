@@ -40,9 +40,9 @@ if __name__ == "__main__":
             if opt.save_test:
                 for j in range(val_pred.shape[0]):
                     pred = Image.fromarray((val_pred[j].cpu().detach().numpy()*255).astype("uint8"))
-                    pred.save(
-                        os.path.join(test_save_path, _data["fname"][j])
-                    )
+                    pred_path = os.path.join(test_save_path, _data["fname"][j])
+                    os.makedirs(os.path.dirname(pred_path), exist_ok=True)
+                    pred.save(pred_path)
         val_scores = running_metric.get_scores()
         message = "(phase: %s) " % (opt.phase)
         for k, v in val_scores.items():

@@ -1,7 +1,10 @@
+import re
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import re
+
+from .lora import LoRALinear
 
 REPO_DIR = "dinov3"
 DINO_NAME = "dinov3_vitl16"
@@ -21,9 +24,14 @@ class DINOV3Wrapper(nn.Module):
         weights_path="dinov3/weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
         extract_ids=[5, 11, 17, 23],
         device="cuda",
+        use_lora=False,
+        lora_r=4,
+        lora_alpha=16,
+        lora_dropout=0.05,
     ):
         super().__init__()
         self.device = device
+        self.use_lora = use_lora
         self.model = torch.hub.load(
             REPO_DIR,
             DINO_NAME,
@@ -37,29 +45,57 @@ class DINOV3Wrapper(nn.Module):
         self.patch_size = int(re.findall(r"\d+", DINO_NAME.split("_")[-1])[-1])
         self.extract_ids = extract_ids
 
-        # freeze the backbone
         for p in self.model.parameters():
             p.requires_grad = False
+
+        if self.use_lora:
+            self.inject_lora(
+                self.model,
+                r=lora_r,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+
+    @staticmethod
+    def should_apply_lora(full_name: str) -> bool:
+        targets = (
+            "attn.qkv",
+            "attn.proj",
+            "mlp.fc1",
+            "mlp.fc2",
+        )
+        return any(full_name.endswith(target) for target in targets)
+
+    @staticmethod
+    def inject_lora(module, prefix="", r=4, alpha=16, dropout=0.05):
+        for name, child in list(module.named_children()):
+            full_name = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, nn.Linear) and DINOV3Wrapper.should_apply_lora(full_name):
+                setattr(module, name, LoRALinear(child, r=r, alpha=alpha, dropout=dropout))
+            else:
+                DINOV3Wrapper.inject_lora(child, full_name, r=r, alpha=alpha, dropout=dropout)
 
     def forward(self, x):
         scale_factor = 2 / (512 / x.shape[-1])
         x = F.interpolate(
             x, size=(512, 512), mode="bilinear", align_corners=True, antialias=True
         )
-        with torch.no_grad():
-            with torch.autocast(device_type=self.device, dtype=torch.float32):
-                feats = self.model.get_intermediate_layers(
-                    x, n=range(self.n_layers), reshape=True, norm=True
-                )
-                feats_ = []
-                for i in range(len(self.extract_ids)):
-                    feats_.append(
-                        F.interpolate(
-                            feats[self.extract_ids[i]],
-                            scale_factor=scale_factor,
-                            mode="bilinear",
-                        )
+
+        use_grad = self.training and self.use_lora
+
+        with torch.set_grad_enabled(use_grad):
+            feats = self.model.get_intermediate_layers(
+                x, n=self.extract_ids, reshape=True, norm=True
+            )
+            feats_ = []
+            for feat in feats:
+                feats_.append(
+                    F.interpolate(
+                        feat,
+                        scale_factor=scale_factor,
+                        mode="bilinear",
                     )
+                )
         return feats_
 
 
@@ -74,7 +110,7 @@ class SepAdapterBlock(nn.Module):
         self.dw = nn.Sequential(
             nn.Conv2d(
                 r, r, kernel_size=3, padding=1, groups=r, bias=False
-            ),  # depthwise
+            ),
             nn.BatchNorm2d(r),
             act(inplace=True),
         )
@@ -107,10 +143,6 @@ class DenseAdapterLite(nn.Module):
         self.share = share
 
     def forward(self, feats):
-        """
-        feats: list of 4 tensors, each [B, C, H_i, W_i]（C = in_dim）
-        return: list of 4 tensors, each [B, out_dim, S_i, S_i], S_i ∈ self.sizes
-        """
         outs = []
         for i, x in enumerate(feats):
             x = F.interpolate(

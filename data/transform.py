@@ -40,11 +40,19 @@ class Transforms(object):
             colorjitter = Compose(colorjitters)
             img1 = colorjitter(img1)
             img2 = colorjitter(img2)
+        cropped = False
         if random.random() < 0.5:
             i, j, h, w = transforms.RandomResizedCrop(size=(256, 256)).get_params(img=img1, scale=[0.333, 1.0], ratio=[0.75, 1.333])
             img1 = TF.resized_crop(img1, i, j, h, w, size=(256, 256), interpolation=InterpolationMode.BILINEAR)
             img2 = TF.resized_crop(img2, i, j, h, w, size=(256, 256), interpolation=InterpolationMode.BILINEAR)
             cd_label = TF.resized_crop(cd_label, i, j, h, w, size=(256, 256), interpolation=InterpolationMode.NEAREST)
+            cropped = True
+
+        # Keep a fixed training size so DataLoader can stack samples into a batch.
+        if not cropped:
+            img1 = TF.resize(img1, size=(256, 256), interpolation=InterpolationMode.BILINEAR)
+            img2 = TF.resize(img2, size=(256, 256), interpolation=InterpolationMode.BILINEAR)
+            cd_label = TF.resize(cd_label, size=(256, 256), interpolation=InterpolationMode.NEAREST)
 
         return {'img1': img1, 'img2': img2, 'cd_label': cd_label}
 
