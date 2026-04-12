@@ -67,7 +67,7 @@ class AdaptiveChangePrior(nn.Module):
         delta = self.expand(relation)
         delta = self.context(delta)
         delta = self.project(delta)
-        # Reweight the original abs-diff prior instead of replacing its shape.
+    
         scale = 1.0 + self.residual_scale * torch.tanh(delta)
         return base * scale
 

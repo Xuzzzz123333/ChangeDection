@@ -82,6 +82,35 @@ class Options:
         self.parser.add_argument("--dino_lora_alpha", type=int, default=16)
         self.parser.add_argument("--dino_lora_dropout", type=float, default=0.05)
         self.parser.add_argument(
+            "--dino_lora_search",
+            action="store_true",
+            help="enable importance-based rank search on top of DINO LoRA",
+        )
+        self.parser.add_argument(
+            "--dino_lora_r_target",
+            type=int,
+            default=4,
+            help="target average LoRA rank after importance-based pruning; can be 0",
+        )
+        self.parser.add_argument(
+            "--dino_lora_alpha_over_r",
+            type=float,
+            default=1.0,
+            help="fixed alpha/r scaling used by searchable LoRA",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_warmup_epochs",
+            type=int,
+            default=5,
+            help="keep the max LoRA rank for the first N epochs before pruning",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_interval",
+            type=int,
+            default=1,
+            help="update searchable LoRA ranks every N epochs",
+        )
+        self.parser.add_argument(
             "--pairlocal_enable",
             action="store_true",
             help="enable pair-aware interaction on the local FPN branch before DINO fusion",
@@ -161,6 +190,18 @@ class Options:
             )
         if self.opt.vis_interval < 0:
             raise ValueError("--vis_interval must be >= 0.")
+        if self.opt.dino_lora_search and not self.opt.dino_lora:
+            raise ValueError("--dino_lora_search requires --dino_lora to be enabled.")
+        if self.opt.dino_lora_search and self.opt.dino_lora_r <= 0:
+            raise ValueError("--dino_lora_r must be > 0 when --dino_lora_search is enabled.")
+        if self.opt.dino_lora_r_target < 0:
+            raise ValueError("--dino_lora_r_target must be >= 0.")
+        if self.opt.dino_lora_alpha_over_r < 0:
+            raise ValueError("--dino_lora_alpha_over_r must be >= 0.")
+        if self.opt.dino_lora_search_warmup_epochs < 0:
+            raise ValueError("--dino_lora_search_warmup_epochs must be >= 0.")
+        if self.opt.dino_lora_search_interval <= 0:
+            raise ValueError("--dino_lora_search_interval must be > 0.")
         if self.opt.acpc_hidden_ratio <= 0:
             raise ValueError("--acpc_hidden_ratio must be > 0.")
         if self.opt.acpc_norm_groups <= 0:

@@ -293,6 +293,7 @@ if __name__ == "__main__":
             if epoch == int(opt.num_epochs * 0.9):
                 trainval._rescheduler(opt)
             train_stats = trainval.train(epoch)
+            trainval.model.update_lora_rank_search(epoch)
             val_scores = trainval.val(epoch)
             trainval._append_log_line(epoch, train_stats, val_scores)
 

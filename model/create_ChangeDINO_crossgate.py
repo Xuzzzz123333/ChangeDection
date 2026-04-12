@@ -44,6 +44,11 @@ class Model(nn.Module):
             dino_lora_r=opt.dino_lora_r,
             dino_lora_alpha=opt.dino_lora_alpha,
             dino_lora_dropout=opt.dino_lora_dropout,
+            dino_lora_search=opt.dino_lora_search,
+            dino_lora_r_target=opt.dino_lora_r_target,
+            dino_lora_alpha_over_r=opt.dino_lora_alpha_over_r,
+            dino_lora_search_warmup_epochs=opt.dino_lora_search_warmup_epochs,
+            dino_lora_search_interval=opt.dino_lora_search_interval,
             crossgate_attn_dim=opt.crossgate_attn_dim,
             crossgate_num_heads=opt.crossgate_num_heads,
             crossgate_window_size=opt.crossgate_window_size,
@@ -137,6 +142,25 @@ class Model(nn.Module):
             print("sample trainable LoRA parameter names:")
             for name, _ in lora_trainable[:preview_limit]:
                 print(f"  {name}")
+
+    def update_lora_rank_search(self, epoch):
+        if not getattr(self.opt, "dino_lora_search", False):
+            return None
+
+        network = self._unwrap_model(self.model)
+        if not hasattr(network.encoder.dino, "update_lora_rank_search"):
+            return None
+
+        summary = network.encoder.dino.update_lora_rank_search(epoch, self.opt.num_epochs)
+        if summary and self.opt.is_main_process:
+            preview = ", ".join(str(rank) for rank in summary["active_ranks"][:8])
+            suffix = " ..." if len(summary["active_ranks"]) > 8 else ""
+            print(
+                f"LoRA rank search -> budget={summary['budget_rank']}, "
+                f"total_active={summary['total_active_rank']}, "
+                f"layer_ranks=[{preview}{suffix}]"
+            )
+        return summary
 
     def forward(self, x1, x2, label):
         final_pred, preds = self.model(x1, x2)
