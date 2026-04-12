@@ -90,6 +90,11 @@ class Encoder(nn.Module):
             lora_r=kwargs.get("dino_lora_r", 8),
             lora_alpha=kwargs.get("dino_lora_alpha", 16),
             lora_dropout=kwargs.get("dino_lora_dropout", 0.05),
+            lora_search=kwargs.get("dino_lora_search", False),
+            lora_r_target=kwargs.get("dino_lora_r_target", 4),
+            lora_alpha_over_r=kwargs.get("dino_lora_alpha_over_r", 1.0),
+            lora_search_warmup_epochs=kwargs.get("dino_lora_search_warmup_epochs", 5),
+            lora_search_interval=kwargs.get("dino_lora_search_interval", 1),
         )
         self.dense_adp = DenseAdapterLite(
             in_dim=1024, out_dim=dense_out_dim, bottleneck=fpn_channels // 2
