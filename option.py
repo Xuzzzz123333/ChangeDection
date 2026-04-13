@@ -148,6 +148,63 @@ class Options:
             help="per-group budget weights for searchable LoRA, formatted as group=value",
         )
         self.parser.add_argument(
+            "--mfce_enable",
+            action="store_true",
+            help="replace the per-layer dense adapter with MFCE-style multi-layer fusion and ASPP context enhancement",
+        )
+        self.parser.add_argument(
+            "--mfce_mid_dim",
+            type=int,
+            default=256,
+            help="hidden width used by the MFCE dense branch",
+        )
+        self.parser.add_argument(
+            "--mfce_aspp_rates",
+            nargs="+",
+            type=int,
+            default=[1, 2, 4, 8],
+            help="dilation rates used by the MFCE ASPP context module",
+        )
+        self.parser.add_argument(
+            "--dino_temporal_exchange_enable",
+            action="store_true",
+            help="enable cross-temporal exchange on raw DINO features before dense adaptation",
+        )
+        self.parser.add_argument(
+            "--dino_temporal_exchange_mode",
+            type=str,
+            default="layer",
+            choices=[
+                "none",
+                "layer",
+                "rand_layer",
+                "channel",
+                "rand_channel",
+                "spatial",
+                "rand_spatial",
+            ],
+            help="temporal exchange mode applied to paired DINO features",
+        )
+        self.parser.add_argument(
+            "--dino_temporal_exchange_thresh",
+            type=float,
+            default=0.5,
+            help="probability threshold used by random temporal exchange modes",
+        )
+        self.parser.add_argument(
+            "--dino_temporal_exchange_p",
+            type=int,
+            default=2,
+            help="stride used by deterministic channel or spatial temporal exchange",
+        )
+        self.parser.add_argument(
+            "--dino_temporal_exchange_layers",
+            nargs="+",
+            type=int,
+            default=[0, 1, 2, 3],
+            help="DINO feature indices that participate in temporal exchange",
+        )
+        self.parser.add_argument(
             "--pairlocal_enable",
             action="store_true",
             help="enable pair-aware interaction on the local FPN branch before DINO fusion",
@@ -243,6 +300,18 @@ class Options:
             raise ValueError("--dino_lora_search_ema_decay must be in [0, 1).")
         if self.opt.dino_lora_search_grad_weight < 0:
             raise ValueError("--dino_lora_search_grad_weight must be >= 0.")
+        if self.opt.mfce_mid_dim <= 0:
+            raise ValueError("--mfce_mid_dim must be > 0.")
+        if not self.opt.mfce_aspp_rates:
+            raise ValueError("--mfce_aspp_rates expects at least one dilation rate.")
+        if any(rate <= 0 for rate in self.opt.mfce_aspp_rates):
+            raise ValueError("--mfce_aspp_rates must use positive integers.")
+        if not (0.0 <= self.opt.dino_temporal_exchange_thresh <= 1.0):
+            raise ValueError("--dino_temporal_exchange_thresh must be in [0, 1].")
+        if self.opt.dino_temporal_exchange_p <= 0:
+            raise ValueError("--dino_temporal_exchange_p must be > 0.")
+        if not self.opt.dino_temporal_exchange_layers:
+            raise ValueError("--dino_temporal_exchange_layers expects at least one index.")
         if self.opt.acpc_hidden_ratio <= 0:
             raise ValueError("--acpc_hidden_ratio must be > 0.")
         if self.opt.acpc_norm_groups <= 0:

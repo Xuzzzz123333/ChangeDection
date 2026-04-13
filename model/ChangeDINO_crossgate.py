@@ -10,6 +10,7 @@ from .blocks.change_prior import AdaptiveChangePriorPyramid
 from .blocks.diffatts import TransformerBlock
 from .blocks.fpn import FPN, DsBnRelu
 from .blocks.light_cross_gate import LightCrossGateFusion
+from .blocks.mfce import MFCEPyramidAdapter, TemporalFeatureExchange
 from .blocks.pair_local import PairLocalPyramid
 from .blocks.refine import LearnableSoftMorph
 
@@ -101,9 +102,17 @@ class Encoder(nn.Module):
             lora_search_budget_mode=kwargs.get("dino_lora_search_budget_mode", "grouped"),
             lora_search_group_weights=kwargs.get("dino_lora_search_group_weights", None),
         )
-        self.dense_adp = DenseAdapterLite(
-            in_dim=1024, out_dim=dense_out_dim, bottleneck=fpn_channels // 2
-        )
+        if kwargs.get("mfce_enable", False):
+            self.dense_adp = MFCEPyramidAdapter(
+                in_dim=1024,
+                out_dim=dense_out_dim,
+                mid_dim=kwargs.get("mfce_mid_dim", dense_out_dim),
+                aspp_rates=tuple(kwargs.get("mfce_aspp_rates", [1, 2, 4, 8])),
+            )
+        else:
+            self.dense_adp = DenseAdapterLite(
+                in_dim=1024, out_dim=dense_out_dim, bottleneck=fpn_channels // 2
+            )
         self.pff = PyramidFeatureFusion(
             in_dims=[fpn_channels] * 4,
             dense_dim=1024,
@@ -115,9 +124,15 @@ class Encoder(nn.Module):
         fea = self.backbone.forward(x)
         return self.fpn(fea[-4:])
 
+    def forward_dense_layers(self, x):
+        return self.dino(x)
+
+    def adapt_dense(self, dense_feats):
+        return self.dense_adp(dense_feats)
+
     def forward_dense(self, x):
-        ds_fea = self.dino(x)
-        return self.dense_adp(ds_fea)
+        ds_fea = self.forward_dense_layers(x)
+        return self.adapt_dense(ds_fea)
 
     def fuse_pyramid(self, local_feas, ds_feas):
         return self.pff(local_feas, ds_feas)
@@ -292,19 +307,32 @@ class ChangeModel(nn.Module):
                 norm_groups=kwargs.get("pairlocal_norm_groups", 8),
                 residual_scale=kwargs.get("pairlocal_residual_scale", 0.1),
             )
+        self.temporal_exchange = None
+        if kwargs.get("dino_temporal_exchange_enable", False):
+            self.temporal_exchange = TemporalFeatureExchange(
+                mode=kwargs.get("dino_temporal_exchange_mode", "layer"),
+                thresh=kwargs.get("dino_temporal_exchange_thresh", 0.5),
+                p=kwargs.get("dino_temporal_exchange_p", 2),
+                layers=tuple(kwargs.get("dino_temporal_exchange_layers", [0, 1, 2, 3])),
+            )
         self.detector = Detector(fpn_channels=fpn_channels, n_layers=n_layers, **kwargs)
         self.refiner = LearnableSoftMorph(3, 5)
 
     def _encode_pair(self, x1, x2):
-        if not self.pairlocal_enable:
-            return self.encoder(x1), self.encoder(x2)
-
         local1 = self.encoder.forward_local(x1)
         local2 = self.encoder.forward_local(x2)
-        local1, local2 = self.pairlocal(local1, local2)
+        if self.pairlocal_enable:
+            local1, local2 = self.pairlocal(local1, local2)
 
-        dense1 = self.encoder.forward_dense(x1)
-        dense2 = self.encoder.forward_dense(x2)
+        dense_layers1 = self.encoder.forward_dense_layers(x1)
+        dense_layers2 = self.encoder.forward_dense_layers(x2)
+        if self.temporal_exchange is not None:
+            dense_layers1, dense_layers2 = self.temporal_exchange(
+                dense_layers1,
+                dense_layers2,
+            )
+        dense1 = self.encoder.adapt_dense(dense_layers1)
+        dense2 = self.encoder.adapt_dense(dense_layers2)
         fea1 = self.encoder.fuse_pyramid(local1, dense1)
         fea2 = self.encoder.fuse_pyramid(local2, dense2)
         return fea1, fea2
