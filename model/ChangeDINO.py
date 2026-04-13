@@ -113,6 +113,11 @@ class Encoder(nn.Module):
     lora_alpha_over_r=kwargs.get("dino_lora_alpha_over_r", 1.0),
     lora_search_warmup_epochs=kwargs.get("dino_lora_search_warmup_epochs", 5),
     lora_search_interval=kwargs.get("dino_lora_search_interval", 1),
+    lora_search_ema_decay=kwargs.get("dino_lora_search_ema_decay", 0.9),
+    lora_search_score_norm=kwargs.get("dino_lora_search_score_norm", "median"),
+    lora_search_grad_weight=kwargs.get("dino_lora_search_grad_weight", 0.5),
+    lora_search_budget_mode=kwargs.get("dino_lora_search_budget_mode", "grouped"),
+    lora_search_group_weights=kwargs.get("dino_lora_search_group_weights", None),
 )
         self.dense_adp = DenseAdapterLite(
             in_dim=1024, out_dim=dense_out_dim, bottleneck=fpn_channels // 2

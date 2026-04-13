@@ -51,6 +51,11 @@ class Model(nn.Module):
             dino_lora_alpha_over_r=opt.dino_lora_alpha_over_r,
             dino_lora_search_warmup_epochs=opt.dino_lora_search_warmup_epochs,
             dino_lora_search_interval=opt.dino_lora_search_interval,
+            dino_lora_search_ema_decay=opt.dino_lora_search_ema_decay,
+            dino_lora_search_score_norm=opt.dino_lora_search_score_norm,
+            dino_lora_search_grad_weight=opt.dino_lora_search_grad_weight,
+            dino_lora_search_budget_mode=opt.dino_lora_search_budget_mode,
+            dino_lora_search_group_weights=opt.dino_lora_search_group_weights,
             pairlocal_enable=opt.pairlocal_enable,
             pairlocal_stage_modes=opt.pairlocal_stage_modes,
             pairlocal_hidden_ratio=opt.pairlocal_hidden_ratio,
@@ -146,9 +151,15 @@ class Model(nn.Module):
         if summary and self.opt.is_main_process:
             preview = ", ".join(str(rank) for rank in summary["active_ranks"][:8])
             suffix = " ..." if len(summary["active_ranks"]) > 8 else ""
+            group_preview = ", ".join(
+                f"{group_name}:{rank}"
+                for group_name, rank in sorted(summary.get("group_active_ranks", {}).items())
+            )
             print(
                 f"LoRA rank search -> budget={summary['budget_rank']}, "
+                f"mode={summary.get('budget_mode', 'global')}, "
                 f"total_active={summary['total_active_rank']}, "
+                f"groups=[{group_preview}], "
                 f"layer_ranks=[{preview}{suffix}]"
             )
         return summary

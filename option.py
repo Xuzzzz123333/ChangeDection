@@ -111,6 +111,43 @@ class Options:
             help="update searchable LoRA ranks every N epochs",
         )
         self.parser.add_argument(
+            "--dino_lora_search_ema_decay",
+            type=float,
+            default=0.9,
+            help="EMA decay used to smooth searchable LoRA importance scores",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_score_norm",
+            type=str,
+            default="median",
+            choices=["none", "median", "zscore"],
+            help="group-wise normalization applied before searchable LoRA ranking",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_grad_weight",
+            type=float,
+            default=0.5,
+            help="strength of gradient-sensitivity modulation for searchable LoRA scores",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_budget_mode",
+            type=str,
+            default="grouped",
+            choices=["global", "grouped"],
+            help="allocate searchable LoRA ranks globally or separately per position group",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_group_weights",
+            nargs="+",
+            default=[
+                "attn.qkv=1.0",
+                "attn.proj=1.0",
+                "mlp.fc1=1.0",
+                "mlp.fc2=1.0",
+            ],
+            help="per-group budget weights for searchable LoRA, formatted as group=value",
+        )
+        self.parser.add_argument(
             "--pairlocal_enable",
             action="store_true",
             help="enable pair-aware interaction on the local FPN branch before DINO fusion",
@@ -202,12 +239,45 @@ class Options:
             raise ValueError("--dino_lora_search_warmup_epochs must be >= 0.")
         if self.opt.dino_lora_search_interval <= 0:
             raise ValueError("--dino_lora_search_interval must be > 0.")
+        if not (0.0 <= self.opt.dino_lora_search_ema_decay < 1.0):
+            raise ValueError("--dino_lora_search_ema_decay must be in [0, 1).")
+        if self.opt.dino_lora_search_grad_weight < 0:
+            raise ValueError("--dino_lora_search_grad_weight must be >= 0.")
         if self.opt.acpc_hidden_ratio <= 0:
             raise ValueError("--acpc_hidden_ratio must be > 0.")
         if self.opt.acpc_norm_groups <= 0:
             raise ValueError("--acpc_norm_groups must be > 0.")
         if self.opt.acpc_residual_scale < 0:
             raise ValueError("--acpc_residual_scale must be >= 0.")
+
+        valid_search_groups = {"attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"}
+        parsed_group_weights = {}
+        for item in self.opt.dino_lora_search_group_weights:
+            if "=" not in item:
+                raise ValueError(
+                    "--dino_lora_search_group_weights entries must be formatted as group=value."
+                )
+            group_name, value = item.split("=", 1)
+            group_name = group_name.strip()
+            if group_name not in valid_search_groups:
+                raise ValueError(
+                    f"Unsupported searchable LoRA group '{group_name}'. "
+                    f"Expected one of {sorted(valid_search_groups)}."
+                )
+            try:
+                weight = float(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid searchable LoRA group weight '{item}'."
+                ) from exc
+            if weight < 0:
+                raise ValueError(
+                    "--dino_lora_search_group_weights must use non-negative weights."
+                )
+            parsed_group_weights[group_name] = weight
+        for group_name in valid_search_groups:
+            parsed_group_weights.setdefault(group_name, 1.0)
+        self.opt.dino_lora_search_group_weights = parsed_group_weights
 
         str_ids = self.opt.gpu_ids.split(",")
         self.opt.gpu_ids = []

@@ -36,7 +36,17 @@ class LoRALinear(nn.Module):
 
 
 class SearchableLoRALinear(nn.Module):
-    def __init__(self, base_layer: nn.Linear, r=8, alpha_over_r=1.0, dropout=0.05):
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        r=8,
+        alpha_over_r=1.0,
+        dropout=0.05,
+        module_name="",
+        group_name="other",
+        score_ema_decay=0.9,
+        grad_weight=0.5,
+    ):
         super().__init__()
         assert isinstance(base_layer, nn.Linear), "LoRA can only be applied to nn.Linear layers."
         if r <= 0:
@@ -48,6 +58,10 @@ class SearchableLoRALinear(nn.Module):
         self.in_features = base_layer.in_features
         self.out_features = base_layer.out_features
         self.alpha_over_r = float(alpha_over_r)
+        self.module_name = module_name
+        self.group_name = group_name
+        self.score_ema_decay = float(score_ema_decay)
+        self.grad_weight = float(grad_weight)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.scaling = self.alpha_over_r
 
@@ -61,11 +75,76 @@ class SearchableLoRALinear(nn.Module):
 
         self.register_buffer("rank_mask", torch.ones(self.r_max, dtype=torch.float32))
         self.register_buffer("active_rank", torch.tensor(self.r_max, dtype=torch.int64))
+        self.register_buffer("importance_ema", torch.zeros(self.r_max, dtype=torch.float32))
+        self.register_buffer("grad_a_ema", torch.zeros(self.r_max, dtype=torch.float32))
+        self.register_buffer("grad_b_ema", torch.zeros(self.r_max, dtype=torch.float32))
+        self.register_buffer("importance_ema_ready", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("grad_a_ema_ready", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("grad_b_ema_ready", torch.tensor(False, dtype=torch.bool))
 
-    def importance_scores(self):
+        self.lora_A.weight.register_hook(self._make_grad_hook("a"))
+        self.lora_B.weight.register_hook(self._make_grad_hook("b"))
+
+    def raw_importance_scores(self):
         a_norm = self.lora_A.weight.float().pow(2).sum(dim=1).sqrt()
         b_norm = self.lora_B.weight.float().pow(2).sum(dim=0).sqrt()
         return a_norm * b_norm
+
+    @staticmethod
+    def _ema_update(buffer, values, ready_flag, decay):
+        if bool(ready_flag.item()):
+            buffer.mul_(decay).add_(values * (1.0 - decay))
+        else:
+            buffer.copy_(values)
+            ready_flag.fill_(True)
+
+    def _make_grad_hook(self, branch: str):
+        def hook(grad):
+            if grad is None:
+                return grad
+            with torch.no_grad():
+                if branch == "a":
+                    values = grad.float().pow(2).sum(dim=1).sqrt()
+                    self._ema_update(
+                        self.grad_a_ema,
+                        values,
+                        self.grad_a_ema_ready,
+                        self.score_ema_decay,
+                    )
+                else:
+                    values = grad.float().pow(2).sum(dim=0).sqrt()
+                    self._ema_update(
+                        self.grad_b_ema,
+                        values,
+                        self.grad_b_ema_ready,
+                        self.score_ema_decay,
+                    )
+            return grad
+
+        return hook
+
+    def importance_scores(self):
+        raw_scores = self.raw_importance_scores()
+        with torch.no_grad():
+            self._ema_update(
+                self.importance_ema,
+                raw_scores,
+                self.importance_ema_ready,
+                self.score_ema_decay,
+            )
+            scores = self.importance_ema.clone()
+            if (
+                self.grad_weight > 0
+                and bool(self.grad_a_ema_ready.item())
+                and bool(self.grad_b_ema_ready.item())
+            ):
+                grad_scores = torch.sqrt(
+                    self.grad_a_ema.clamp_min(0.0) * self.grad_b_ema.clamp_min(0.0)
+                )
+                if bool(grad_scores.gt(0).any().item()):
+                    grad_scale = grad_scores / grad_scores.median().clamp_min(1e-6)
+                    scores = scores * grad_scale.clamp_min(1e-6).pow(self.grad_weight)
+        return scores
 
     @torch.no_grad()
     def set_rank_mask(self, mask):
@@ -87,7 +166,7 @@ class SearchableLoRALinear(nn.Module):
             self.set_rank_mask(torch.ones_like(self.rank_mask))
             return
 
-        scores = self.importance_scores()
+        scores = self.raw_importance_scores()
         keep_idx = scores.topk(rank, largest=True, sorted=False).indices
         mask = torch.zeros_like(scores)
         mask[keep_idx] = 1.0
