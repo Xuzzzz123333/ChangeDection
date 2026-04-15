@@ -126,6 +126,15 @@ class Encoder(nn.Module):
                 out_dim=dense_out_dim,
                 mid_dim=kwargs.get("mfce_mid_dim", dense_out_dim),
                 aspp_rates=tuple(kwargs.get("mfce_aspp_rates", [1, 2, 4, 8])),
+                rf_enable=kwargs.get("mfce_rf_enable", False),
+                rf_mode=kwargs.get("mfce_rf_mode", "rfsearch"),
+                rf_num_branches=kwargs.get("mfce_rf_num_branches", 3),
+                rf_expand_rate=kwargs.get("mfce_rf_expand_rate", 0.5),
+                rf_min_dilation=kwargs.get("mfce_rf_min_dilation", 1),
+                rf_max_dilations=kwargs.get("mfce_rf_max_dilations", None),
+                rf_search_interval=kwargs.get("mfce_rf_search_interval", 100),
+                rf_max_search_step=kwargs.get("mfce_rf_max_search_step", 8),
+                rf_init_weight=kwargs.get("mfce_rf_init_weight", 0.01),
             )
         else:
             self.dense_adp = DenseAdapterLite(

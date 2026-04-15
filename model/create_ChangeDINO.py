@@ -59,6 +59,15 @@ class Model(nn.Module):
             mfce_enable=opt.mfce_enable,
             mfce_mid_dim=opt.mfce_mid_dim,
             mfce_aspp_rates=opt.mfce_aspp_rates,
+            mfce_rf_enable=opt.mfce_rf_enable,
+            mfce_rf_mode=opt.mfce_rf_mode,
+            mfce_rf_num_branches=opt.mfce_rf_num_branches,
+            mfce_rf_expand_rate=opt.mfce_rf_expand_rate,
+            mfce_rf_min_dilation=opt.mfce_rf_min_dilation,
+            mfce_rf_max_dilations=opt.mfce_rf_max_dilations,
+            mfce_rf_search_interval=opt.mfce_rf_search_interval,
+            mfce_rf_max_search_step=opt.mfce_rf_max_search_step,
+            mfce_rf_init_weight=opt.mfce_rf_init_weight,
             dino_temporal_exchange_enable=opt.dino_temporal_exchange_enable,
             dino_temporal_exchange_mode=opt.dino_temporal_exchange_mode,
             dino_temporal_exchange_thresh=opt.dino_temporal_exchange_thresh,
@@ -76,6 +85,7 @@ class Model(nn.Module):
             acpc_residual_scale=opt.acpc_residual_scale,
         )
         self._log_trainable_parameters()
+        self._log_rf_states()
         if opt.load_pretrain:
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
 
@@ -146,6 +156,28 @@ class Model(nn.Module):
             print("sample trainable LoRA parameter names:")
             for name, _ in lora_trainable[:preview_limit]:
                 print(f"  {name}")
+
+    def _log_rf_states(self):
+        if not getattr(self.opt, "mfce_rf_enable", False):
+            return
+        dense_adapter = getattr(getattr(self.model, "encoder", None), "dense_adp", None)
+        if dense_adapter is None or not hasattr(dense_adapter, "rf_states"):
+            return
+        states = dense_adapter.rf_states()
+        if not states:
+            return
+
+        print("initial MFCE RF states:")
+        for branch_index, state in enumerate(states):
+            rates = ", ".join(
+                f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
+            )
+            weights = ", ".join(f"{weight:.3f}" for weight in state.get("weights", []))
+            print(
+                f"  branch{branch_index}: mode={state.get('mode')} "
+                f"dilation={state.get('dilation')} rates=[{rates}] weights=[{weights}] "
+                f"search_step={state.get('search_step', 0)}"
+            )
 
     def update_lora_rank_search(self, epoch):
         if not getattr(self.opt, "dino_lora_search", False):

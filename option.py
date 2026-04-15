@@ -166,6 +166,61 @@ class Options:
             help="dilation rates used by the MFCE ASPP context module",
         )
         self.parser.add_argument(
+            "--mfce_rf_enable",
+            action="store_true",
+            help="replace fixed ASPP depthwise dilations with RF-Next style local receptive-field search",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_mode",
+            type=str,
+            default="rfsearch",
+            choices=["rfsearch", "rfsingle", "rfmultiple", "rfmerge"],
+            help="RF-Next mode used inside each MFCE ASPP branch",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_num_branches",
+            type=int,
+            default=3,
+            help="number of local dilation candidates maintained by each RF-Next ASPP branch",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_expand_rate",
+            type=float,
+            default=0.5,
+            help="local expansion ratio used by RF-Next receptive-field search",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_min_dilation",
+            type=int,
+            default=1,
+            help="minimum dilation allowed by RF-Next ASPP search",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_max_dilations",
+            nargs="+",
+            type=int,
+            default=None,
+            help="optional per-branch max dilations for MFCE RF search; provide one value or one per ASPP branch",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_search_interval",
+            type=int,
+            default=100,
+            help="forward-step interval between RF-Next estimate-expand updates",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_max_search_step",
+            type=int,
+            default=8,
+            help="maximum number of RF-Next local search refinements; 0 disables iterative updates",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_init_weight",
+            type=float,
+            default=0.01,
+            help="initial branch weight used by RF-Next ASPP search",
+        )
+        self.parser.add_argument(
             "--dino_temporal_exchange_enable",
             action="store_true",
             help="enable cross-temporal exchange on raw DINO features before dense adaptation",
@@ -306,6 +361,27 @@ class Options:
             raise ValueError("--mfce_aspp_rates expects at least one dilation rate.")
         if any(rate <= 0 for rate in self.opt.mfce_aspp_rates):
             raise ValueError("--mfce_aspp_rates must use positive integers.")
+        if self.opt.mfce_rf_enable and not self.opt.mfce_enable:
+            raise ValueError("--mfce_rf_enable requires --mfce_enable to be enabled.")
+        if self.opt.mfce_rf_num_branches <= 0:
+            raise ValueError("--mfce_rf_num_branches must be > 0.")
+        if (
+            self.opt.mfce_rf_mode in {"rfsearch", "rfmultiple"}
+            and self.opt.mfce_rf_num_branches < 2
+        ):
+            raise ValueError(
+                "--mfce_rf_num_branches must be >= 2 for rfsearch or rfmultiple mode."
+            )
+        if self.opt.mfce_rf_expand_rate <= 0:
+            raise ValueError("--mfce_rf_expand_rate must be > 0.")
+        if self.opt.mfce_rf_min_dilation <= 0:
+            raise ValueError("--mfce_rf_min_dilation must be > 0.")
+        if self.opt.mfce_rf_search_interval <= 0:
+            raise ValueError("--mfce_rf_search_interval must be > 0.")
+        if self.opt.mfce_rf_max_search_step < 0:
+            raise ValueError("--mfce_rf_max_search_step must be >= 0.")
+        if self.opt.mfce_rf_init_weight < 0:
+            raise ValueError("--mfce_rf_init_weight must be >= 0.")
         if not (0.0 <= self.opt.dino_temporal_exchange_thresh <= 1.0):
             raise ValueError("--dino_temporal_exchange_thresh must be in [0, 1].")
         if self.opt.dino_temporal_exchange_p <= 0:
@@ -347,6 +423,32 @@ class Options:
         for group_name in valid_search_groups:
             parsed_group_weights.setdefault(group_name, 1.0)
         self.opt.dino_lora_search_group_weights = parsed_group_weights
+
+        rf_max_dilations = self.opt.mfce_rf_max_dilations
+        if rf_max_dilations is None:
+            rf_max_dilations = [
+                max(
+                    rate + 2,
+                    rate * 2 if rate <= 4 else int(round(rate * 1.5)),
+                )
+                for rate in self.opt.mfce_aspp_rates
+            ]
+        elif len(rf_max_dilations) == 1:
+            rf_max_dilations = rf_max_dilations * len(self.opt.mfce_aspp_rates)
+        elif len(rf_max_dilations) != len(self.opt.mfce_aspp_rates):
+            raise ValueError(
+                "--mfce_rf_max_dilations expects either one value or one per ASPP branch."
+            )
+        for seed_rate, max_rate in zip(self.opt.mfce_aspp_rates, rf_max_dilations):
+            if max_rate < self.opt.mfce_rf_min_dilation:
+                raise ValueError(
+                    "--mfce_rf_max_dilations must be >= --mfce_rf_min_dilation."
+                )
+            if max_rate < seed_rate:
+                raise ValueError(
+                    "--mfce_rf_max_dilations must be >= the corresponding --mfce_aspp_rates seed."
+                )
+        self.opt.mfce_rf_max_dilations = rf_max_dilations
 
         str_ids = self.opt.gpu_ids.split(",")
         self.opt.gpu_ids = []

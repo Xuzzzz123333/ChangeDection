@@ -3,6 +3,67 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _to_2tuple(value):
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2:
+            raise ValueError(f"Expected a 2-tuple value, got {value}.")
+        return (int(value[0]), int(value[1]))
+    value = int(value)
+    return (value, value)
+
+
+def _same_padding(kernel_size: int, stride: int, dilation: int):
+    return ((stride - 1) + dilation * (kernel_size - 1)) // 2
+
+
+def value_crop(dilation, min_dilation, max_dilation):
+    if min_dilation is not None and dilation < min_dilation:
+        dilation = min_dilation
+    if max_dilation is not None and dilation > max_dilation:
+        dilation = max_dilation
+    return dilation
+
+
+def rf_expand(dilation, expand_rate, num_branches, min_dilation=1, max_dilation=None):
+    if num_branches < 2:
+        raise ValueError("rf_expand expects num_branches >= 2.")
+
+    dilation = _to_2tuple(dilation)
+    delta_h = expand_rate * dilation[0]
+    delta_w = expand_rate * dilation[1]
+    rate_list = []
+    for index in range(num_branches):
+        rate_list.append(
+            (
+                value_crop(
+                    int(
+                        round(
+                            dilation[0]
+                            - delta_h
+                            + index * 2 * delta_h / (num_branches - 1)
+                        )
+                    ),
+                    min_dilation,
+                    max_dilation,
+                ),
+                value_crop(
+                    int(
+                        round(
+                            dilation[1]
+                            - delta_w
+                            + index * 2 * delta_w / (num_branches - 1)
+                        )
+                    ),
+                    min_dilation,
+                    max_dilation,
+                ),
+            )
+        )
+
+    unique_rate_list = list(dict.fromkeys(rate_list))
+    return unique_rate_list
+
+
 class ConvBnAct(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, kernel_size: int = 1, act=nn.SiLU):
         super().__init__()
@@ -15,6 +76,218 @@ class ConvBnAct(nn.Module):
 
     def forward(self, x):
         return self.block(x)
+
+
+class RFConv2d(nn.Conv2d):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=1,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias=True,
+        padding_mode="zeros",
+        num_branches=3,
+        expand_rate=0.5,
+        min_dilation=1,
+        max_dilation=None,
+        init_weight=0.01,
+        search_interval=100,
+        max_search_step=8,
+        rf_mode="rfsearch",
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+        )
+        if rf_mode not in {"rfsearch", "rfsingle", "rfmultiple", "rfmerge"}:
+            raise ValueError(f"Unsupported RF mode: {rf_mode}")
+        if num_branches <= 0:
+            raise ValueError("RFConv2d expects num_branches > 0.")
+
+        self.rf_mode = rf_mode
+        self.num_branches = int(num_branches)
+        self.max_dilation = None if max_dilation is None else int(max_dilation)
+        self.min_dilation = max(1, int(min_dilation))
+        self.expand_rate = float(expand_rate)
+        self.init_weight = float(init_weight)
+        self.search_interval = max(1, int(search_interval))
+        self.max_search_step = max(0, int(max_search_step))
+
+        self.sample_weights = nn.Parameter(torch.empty(self.num_branches))
+        self.register_buffer("counter", torch.zeros(1, dtype=torch.int64))
+        self.register_buffer(
+            "current_search_step", torch.zeros(1, dtype=torch.int64)
+        )
+        self.register_buffer(
+            "rates", torch.ones((self.num_branches, 2), dtype=torch.int32)
+        )
+        self.register_buffer("num_rates", torch.ones(1, dtype=torch.int32))
+
+        init_dilation = _to_2tuple(self.dilation)
+        self.rates[0] = torch.tensor(init_dilation, dtype=torch.int32)
+        self.sample_weights.data.fill_(self.init_weight)
+
+        if self.rf_mode == "rfsearch":
+            self.estimate()
+            self.expand()
+        elif self.rf_mode == "rfsingle":
+            self.estimate()
+            self.max_search_step = 0
+            self.sample_weights.requires_grad = False
+        elif self.rf_mode == "rfmultiple":
+            self.estimate()
+            self.expand()
+            self.sample_weights.data.fill_(self.init_weight)
+            self.max_search_step = 0
+        elif self.rf_mode == "rfmerge":
+            self.max_search_step = 0
+            self.sample_weights.requires_grad = False
+
+        if self.rf_mode == "rfsingle" and self.num_rates.item() != 1:
+            raise ValueError("rfsingle expects a single active receptive field.")
+
+    def _conv_forward_dilation(self, input_tensor, dilation_rate):
+        dilation_rate = _to_2tuple(dilation_rate)
+        if self.padding_mode != "zeros":
+            raise NotImplementedError(
+                "RFConv2d currently supports only zero padding mode."
+            )
+
+        padding = (
+            dilation_rate[0] * (self.kernel_size[0] - 1) // 2,
+            dilation_rate[1] * (self.kernel_size[1] - 1) // 2,
+        )
+        return F.conv2d(
+            input_tensor,
+            self.weight,
+            self.bias,
+            self.stride,
+            padding,
+            dilation_rate,
+            self.groups,
+        )
+
+    def normalize(self, weights):
+        abs_weights = torch.abs(weights)
+        weight_sum = abs_weights.sum().clamp_min(1e-6)
+        return abs_weights / weight_sum
+
+    def tensor_to_tuple(self, tensor):
+        return tuple((value[0].item(), value[1].item()) for value in tensor)
+
+    @torch.no_grad()
+    def estimate(self):
+        norm_weights = self.normalize(self.sample_weights[: self.num_rates.item()])
+        sum_h = 0.0
+        sum_w = 0.0
+        weight_sum = 0.0
+        for index in range(self.num_rates.item()):
+            sum_h += norm_weights[index].item() * self.rates[index][0].item()
+            sum_w += norm_weights[index].item() * self.rates[index][1].item()
+            weight_sum += norm_weights[index].item()
+
+        estimated = (
+            value_crop(
+                int(round(sum_h / max(weight_sum, 1e-6))),
+                self.min_dilation,
+                self.max_dilation,
+            ),
+            value_crop(
+                int(round(sum_w / max(weight_sum, 1e-6))),
+                self.min_dilation,
+                self.max_dilation,
+            ),
+        )
+        self.dilation = estimated
+        self.padding = (
+            _same_padding(self.kernel_size[0], self.stride[0], self.dilation[0]),
+            _same_padding(self.kernel_size[1], self.stride[1], self.dilation[1]),
+        )
+        self.rates[0] = torch.tensor(estimated, dtype=torch.int32, device=self.rates.device)
+        self.num_rates[0] = 1
+
+    @torch.no_grad()
+    def expand(self):
+        rates = rf_expand(
+            self.dilation,
+            self.expand_rate,
+            self.num_branches,
+            min_dilation=self.min_dilation,
+            max_dilation=self.max_dilation,
+        )
+        for index, rate in enumerate(rates):
+            self.rates[index] = torch.tensor(rate, dtype=torch.int32, device=self.rates.device)
+        self.num_rates[0] = len(rates)
+        self.sample_weights.data.fill_(self.init_weight)
+
+    @torch.no_grad()
+    def searcher(self):
+        self.counter += 1
+        if (
+            self.counter % self.search_interval == 0
+            and self.current_search_step < self.max_search_step
+            and self.max_search_step != 0
+        ):
+            self.counter[0] = 0
+            self.current_search_step += 1
+            self.estimate()
+            self.expand()
+
+    def rf_state(self):
+        num_rates = int(self.num_rates.item())
+        if num_rates <= 0:
+            return {}
+        if num_rates == 1:
+            weights = [1.0]
+        else:
+            weights = (
+                self.normalize(self.sample_weights[:num_rates])
+                .detach()
+                .cpu()
+                .tolist()
+            )
+        return {
+            "mode": self.rf_mode,
+            "dilation": tuple(int(value) for value in self.dilation),
+            "rates": self.tensor_to_tuple(self.rates[:num_rates].detach().cpu()),
+            "weights": weights,
+            "search_step": int(self.current_search_step.item()),
+        }
+
+    def forward(self, x):
+        if self.num_rates.item() == 1:
+            return super().forward(x)
+
+        norm_weights = self.normalize(self.sample_weights[: self.num_rates.item()])
+        outputs = [
+            self._conv_forward_dilation(
+                x,
+                (
+                    self.rates[index][0].item(),
+                    self.rates[index][1].item(),
+                ),
+            )
+            * norm_weights[index]
+            for index in range(self.num_rates.item())
+        ]
+        output = outputs[0]
+        for index in range(1, self.num_rates.item()):
+            output = output + outputs[index]
+
+        if self.training and self.rf_mode == "rfsearch":
+            self.searcher()
+        return output
 
 
 class DepthwiseSeparableConv(nn.Module):
@@ -51,6 +324,62 @@ class DepthwiseSeparableConv(nn.Module):
         return self.block(x)
 
 
+class RFDepthwiseSeparableConv(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        dilation: int = 1,
+        act=nn.SiLU,
+        rf_mode: str = "rfsearch",
+        rf_num_branches: int = 3,
+        rf_expand_rate: float = 0.5,
+        rf_min_dilation: int = 1,
+        rf_max_dilation=None,
+        rf_search_interval: int = 100,
+        rf_max_search_step: int = 8,
+        rf_init_weight: float = 0.01,
+    ):
+        super().__init__()
+        self.depthwise = RFConv2d(
+            in_dim,
+            in_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=0,
+            dilation=max(1, int(dilation)),
+            groups=in_dim,
+            bias=False,
+            num_branches=rf_num_branches,
+            expand_rate=rf_expand_rate,
+            min_dilation=rf_min_dilation,
+            max_dilation=rf_max_dilation,
+            init_weight=rf_init_weight,
+            search_interval=rf_search_interval,
+            max_search_step=rf_max_search_step,
+            rf_mode=rf_mode,
+        )
+        self.depth_bn = nn.BatchNorm2d(in_dim)
+        self.depth_act = act(inplace=True)
+        self.pointwise = nn.Conv2d(in_dim, out_dim, 1, bias=False)
+        self.point_bn = nn.BatchNorm2d(out_dim)
+        self.point_act = act(inplace=True)
+
+    def rf_state(self):
+        return self.depthwise.rf_state()
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.depth_bn(x)
+        x = self.depth_act(x)
+        x = self.pointwise(x)
+        x = self.point_bn(x)
+        x = self.point_act(x)
+        return x
+
+
 class DepthAttnFuse(nn.Module):
     def __init__(self, in_dim: int = 1024, hidden_dim: int = 256, num_layers: int = 4):
         super().__init__()
@@ -83,23 +412,70 @@ class DepthAttnFuse(nn.Module):
 
 
 class ASPPContext(nn.Module):
-    def __init__(self, dim: int, rates=(1, 2, 4, 8)):
+    def __init__(
+        self,
+        dim: int,
+        rates=(1, 2, 4, 8),
+        rf_enable: bool = False,
+        rf_mode: str = "rfsearch",
+        rf_num_branches: int = 3,
+        rf_expand_rate: float = 0.5,
+        rf_min_dilation: int = 1,
+        rf_max_dilations=None,
+        rf_search_interval: int = 100,
+        rf_max_search_step: int = 8,
+        rf_init_weight: float = 0.01,
+    ):
         super().__init__()
         if not rates:
             raise ValueError("ASPPContext expects at least one dilation rate.")
 
+        rates = tuple(max(1, int(rate)) for rate in rates)
+        self.rf_enable = bool(rf_enable)
+        if rf_max_dilations is None:
+            rf_max_dilations = [None] * len(rates)
+        elif len(rf_max_dilations) != len(rates):
+            raise ValueError(
+                "ASPPContext expects rf_max_dilations to match the ASPP branch count."
+            )
+
+        branch_cls = RFDepthwiseSeparableConv if self.rf_enable else DepthwiseSeparableConv
+        branch_kwargs = []
+        for rate, rf_max_dilation in zip(rates, rf_max_dilations):
+            if self.rf_enable:
+                branch_kwargs.append(
+                    dict(
+                        rf_mode=rf_mode,
+                        rf_num_branches=rf_num_branches,
+                        rf_expand_rate=rf_expand_rate,
+                        rf_min_dilation=rf_min_dilation,
+                        rf_max_dilation=rf_max_dilation,
+                        rf_search_interval=rf_search_interval,
+                        rf_max_search_step=rf_max_search_step,
+                        rf_init_weight=rf_init_weight,
+                    )
+                )
+            else:
+                branch_kwargs.append({})
+
         self.branches = nn.ModuleList(
             [
-                DepthwiseSeparableConv(
+                branch_cls(
                     dim,
                     dim,
                     kernel_size=3,
-                    dilation=max(1, int(rate)),
+                    dilation=rate,
+                    **kwargs,
                 )
-                for rate in rates
+                for rate, kwargs in zip(rates, branch_kwargs)
             ]
         )
         self.project = ConvBnAct(dim * len(self.branches), dim, kernel_size=1)
+
+    def rf_states(self):
+        if not self.rf_enable:
+            return []
+        return [branch.rf_state() for branch in self.branches]
 
     def forward(self, x):
         branch_feats = [branch(x) for branch in self.branches]
@@ -113,10 +489,31 @@ class MFCEPyramidAdapter(nn.Module):
         out_dim: int = 256,
         mid_dim: int = 256,
         aspp_rates=(1, 2, 4, 8),
+        rf_enable: bool = False,
+        rf_mode: str = "rfsearch",
+        rf_num_branches: int = 3,
+        rf_expand_rate: float = 0.5,
+        rf_min_dilation: int = 1,
+        rf_max_dilations=None,
+        rf_search_interval: int = 100,
+        rf_max_search_step: int = 8,
+        rf_init_weight: float = 0.01,
     ):
         super().__init__()
         self.depth_fuse = DepthAttnFuse(in_dim=in_dim, hidden_dim=mid_dim, num_layers=4)
-        self.context = ASPPContext(mid_dim, rates=tuple(aspp_rates))
+        self.context = ASPPContext(
+            mid_dim,
+            rates=tuple(aspp_rates),
+            rf_enable=rf_enable,
+            rf_mode=rf_mode,
+            rf_num_branches=rf_num_branches,
+            rf_expand_rate=rf_expand_rate,
+            rf_min_dilation=rf_min_dilation,
+            rf_max_dilations=rf_max_dilations,
+            rf_search_interval=rf_search_interval,
+            rf_max_search_step=rf_max_search_step,
+            rf_init_weight=rf_init_weight,
+        )
         self.refine_blocks = nn.ModuleList(
             [DepthwiseSeparableConv(mid_dim, mid_dim, kernel_size=3) for _ in range(4)]
         )
@@ -124,6 +521,9 @@ class MFCEPyramidAdapter(nn.Module):
             [nn.Conv2d(mid_dim, out_dim, kernel_size=1, bias=True) for _ in range(4)]
         )
         self.scales = (2.0, 1.0, 0.5, 0.25)
+
+    def rf_states(self):
+        return self.context.rf_states()
 
     def forward(self, feats):
         fused = self.depth_fuse(feats)
