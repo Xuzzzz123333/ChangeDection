@@ -126,13 +126,19 @@ class RFConv2d(nn.Conv2d):
 
         self.sample_weights = nn.Parameter(torch.empty(self.num_branches))
         self.register_buffer("counter", torch.zeros(1, dtype=torch.int64))
+        self.register_buffer("forward_step", torch.zeros(1, dtype=torch.int64))
         self.register_buffer(
             "current_search_step", torch.zeros(1, dtype=torch.int64)
+        )
+        self.register_buffer("search_start_step", torch.zeros(1, dtype=torch.int64))
+        self.register_buffer(
+            "search_stop_step", torch.full((1,), -1, dtype=torch.int64)
         )
         self.register_buffer(
             "rates", torch.ones((self.num_branches, 2), dtype=torch.int32)
         )
         self.register_buffer("num_rates", torch.ones(1, dtype=torch.int32))
+        self.register_buffer("merged", torch.tensor(False, dtype=torch.bool))
 
         init_dilation = _to_2tuple(self.dilation)
         self.rates[0] = torch.tensor(init_dilation, dtype=torch.int32)
@@ -183,8 +189,84 @@ class RFConv2d(nn.Conv2d):
         weight_sum = abs_weights.sum().clamp_min(1e-6)
         return abs_weights / weight_sum
 
+    def _active_rates(self):
+        num_rates = int(self.num_rates.item())
+        if num_rates <= 0:
+            return self.rates[:0].to(dtype=self.weight.dtype, device=self.weight.device)
+        return self.rates[:num_rates].to(dtype=self.weight.dtype, device=self.weight.device)
+
     def tensor_to_tuple(self, tensor):
         return tuple((value[0].item(), value[1].item()) for value in tensor)
+
+    def expected_dilation(self):
+        active_rates = self._active_rates()
+        if active_rates.numel() == 0:
+            return self.weight.new_zeros(2)
+        if active_rates.shape[0] == 1:
+            return active_rates[0]
+        norm_weights = self.normalize(self.sample_weights[: active_rates.shape[0]])
+        return (active_rates * norm_weights[:, None].to(active_rates.dtype)).sum(dim=0)
+
+    def schedule_state(self):
+        stop_step = int(self.search_stop_step.item())
+        return {
+            "search_interval": int(self.search_interval),
+            "max_search_step": int(self.max_search_step),
+            "start_step": int(self.search_start_step.item()),
+            "stop_step": None if stop_step < 0 else stop_step,
+        }
+
+    @torch.no_grad()
+    def configure_search_schedule(
+        self,
+        schedule_mode="manual",
+        steps_per_epoch=0,
+        total_epochs=0,
+        search_interval=None,
+        max_search_step=None,
+        warmup_epochs=0,
+        search_epochs=0,
+        reset_counters=True,
+    ):
+        if max_search_step is not None:
+            self.max_search_step = max(0, int(max_search_step))
+
+        derived_interval = (
+            int(search_interval)
+            if search_interval is not None
+            else int(self.search_interval)
+        )
+        start_step = 0
+        stop_step = -1
+
+        if schedule_mode == "epoch":
+            steps_per_epoch = max(1, int(steps_per_epoch))
+            total_epochs = max(1, int(total_epochs))
+            warmup_epochs = max(0, int(warmup_epochs))
+            if search_epochs is None or int(search_epochs) <= 0:
+                search_epochs = max(1, total_epochs - warmup_epochs)
+            else:
+                search_epochs = int(search_epochs)
+            start_step = warmup_epochs * steps_per_epoch
+            active_steps = max(1, search_epochs * steps_per_epoch)
+            stop_step = start_step + active_steps
+            if self.max_search_step > 0:
+                derived_interval = max(1, active_steps // self.max_search_step)
+            else:
+                derived_interval = max(1, derived_interval)
+        else:
+            derived_interval = max(1, derived_interval)
+
+        self.search_interval = int(derived_interval)
+        self.search_start_step.fill_(int(start_step))
+        self.search_stop_step.fill_(int(stop_step))
+
+        if reset_counters:
+            self.counter.zero_()
+            self.forward_step.zero_()
+            self.current_search_step.zero_()
+
+        return self.schedule_state()
 
     @torch.no_grad()
     def estimate(self):
@@ -233,6 +315,18 @@ class RFConv2d(nn.Conv2d):
 
     @torch.no_grad()
     def searcher(self):
+        if self.max_search_step == 0 or bool(self.merged.item()):
+            return
+
+        self.forward_step += 1
+        current_step = int(self.forward_step.item())
+        if current_step <= int(self.search_start_step.item()):
+            return
+
+        stop_step = int(self.search_stop_step.item())
+        if stop_step >= 0 and current_step > stop_step:
+            return
+
         self.counter += 1
         if (
             self.counter % self.search_interval == 0
@@ -243,6 +337,81 @@ class RFConv2d(nn.Conv2d):
             self.current_search_step += 1
             self.estimate()
             self.expand()
+
+    @torch.no_grad()
+    def merge_branches_(self):
+        if bool(self.merged.item()):
+            return self.rf_state()
+
+        num_rates = int(self.num_rates.item())
+        if num_rates <= 0:
+            return self.rf_state()
+
+        active_rates = self._active_rates()
+        if active_rates.shape[0] == 1:
+            norm_weights = self.weight.new_ones(1)
+        else:
+            norm_weights = self.normalize(self.sample_weights[: active_rates.shape[0]]).to(
+                dtype=self.weight.dtype,
+                device=self.weight.device,
+            )
+
+        old_weight = self.weight.detach()
+        old_bias = None if self.bias is None else self.bias.detach().clone()
+        old_kernel_h, old_kernel_w = self.kernel_size
+        center_h = old_kernel_h // 2
+        center_w = old_kernel_w // 2
+
+        max_rate_h = max(int(rate[0].item()) for rate in active_rates)
+        max_rate_w = max(int(rate[1].item()) for rate in active_rates)
+        new_kernel_size = (
+            old_kernel_h + (max_rate_h - 1) * center_h * 2,
+            old_kernel_w + (max_rate_w - 1) * center_w * 2,
+        )
+        new_center_h = new_kernel_size[0] // 2
+        new_center_w = new_kernel_size[1] // 2
+        in_channels_per_group = old_weight.shape[1]
+        merged_weight = old_weight.new_zeros(
+            self.out_channels,
+            in_channels_per_group,
+            new_kernel_size[0],
+            new_kernel_size[1],
+        )
+
+        for branch_index, branch_rate in enumerate(active_rates):
+            rate_h = int(branch_rate[0].item())
+            rate_w = int(branch_rate[1].item())
+            branch_weight = norm_weights[branch_index]
+            for old_h in range(old_kernel_h):
+                for old_w in range(old_kernel_w):
+                    offset_h = old_h - center_h
+                    offset_w = old_w - center_w
+                    new_h = new_center_h + offset_h * rate_h
+                    new_w = new_center_w + offset_w * rate_w
+                    merged_weight[:, :, new_h, new_w] += (
+                        old_weight[:, :, old_h, old_w] * branch_weight
+                    )
+
+        self.weight = nn.Parameter(merged_weight)
+        if old_bias is not None:
+            self.bias = nn.Parameter(old_bias)
+        self.kernel_size = new_kernel_size
+        self.dilation = (1, 1)
+        self.padding = (
+            _same_padding(self.kernel_size[0], self.stride[0], 1),
+            _same_padding(self.kernel_size[1], self.stride[1], 1),
+        )
+        self.rates.zero_()
+        self.rates[0] = torch.tensor([1, 1], dtype=torch.int32, device=self.rates.device)
+        self.num_rates[0] = 1
+        self.sample_weights.data.fill_(1.0)
+        self.sample_weights.requires_grad = False
+        self.merged.fill_(True)
+        self.rf_mode = "rfmerge"
+        self.counter.zero_()
+        self.forward_step.zero_()
+        self.current_search_step.zero_()
+        return self.rf_state()
 
     def rf_state(self):
         num_rates = int(self.num_rates.item())
@@ -259,10 +428,13 @@ class RFConv2d(nn.Conv2d):
             )
         return {
             "mode": self.rf_mode,
+            "merged": bool(self.merged.item()),
+            "kernel_size": tuple(int(value) for value in self.kernel_size),
             "dilation": tuple(int(value) for value in self.dilation),
             "rates": self.tensor_to_tuple(self.rates[:num_rates].detach().cpu()),
             "weights": weights,
             "search_step": int(self.current_search_step.item()),
+            **self.schedule_state(),
         }
 
     def forward(self, x):
@@ -369,6 +541,15 @@ class RFDepthwiseSeparableConv(nn.Module):
 
     def rf_state(self):
         return self.depthwise.rf_state()
+
+    def expected_dilation(self):
+        return self.depthwise.expected_dilation()
+
+    def configure_search_schedule(self, **kwargs):
+        return self.depthwise.configure_search_schedule(**kwargs)
+
+    def merge_branches_(self):
+        return self.depthwise.merge_branches_()
 
     def forward(self, x):
         x = self.depthwise(x)
@@ -477,6 +658,40 @@ class ASPPContext(nn.Module):
             return []
         return [branch.rf_state() for branch in self.branches]
 
+    def configure_rf_search(self, **kwargs):
+        if not self.rf_enable:
+            return None
+        branch_summaries = [
+            branch.configure_search_schedule(**kwargs) for branch in self.branches
+        ]
+        summary = branch_summaries[0].copy() if branch_summaries else {}
+        summary["branches"] = branch_summaries
+        return summary
+
+    def merge_rf_branches_(self):
+        if not self.rf_enable:
+            return []
+        return [branch.merge_branches_() for branch in self.branches]
+
+    def rf_diversity_loss(self, margin=1.0):
+        reference = self.project.block[0].weight
+        if not self.rf_enable or len(self.branches) < 2:
+            return reference.new_zeros(())
+
+        margin = float(margin)
+        expected = torch.stack(
+            [branch.expected_dilation().mean() for branch in self.branches],
+            dim=0,
+        )
+        loss = expected.new_zeros(())
+        count = 0
+        for left in range(len(self.branches) - 1):
+            for right in range(left + 1, len(self.branches)):
+                target_gap = margin * (right - left)
+                loss = loss + F.relu(target_gap - (expected[right] - expected[left]))
+                count += 1
+        return loss / max(count, 1)
+
     def forward(self, x):
         branch_feats = [branch(x) for branch in self.branches]
         return self.project(torch.cat(branch_feats, dim=1))
@@ -524,6 +739,15 @@ class MFCEPyramidAdapter(nn.Module):
 
     def rf_states(self):
         return self.context.rf_states()
+
+    def configure_rf_search(self, **kwargs):
+        return self.context.configure_rf_search(**kwargs)
+
+    def merge_rf_branches_(self):
+        return self.context.merge_rf_branches_()
+
+    def rf_diversity_loss(self, margin=1.0):
+        return self.context.rf_diversity_loss(margin=margin)
 
     def forward(self, feats):
         fused = self.depth_fuse(feats)

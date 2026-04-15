@@ -32,6 +32,7 @@ class Model(nn.Module):
         self.base_lr = opt.lr
         self.save_dir = os.path.join(opt.checkpoint_dir, opt.name)
         os.makedirs(self.save_dir, exist_ok=True)
+        self.last_aux_losses = {}
 
         self.model = get_model(
             backbone_name=opt.backbone,
@@ -85,9 +86,17 @@ class Model(nn.Module):
             acpc_residual_scale=opt.acpc_residual_scale,
         )
         self._log_trainable_parameters()
-        self._log_rf_states()
         if opt.load_pretrain:
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
+        should_merge_rf = opt.load_pretrain and (
+            getattr(opt, "mfce_rf_merge_on_eval", False)
+            or getattr(opt, "mfce_rf_mode", "") == "rfmerge"
+        )
+        if should_merge_rf:
+            self.merge_rf_branches()
+            self._log_rf_states("merged")
+        else:
+            self._log_rf_states("initial")
 
         self.model = self.model.to(self.device)
         if self.use_distributed:
@@ -157,17 +166,22 @@ class Model(nn.Module):
             for name, _ in lora_trainable[:preview_limit]:
                 print(f"  {name}")
 
-    def _log_rf_states(self):
+    def _collect_dense_adapter(self):
+        network = self._unwrap_model(self.model)
+        encoder = getattr(network, "encoder", None)
+        return getattr(encoder, "dense_adp", None)
+
+    def _log_rf_states(self, prefix="current"):
         if not getattr(self.opt, "mfce_rf_enable", False):
             return
-        dense_adapter = getattr(getattr(self.model, "encoder", None), "dense_adp", None)
+        dense_adapter = self._collect_dense_adapter()
         if dense_adapter is None or not hasattr(dense_adapter, "rf_states"):
             return
         states = dense_adapter.rf_states()
         if not states:
             return
 
-        print("initial MFCE RF states:")
+        print(f"{prefix} MFCE RF states:")
         for branch_index, state in enumerate(states):
             rates = ", ".join(
                 f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
@@ -175,9 +189,57 @@ class Model(nn.Module):
             weights = ", ".join(f"{weight:.3f}" for weight in state.get("weights", []))
             print(
                 f"  branch{branch_index}: mode={state.get('mode')} "
-                f"dilation={state.get('dilation')} rates=[{rates}] weights=[{weights}] "
-                f"search_step={state.get('search_step', 0)}"
+                f"dilation={state.get('dilation')} kernel={state.get('kernel_size')} "
+                f"rates=[{rates}] weights=[{weights}] merged={state.get('merged', False)} "
+                f"search_step={state.get('search_step', 0)} "
+                f"interval={state.get('search_interval')} "
+                f"window=[{state.get('start_step')},{state.get('stop_step')}]"
             )
+
+    def configure_rf_search(self, steps_per_epoch: int):
+        if not getattr(self.opt, "mfce_rf_enable", False):
+            return None
+        dense_adapter = self._collect_dense_adapter()
+        if dense_adapter is None or not hasattr(dense_adapter, "configure_rf_search"):
+            return None
+
+        schedule_mode = getattr(self.opt, "mfce_rf_schedule_mode", "manual")
+        summary = dense_adapter.configure_rf_search(
+            schedule_mode=schedule_mode,
+            steps_per_epoch=max(1, int(steps_per_epoch)),
+            total_epochs=self.opt.num_epochs,
+            search_interval=self.opt.mfce_rf_search_interval,
+            max_search_step=self.opt.mfce_rf_max_search_step,
+            warmup_epochs=self.opt.mfce_rf_search_warmup_epochs,
+            search_epochs=self.opt.mfce_rf_search_epochs,
+        )
+        if summary and self.opt.is_main_process:
+            print(
+                "RF search schedule -> "
+                f"mode={schedule_mode}, interval={summary.get('search_interval')}, "
+                f"max_steps={summary.get('max_search_step')}, "
+                f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
+            )
+        return summary
+
+    def merge_rf_branches(self):
+        dense_adapter = self._collect_dense_adapter()
+        if dense_adapter is None or not hasattr(dense_adapter, "merge_rf_branches_"):
+            return None
+        return dense_adapter.merge_rf_branches_()
+
+    def rf_diversity_loss(self):
+        if (
+            not getattr(self.opt, "mfce_rf_enable", False)
+            or getattr(self.opt, "mfce_rf_diversity_weight", 0.0) <= 0
+        ):
+            return None
+        dense_adapter = self._collect_dense_adapter()
+        if dense_adapter is None or not hasattr(dense_adapter, "rf_diversity_loss"):
+            return None
+        return dense_adapter.rf_diversity_loss(
+            margin=getattr(self.opt, "mfce_rf_diversity_margin", 1.0)
+        )
 
     def update_lora_rank_search(self, epoch):
         if not getattr(self.opt, "dino_lora_search", False):
@@ -205,6 +267,7 @@ class Model(nn.Module):
         return summary
 
     def forward(self, x1, x2, label):
+        self.last_aux_losses = {}
         final_pred, preds = self.model(x1, x2)
         label = label.long()
         focal = self.focal(final_pred, label)
@@ -212,6 +275,11 @@ class Model(nn.Module):
         for i in range(len(preds)):
             focal += self.focal(preds[i], label)
             dice += 0.5 * self.dice(preds[i], label)
+
+        rf_diversity = self.rf_diversity_loss()
+        if rf_diversity is not None:
+            self.last_aux_losses["rf_diversity"] = float(rf_diversity.detach().item())
+            dice = dice + self.opt.mfce_rf_diversity_weight * rf_diversity
 
         return final_pred, focal, dice
 

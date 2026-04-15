@@ -221,6 +221,48 @@ class Options:
             help="initial branch weight used by RF-Next ASPP search",
         )
         self.parser.add_argument(
+            "--mfce_rf_schedule_mode",
+            type=str,
+            default="epoch",
+            choices=["manual", "epoch"],
+            help="manual step schedule or epoch-aware RF search schedule",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_search_warmup_epochs",
+            type=int,
+            default=0,
+            help="delay RF search updates for the first N epochs",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_search_epochs",
+            type=int,
+            default=20,
+            help="number of epochs allocated to RF search refinement in epoch schedule mode; <=0 uses the remaining training epochs",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_diversity_weight",
+            type=float,
+            default=0.05,
+            help="weight of the ASPP branch diversity regularizer for RF search",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_diversity_margin",
+            type=float,
+            default=1.0,
+            help="minimum expected dilation gap enforced between RF-ASPP branches",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_log_interval",
+            type=int,
+            default=5,
+            help="log RF branch states every N epochs during training; set to 0 to disable",
+        )
+        self.parser.add_argument(
+            "--mfce_rf_merge_on_eval",
+            action="store_true",
+            help="merge searched RF branches into a single equivalent convolution after loading checkpoints for evaluation",
+        )
+        self.parser.add_argument(
             "--dino_temporal_exchange_enable",
             action="store_true",
             help="enable cross-temporal exchange on raw DINO features before dense adaptation",
@@ -382,6 +424,16 @@ class Options:
             raise ValueError("--mfce_rf_max_search_step must be >= 0.")
         if self.opt.mfce_rf_init_weight < 0:
             raise ValueError("--mfce_rf_init_weight must be >= 0.")
+        if self.opt.mfce_rf_search_warmup_epochs < 0:
+            raise ValueError("--mfce_rf_search_warmup_epochs must be >= 0.")
+        if self.opt.mfce_rf_search_epochs < 0:
+            raise ValueError("--mfce_rf_search_epochs must be >= 0.")
+        if self.opt.mfce_rf_diversity_weight < 0:
+            raise ValueError("--mfce_rf_diversity_weight must be >= 0.")
+        if self.opt.mfce_rf_diversity_margin < 0:
+            raise ValueError("--mfce_rf_diversity_margin must be >= 0.")
+        if self.opt.mfce_rf_log_interval < 0:
+            raise ValueError("--mfce_rf_log_interval must be >= 0.")
         if not (0.0 <= self.opt.dino_temporal_exchange_thresh <= 1.0):
             raise ValueError("--dino_temporal_exchange_thresh must be in [0, 1].")
         if self.opt.dino_temporal_exchange_p <= 0:

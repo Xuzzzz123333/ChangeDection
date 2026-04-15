@@ -82,6 +82,7 @@ class Trainval(object):
         opt.phase = "train"
 
         self.model = create_model(opt)
+        self.model.configure_rf_search(len(self.train_data))
         self.optimizer = self.model.optimizer
         self.schedular = self.model.schedular
 
@@ -102,7 +103,9 @@ class Trainval(object):
                     "# name: %s | backbone: %s\n"
                     % (opt.name, getattr(opt, "backbone", "NA"))
                 )
-                f.write("# time,epoch,train_loss,train_focal,train_dice,lr,")
+                f.write(
+                    "# time,epoch,train_loss,train_focal,train_dice,train_rf_div,lr,"
+                )
                 f.write("val_metrics(json)\n")
 
     def _rescheduler(self, opt):
@@ -127,6 +130,7 @@ class Trainval(object):
             f"{train_stats.get('loss', float('nan')):.6f},"
             f"{train_stats.get('focal', float('nan')):.6f},"
             f"{train_stats.get('dice', float('nan')):.6f},"
+            f"{train_stats.get('rf_diversity', float('nan')):.6f},"
             f"{train_stats.get('lr', float('nan')):.8f},"
             + json.dumps(val_scores, ensure_ascii=False)
             + "\n"
@@ -160,6 +164,7 @@ class Trainval(object):
         _loss = 0.0
         _focal_loss = 0.0
         _dice_loss = 0.0
+        _rf_diversity = 0.0
         last_lr = self.optimizer.param_groups[0]["lr"]
         accum_steps = max(1, self.opt.grad_accum_steps)
         self.optimizer.zero_grad()
@@ -194,15 +199,19 @@ class Trainval(object):
             _loss += loss.item()
             _focal_loss += focal.item()
             _dice_loss += dice.item()
+            _rf_diversity += float(
+                self.model.last_aux_losses.get("rf_diversity", 0.0)
+            )
             last_lr = self.optimizer.param_groups[0]["lr"]
 
             if self.opt.is_main_process:
                 tbar.set_description(
-                    "Loss: %.3f, Focal: %.3f, Dice: %.3f, LR: %.6f"
+                    "Loss: %.3f, Focal: %.3f, Dice: %.3f, RFDiv: %.3f, LR: %.6f"
                     % (
                         _loss / (i + 1),
                         _focal_loss / (i + 1),
                         _dice_loss / (i + 1),
+                        _rf_diversity / (i + 1),
                         last_lr,
                     )
                 )
@@ -216,14 +225,15 @@ class Trainval(object):
 
         batch_count = max(1, i + 1)
         reduced = reduce_tensor_sum(
-            [_loss, _focal_loss, _dice_loss, batch_count],
+            [_loss, _focal_loss, _dice_loss, _rf_diversity, batch_count],
             self.device,
         )
-        denom = reduced[3].item()
+        denom = reduced[4].item()
         return {
             "loss": float(reduced[0].item() / denom),
             "focal": float(reduced[1].item() / denom),
             "dice": float(reduced[2].item() / denom),
+            "rf_diversity": float(reduced[3].item() / denom),
             "lr": last_lr,
         }
 
@@ -296,6 +306,13 @@ if __name__ == "__main__":
             train_stats = trainval.train(epoch)
             val_scores = trainval.val(epoch)
             trainval._append_log_line(epoch, train_stats, val_scores)
+            if (
+                opt.is_main_process
+                and opt.mfce_rf_enable
+                and opt.mfce_rf_log_interval > 0
+                and epoch % opt.mfce_rf_log_interval == 0
+            ):
+                trainval.model._log_rf_states(f"epoch {epoch}")
 
         if opt.is_main_process:
             print("Done!")
