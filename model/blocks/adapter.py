@@ -333,7 +333,7 @@ class DINOV3Wrapper(nn.Module):
         normalized_scores,
         keep_masks,
         total_budget,
-        eval_loss_fn,
+        eval_metric_fn,
     ):
         current_masks = [layer.get_rank_mask() for layer in layers]
         candidate_records = []
@@ -359,19 +359,22 @@ class DINOV3Wrapper(nn.Module):
 
         candidate_records.sort(key=lambda item: item[0])
         candidate_records = candidate_records[: self.lora_search_counterfactual_max_candidates]
-        baseline_loss = float(eval_loss_fn())
+        baseline_eval = eval_metric_fn()
+        baseline_score = float(baseline_eval["score"])
+        metric_name = baseline_eval.get("metric_name", "score")
 
         for _, layer_index, rank_index in candidate_records:
             layer = layers[layer_index]
             temp_mask = current_masks[layer_index].clone()
             temp_mask[rank_index] = 0.0
             layer.set_rank_mask(temp_mask)
-            drop_loss = float(eval_loss_fn())
+            drop_eval = eval_metric_fn()
+            drop_score = float(drop_eval["score"])
             layer.set_rank_mask(current_masks[layer_index])
 
-            delta = drop_loss - baseline_loss
+            delta = drop_score - baseline_score
             tested_masks[layer_index][rank_index] = True
-            if delta <= self.lora_search_counterfactual_delta:
+            if delta >= -self.lora_search_counterfactual_delta:
                 safe_masks[layer_index][rank_index] = True
 
         final_masks = [mask.clone() for mask in current_masks]
@@ -408,7 +411,8 @@ class DINOV3Wrapper(nn.Module):
             "counterfactual_tested": tested_candidates,
             "counterfactual_accepted": accepted_candidates,
             "counterfactual_pruned": confirmed_pruned,
-            "counterfactual_baseline_loss": baseline_loss,
+            "counterfactual_metric_name": metric_name,
+            "counterfactual_baseline_score": baseline_score,
             "counterfactual_budget_gap": int(max(0, sum(active_ranks) - total_budget)),
         }
 
@@ -457,7 +461,7 @@ class DINOV3Wrapper(nn.Module):
         }
 
     @torch.no_grad()
-    def update_lora_rank_search(self, epoch: int, total_epochs: int, eval_loss_fn=None):
+    def update_lora_rank_search(self, epoch: int, total_epochs: int, eval_metric_fn=None):
         if not self.lora_search or epoch % self.lora_search_interval != 0:
             return None
 
@@ -482,7 +486,7 @@ class DINOV3Wrapper(nn.Module):
         )
         if (
             not self.lora_search_counterfactual
-            or eval_loss_fn is None
+            or eval_metric_fn is None
             or total_budget <= 0
             or total_budget >= total_capacity
         ):
@@ -502,7 +506,7 @@ class DINOV3Wrapper(nn.Module):
             normalized_scores,
             keep_masks,
             total_budget,
-            eval_loss_fn,
+            eval_metric_fn,
         )
         summary.update(
             {

@@ -8,6 +8,7 @@ import os
 import torch.optim as optim
 from .loss.focal import FocalLoss
 from .loss.dice import DICELoss
+from util.metric_tool import cm2score, get_confuse_matrix
 
 
 def get_model(backbone_name="mobilenetv2", fpn_channels=128, n_layers=[1, 1, 1], **kwargs):
@@ -247,10 +248,10 @@ class Model(nn.Module):
         )
 
     def update_lora_rank_search(self, epoch):
-        return self.update_lora_rank_search_with_val(epoch, None, focal_weight=0.5)
+        return self.update_lora_rank_search_with_val(epoch, None)
 
     @torch.no_grad()
-    def _evaluate_lora_counterfactual_loss(self, val_batches, focal_weight=0.5):
+    def _evaluate_lora_counterfactual_metric(self, val_batches):
         if not val_batches:
             return None
 
@@ -258,26 +259,49 @@ class Model(nn.Module):
         was_training = network.training
         network.eval()
 
-        total_loss = 0.0
-        total_batches = 0
+        confusion_matrix = None
         for batch in val_batches:
             x1 = batch["img1"].to(self.device, non_blocking=True)
             x2 = batch["img2"].to(self.device, non_blocking=True)
-            label = batch["cd_label"].to(self.device, non_blocking=True).long()
-            final_pred, preds = network(x1, x2)
+            label = batch["cd_label"].to(self.device, non_blocking=True)
+            pred = network._forward(x1, x2)
+            pred = torch.argmax(pred, dim=1)
 
-            focal = self.focal(final_pred, label)
-            dice = self.dice(final_pred, label)
-            for pred in preds:
-                focal = focal + self.focal(pred, label)
-                dice = dice + 0.5 * self.dice(pred, label)
-            total_loss += float((focal_weight * focal + dice).item())
-            total_batches += 1
+            batch_confusion = get_confuse_matrix(
+                num_classes=2,
+                label_gts=label.detach().cpu().numpy(),
+                label_preds=pred.detach().cpu().numpy(),
+            )
+            if confusion_matrix is None:
+                confusion_matrix = batch_confusion
+            else:
+                confusion_matrix += batch_confusion
 
         if was_training:
             network.train()
 
-        return total_loss / max(total_batches, 1)
+        if confusion_matrix is None:
+            return None
+
+        scores = cm2score(confusion_matrix)
+        metric_name = getattr(
+            self.opt,
+            "dino_lora_search_counterfactual_metric",
+            "mean_iou1_f1",
+        )
+        if metric_name == "iou_1":
+            score = float(scores.get("iou_1", 0.0))
+        elif metric_name == "F1_1":
+            score = float(scores.get("F1_1", 0.0))
+        else:
+            score = 0.5 * (
+                float(scores.get("iou_1", 0.0)) + float(scores.get("F1_1", 0.0))
+            )
+        return {
+            "score": score,
+            "metric_name": metric_name,
+            "metrics": scores,
+        }
 
     def sync_lora_rank_masks(self):
         if not (self.use_distributed and getattr(self.opt, "dino_lora_search", False)):
@@ -296,7 +320,7 @@ class Model(nn.Module):
             if hasattr(layer, "counterfactual_confirm"):
                 torch.distributed.broadcast(layer.counterfactual_confirm, src=0)
 
-    def update_lora_rank_search_with_val(self, epoch, val_batches=None, focal_weight=0.5):
+    def update_lora_rank_search_with_val(self, epoch, val_batches=None):
         if not getattr(self.opt, "dino_lora_search", False):
             return None
 
@@ -305,22 +329,19 @@ class Model(nn.Module):
             return None
 
         summary = None
-        eval_loss_fn = None
+        eval_metric_fn = None
         if (
             getattr(self.opt, "dino_lora_search_counterfactual", False)
             and val_batches
             and (not self.use_distributed or self.opt.is_main_process)
         ):
-            eval_loss_fn = lambda: self._evaluate_lora_counterfactual_loss(
-                val_batches,
-                focal_weight=focal_weight,
-            )
+            eval_metric_fn = lambda: self._evaluate_lora_counterfactual_metric(val_batches)
 
         if not self.use_distributed or self.opt.is_main_process:
             summary = network.encoder.dino.update_lora_rank_search(
                 epoch,
                 self.opt.num_epochs,
-                eval_loss_fn=eval_loss_fn,
+                eval_metric_fn=eval_metric_fn,
             )
 
         self.sync_lora_rank_masks()
@@ -339,7 +360,8 @@ class Model(nn.Module):
                     f", cf_safe={summary.get('counterfactual_accepted', 0)}"
                     f", cf_pruned={summary.get('counterfactual_pruned', 0)}"
                     f", cf_gap={summary.get('counterfactual_budget_gap', 0)}"
-                    f", cf_loss={summary.get('counterfactual_baseline_loss', float('nan')):.4f}"
+                    f", cf_metric={summary.get('counterfactual_metric_name', 'score')}"
+                    f", cf_score={summary.get('counterfactual_baseline_score', float('nan')):.4f}"
                 )
             print(
                 f"LoRA rank search -> budget={summary['budget_rank']}, "

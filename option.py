@@ -155,8 +155,15 @@ class Options:
         self.parser.add_argument(
             "--dino_lora_search_counterfactual_val_batches",
             type=int,
-            default=2,
-            help="number of cached validation batches used by counterfactual LoRA rank testing",
+            default=4,
+            help="number of randomly sampled validation batches used by counterfactual LoRA rank testing",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_counterfactual_metric",
+            type=str,
+            default="mean_iou1_f1",
+            choices=["iou_1", "F1_1", "mean_iou1_f1"],
+            help="validation metric used to decide whether a candidate LoRA rank direction is safe to prune",
         )
         self.parser.add_argument(
             "--dino_lora_search_counterfactual_max_candidates",
@@ -168,7 +175,7 @@ class Options:
             "--dino_lora_search_counterfactual_delta",
             type=float,
             default=0.0,
-            help="only prune a tested LoRA direction when dropping it increases validation loss by at most this threshold",
+            help="only prune a tested LoRA direction when dropping it reduces the chosen validation metric by at most this threshold",
         )
         self.parser.add_argument(
             "--dino_lora_search_counterfactual_patience",
