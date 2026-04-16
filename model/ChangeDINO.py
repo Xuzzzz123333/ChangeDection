@@ -119,6 +119,19 @@ class Encoder(nn.Module):
             lora_search_grad_weight=kwargs.get("dino_lora_search_grad_weight", 0.5),
             lora_search_budget_mode=kwargs.get("dino_lora_search_budget_mode", "grouped"),
             lora_search_group_weights=kwargs.get("dino_lora_search_group_weights", None),
+            lora_search_counterfactual=kwargs.get("dino_lora_search_counterfactual", False),
+            lora_search_counterfactual_val_batches=kwargs.get(
+                "dino_lora_search_counterfactual_val_batches", 2
+            ),
+            lora_search_counterfactual_max_candidates=kwargs.get(
+                "dino_lora_search_counterfactual_max_candidates", 64
+            ),
+            lora_search_counterfactual_delta=kwargs.get(
+                "dino_lora_search_counterfactual_delta", 0.0
+            ),
+            lora_search_counterfactual_patience=kwargs.get(
+                "dino_lora_search_counterfactual_patience", 1
+            ),
         )
         if kwargs.get("mfce_enable", False):
             self.dense_adp = MFCEPyramidAdapter(

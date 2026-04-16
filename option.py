@@ -148,6 +148,35 @@ class Options:
             help="per-group budget weights for searchable LoRA, formatted as group=value",
         )
         self.parser.add_argument(
+            "--dino_lora_search_counterfactual",
+            action="store_true",
+            help="use a small validation set to counterfactually test candidate LoRA rank deletions before pruning",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_counterfactual_val_batches",
+            type=int,
+            default=2,
+            help="number of cached validation batches used by counterfactual LoRA rank testing",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_counterfactual_max_candidates",
+            type=int,
+            default=64,
+            help="maximum number of low-score LoRA rank directions tested per search update",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_counterfactual_delta",
+            type=float,
+            default=0.0,
+            help="only prune a tested LoRA direction when dropping it increases validation loss by at most this threshold",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_counterfactual_patience",
+            type=int,
+            default=1,
+            help="number of consecutive counterfactual confirmations required before pruning a LoRA direction",
+        )
+        self.parser.add_argument(
             "--mfce_enable",
             action="store_true",
             help="replace the per-layer dense adapter with MFCE-style multi-layer fusion and ASPP context enhancement",
@@ -397,6 +426,22 @@ class Options:
             raise ValueError("--dino_lora_search_ema_decay must be in [0, 1).")
         if self.opt.dino_lora_search_grad_weight < 0:
             raise ValueError("--dino_lora_search_grad_weight must be >= 0.")
+        if self.opt.dino_lora_search_counterfactual and not self.opt.dino_lora_search:
+            raise ValueError(
+                "--dino_lora_search_counterfactual requires --dino_lora_search to be enabled."
+            )
+        if self.opt.dino_lora_search_counterfactual_val_batches < 0:
+            raise ValueError(
+                "--dino_lora_search_counterfactual_val_batches must be >= 0."
+            )
+        if self.opt.dino_lora_search_counterfactual_max_candidates <= 0:
+            raise ValueError(
+                "--dino_lora_search_counterfactual_max_candidates must be > 0."
+            )
+        if self.opt.dino_lora_search_counterfactual_patience <= 0:
+            raise ValueError(
+                "--dino_lora_search_counterfactual_patience must be > 0."
+            )
         if self.opt.mfce_mid_dim <= 0:
             raise ValueError("--mfce_mid_dim must be > 0.")
         if not self.opt.mfce_aspp_rates:

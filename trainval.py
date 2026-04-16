@@ -83,6 +83,7 @@ class Trainval(object):
 
         self.model = create_model(opt)
         self.model.configure_rf_search(len(self.train_data))
+        self.lora_search_val_batches = self._build_lora_search_val_batches()
         self.optimizer = self.model.optimizer
         self.schedular = self.model.schedular
 
@@ -107,6 +108,45 @@ class Trainval(object):
                     "# time,epoch,train_loss,train_focal,train_dice,train_rf_div,lr,"
                 )
                 f.write("val_metrics(json)\n")
+
+    def _clone_batch(self, batch):
+        cloned = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                cloned[key] = value.clone()
+            elif isinstance(value, list):
+                cloned[key] = list(value)
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _build_lora_search_val_batches(self):
+        if not (
+            getattr(self.opt, "dino_lora_search", False)
+            and getattr(self.opt, "dino_lora_search_counterfactual", False)
+        ):
+            return []
+        if self.opt.distributed and not self.opt.is_main_process:
+            return []
+
+        max_batches = max(
+            0,
+            int(getattr(self.opt, "dino_lora_search_counterfactual_val_batches", 0)),
+        )
+        if max_batches <= 0:
+            return []
+
+        cached_batches = []
+        for batch in self.val_data:
+            cached_batches.append(self._clone_batch(batch))
+            if len(cached_batches) >= max_batches:
+                break
+
+        if self.opt.is_main_process:
+            print(
+                f"cached {len(cached_batches)} val batches for LoRA counterfactual rank search"
+            )
+        return cached_batches
 
     def _rescheduler(self, opt):
         self.model.optimizer = optim.AdamW(
@@ -300,7 +340,11 @@ if __name__ == "__main__":
                     "\n==> Name %s, Epoch %i, previous best = %.3f"
                     % (opt.name, epoch, trainval.previous_best * 100)
                 )
-            trainval.model.update_lora_rank_search(epoch)
+            trainval.model.update_lora_rank_search_with_val(
+                epoch,
+                trainval.lora_search_val_batches,
+                focal_weight=trainval.alpha,
+            )
             if epoch == int(opt.num_epochs * 0.9):
                 trainval._rescheduler(opt)
             train_stats = trainval.train(epoch)

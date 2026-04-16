@@ -57,6 +57,11 @@ class Model(nn.Module):
             dino_lora_search_grad_weight=opt.dino_lora_search_grad_weight,
             dino_lora_search_budget_mode=opt.dino_lora_search_budget_mode,
             dino_lora_search_group_weights=opt.dino_lora_search_group_weights,
+            dino_lora_search_counterfactual=opt.dino_lora_search_counterfactual,
+            dino_lora_search_counterfactual_val_batches=opt.dino_lora_search_counterfactual_val_batches,
+            dino_lora_search_counterfactual_max_candidates=opt.dino_lora_search_counterfactual_max_candidates,
+            dino_lora_search_counterfactual_delta=opt.dino_lora_search_counterfactual_delta,
+            dino_lora_search_counterfactual_patience=opt.dino_lora_search_counterfactual_patience,
             mfce_enable=opt.mfce_enable,
             mfce_mid_dim=opt.mfce_mid_dim,
             mfce_aspp_rates=opt.mfce_aspp_rates,
@@ -242,6 +247,56 @@ class Model(nn.Module):
         )
 
     def update_lora_rank_search(self, epoch):
+        return self.update_lora_rank_search_with_val(epoch, None, focal_weight=0.5)
+
+    @torch.no_grad()
+    def _evaluate_lora_counterfactual_loss(self, val_batches, focal_weight=0.5):
+        if not val_batches:
+            return None
+
+        network = self._unwrap_model(self.model)
+        was_training = network.training
+        network.eval()
+
+        total_loss = 0.0
+        total_batches = 0
+        for batch in val_batches:
+            x1 = batch["img1"].to(self.device, non_blocking=True)
+            x2 = batch["img2"].to(self.device, non_blocking=True)
+            label = batch["cd_label"].to(self.device, non_blocking=True).long()
+            final_pred, preds = network(x1, x2)
+
+            focal = self.focal(final_pred, label)
+            dice = self.dice(final_pred, label)
+            for pred in preds:
+                focal = focal + self.focal(pred, label)
+                dice = dice + 0.5 * self.dice(pred, label)
+            total_loss += float((focal_weight * focal + dice).item())
+            total_batches += 1
+
+        if was_training:
+            network.train()
+
+        return total_loss / max(total_batches, 1)
+
+    def sync_lora_rank_masks(self):
+        if not (self.use_distributed and getattr(self.opt, "dino_lora_search", False)):
+            return
+        if not torch.distributed.is_initialized():
+            return
+
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
+        if dino is None or not hasattr(dino, "iter_searchable_lora_layers"):
+            return
+
+        for layer in dino.iter_searchable_lora_layers():
+            torch.distributed.broadcast(layer.rank_mask, src=0)
+            layer.active_rank.fill_(int(layer.rank_mask.gt(0).sum().item()))
+            if hasattr(layer, "counterfactual_confirm"):
+                torch.distributed.broadcast(layer.counterfactual_confirm, src=0)
+
+    def update_lora_rank_search_with_val(self, epoch, val_batches=None, focal_weight=0.5):
         if not getattr(self.opt, "dino_lora_search", False):
             return None
 
@@ -249,7 +304,27 @@ class Model(nn.Module):
         if not hasattr(network.encoder.dino, "update_lora_rank_search"):
             return None
 
-        summary = network.encoder.dino.update_lora_rank_search(epoch, self.opt.num_epochs)
+        summary = None
+        eval_loss_fn = None
+        if (
+            getattr(self.opt, "dino_lora_search_counterfactual", False)
+            and val_batches
+            and (not self.use_distributed or self.opt.is_main_process)
+        ):
+            eval_loss_fn = lambda: self._evaluate_lora_counterfactual_loss(
+                val_batches,
+                focal_weight=focal_weight,
+            )
+
+        if not self.use_distributed or self.opt.is_main_process:
+            summary = network.encoder.dino.update_lora_rank_search(
+                epoch,
+                self.opt.num_epochs,
+                eval_loss_fn=eval_loss_fn,
+            )
+
+        self.sync_lora_rank_masks()
+
         if summary and self.opt.is_main_process:
             preview = ", ".join(str(rank) for rank in summary["active_ranks"][:8])
             suffix = " ..." if len(summary["active_ranks"]) > 8 else ""
@@ -257,12 +332,22 @@ class Model(nn.Module):
                 f"{group_name}:{rank}"
                 for group_name, rank in sorted(summary.get("group_active_ranks", {}).items())
             )
+            counterfactual_suffix = ""
+            if summary.get("counterfactual", False):
+                counterfactual_suffix = (
+                    f", cf_tested={summary.get('counterfactual_tested', 0)}"
+                    f", cf_safe={summary.get('counterfactual_accepted', 0)}"
+                    f", cf_pruned={summary.get('counterfactual_pruned', 0)}"
+                    f", cf_gap={summary.get('counterfactual_budget_gap', 0)}"
+                    f", cf_loss={summary.get('counterfactual_baseline_loss', float('nan')):.4f}"
+                )
             print(
                 f"LoRA rank search -> budget={summary['budget_rank']}, "
                 f"mode={summary.get('budget_mode', 'global')}, "
                 f"total_active={summary['total_active_rank']}, "
                 f"groups=[{group_preview}], "
                 f"layer_ranks=[{preview}{suffix}]"
+                f"{counterfactual_suffix}"
             )
         return summary
 

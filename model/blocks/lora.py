@@ -81,6 +81,9 @@ class SearchableLoRALinear(nn.Module):
         self.register_buffer("importance_ema_ready", torch.tensor(False, dtype=torch.bool))
         self.register_buffer("grad_a_ema_ready", torch.tensor(False, dtype=torch.bool))
         self.register_buffer("grad_b_ema_ready", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer(
+            "counterfactual_confirm", torch.zeros(self.r_max, dtype=torch.int64)
+        )
 
         self.lora_A.weight.register_hook(self._make_grad_hook("a"))
         self.lora_B.weight.register_hook(self._make_grad_hook("b"))
@@ -155,6 +158,34 @@ class SearchableLoRALinear(nn.Module):
             )
         self.rank_mask.copy_(mask)
         self.active_rank.fill_(int(mask.gt(0).sum().item()))
+
+    @torch.no_grad()
+    def get_rank_mask(self):
+        return self.rank_mask.clone()
+
+    @torch.no_grad()
+    def update_counterfactual_confirm(self, candidate_mask, tested_mask, safe_mask):
+        candidate_mask = candidate_mask.to(
+            device=self.counterfactual_confirm.device, dtype=torch.bool
+        ).view(-1)
+        tested_mask = tested_mask.to(
+            device=self.counterfactual_confirm.device, dtype=torch.bool
+        ).view(-1)
+        safe_mask = safe_mask.to(
+            device=self.counterfactual_confirm.device, dtype=torch.bool
+        ).view(-1)
+        if (
+            candidate_mask.numel() != self.r_max
+            or tested_mask.numel() != self.r_max
+            or safe_mask.numel() != self.r_max
+        ):
+            raise ValueError("Counterfactual masks must match the searchable LoRA rank.")
+
+        # Non-candidates and untested candidates should not accumulate stale confirmations.
+        self.counterfactual_confirm.masked_fill_(~candidate_mask, 0)
+        self.counterfactual_confirm.masked_fill_(candidate_mask & ~tested_mask, 0)
+        self.counterfactual_confirm.masked_fill_(tested_mask & ~safe_mask, 0)
+        self.counterfactual_confirm[safe_mask & tested_mask] += 1
 
     @torch.no_grad()
     def set_active_rank(self, rank: int):

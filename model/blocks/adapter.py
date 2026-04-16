@@ -38,6 +38,11 @@ class DINOV3Wrapper(nn.Module):
         lora_search_grad_weight=0.5,
         lora_search_budget_mode="grouped",
         lora_search_group_weights=None,
+        lora_search_counterfactual=False,
+        lora_search_counterfactual_val_batches=2,
+        lora_search_counterfactual_max_candidates=64,
+        lora_search_counterfactual_delta=0.0,
+        lora_search_counterfactual_patience=1,
     ):
         super().__init__()
         self.device = device
@@ -54,6 +59,19 @@ class DINOV3Wrapper(nn.Module):
         self.lora_search_score_norm = lora_search_score_norm
         self.lora_search_grad_weight = float(lora_search_grad_weight)
         self.lora_search_budget_mode = lora_search_budget_mode
+        self.lora_search_counterfactual = bool(lora_search_counterfactual)
+        self.lora_search_counterfactual_val_batches = int(
+            max(0, lora_search_counterfactual_val_batches)
+        )
+        self.lora_search_counterfactual_max_candidates = int(
+            max(1, lora_search_counterfactual_max_candidates)
+        )
+        self.lora_search_counterfactual_delta = float(
+            lora_search_counterfactual_delta
+        )
+        self.lora_search_counterfactual_patience = int(
+            max(1, lora_search_counterfactual_patience)
+        )
         self.lora_search_group_weights = {
             "attn.qkv": 1.0,
             "attn.proj": 1.0,
@@ -225,15 +243,185 @@ class DINOV3Wrapper(nn.Module):
 
         return allocated
 
+    def _compute_rank_budget(self, layers, budget_rank: int):
+        budget_rank = int(max(0, min(budget_rank, self.lora_r)))
+        total_capacity = sum(layer.r_max for layer in layers)
+        total_budget = min(total_capacity, budget_rank * len(layers))
+        return budget_rank, total_capacity, total_budget
+
+    def _compute_normalized_scores(self, layers):
+        layer_scores = [layer.importance_scores() for layer in layers]
+        group_to_indices = {}
+        group_capacity = {}
+        for index, layer in enumerate(layers):
+            group_name = layer.group_name
+            group_to_indices.setdefault(group_name, []).append(index)
+            group_capacity[group_name] = group_capacity.get(group_name, 0) + layer.r_max
+
+        normalized_scores = [None] * len(layers)
+        for group_name, indices in group_to_indices.items():
+            group_scores = [layer_scores[index] for index in indices]
+            group_scores = self._normalize_group_scores(
+                group_scores,
+                self.lora_search_score_norm,
+            )
+            for index, scores in zip(indices, group_scores):
+                normalized_scores[index] = scores
+        return normalized_scores, group_to_indices, group_capacity
+
+    def _build_keep_masks(self, layers, normalized_scores, total_budget, total_capacity, group_to_indices, group_capacity):
+        if total_budget <= 0:
+            return [torch.zeros_like(scores) for scores in normalized_scores], {}
+        if total_budget >= total_capacity:
+            return [torch.ones_like(scores) for scores in normalized_scores], {}
+
+        keep_masks = [torch.zeros_like(scores) for scores in normalized_scores]
+        if self.lora_search_budget_mode == "global":
+            flat_scores = torch.cat(normalized_scores, dim=0)
+            keep_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
+            keep_idx = flat_scores.topk(total_budget, largest=True, sorted=False).indices
+            keep_mask[keep_idx] = True
+
+            offset = 0
+            for index, layer in enumerate(layers):
+                next_offset = offset + layer.r_max
+                keep_masks[index] = keep_mask[offset:next_offset].to(
+                    dtype=layers[index].rank_mask.dtype
+                )
+                offset = next_offset
+            return keep_masks, {}
+
+        group_budgets = self._allocate_group_budgets(
+            total_budget,
+            group_capacity,
+            self.lora_search_group_weights,
+        )
+        for group_name, indices in group_to_indices.items():
+            group_budget = min(group_capacity[group_name], group_budgets.get(group_name, 0))
+            if group_budget <= 0:
+                continue
+            if group_budget >= group_capacity[group_name]:
+                for index in indices:
+                    keep_masks[index] = torch.ones_like(normalized_scores[index])
+                continue
+
+            group_scores = [normalized_scores[index] for index in indices]
+            flat_scores = torch.cat(group_scores, dim=0)
+            keep_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
+            keep_idx = flat_scores.topk(group_budget, largest=True, sorted=False).indices
+            keep_mask[keep_idx] = True
+
+            offset = 0
+            for index in indices:
+                layer = layers[index]
+                next_offset = offset + layer.r_max
+                keep_masks[index] = keep_mask[offset:next_offset].to(
+                    dtype=layer.rank_mask.dtype
+                )
+                offset = next_offset
+        return keep_masks, group_budgets
+
+    @staticmethod
+    def _apply_rank_masks(layers, masks):
+        for layer, mask in zip(layers, masks):
+            layer.set_rank_mask(mask)
+
+    @torch.no_grad()
+    def _update_lora_rank_budget_with_counterfactual(
+        self,
+        layers,
+        normalized_scores,
+        keep_masks,
+        total_budget,
+        eval_loss_fn,
+    ):
+        current_masks = [layer.get_rank_mask() for layer in layers]
+        candidate_records = []
+        candidate_masks = []
+        tested_masks = []
+        safe_masks = []
+        for index, (layer, current_mask, keep_mask, scores) in enumerate(
+            zip(layers, current_masks, keep_masks, normalized_scores)
+        ):
+            candidate_mask = current_mask.gt(0) & keep_mask.le(0)
+            candidate_masks.append(candidate_mask)
+            tested_masks.append(torch.zeros_like(candidate_mask, dtype=torch.bool))
+            safe_masks.append(torch.zeros_like(candidate_mask, dtype=torch.bool))
+            candidate_indices = candidate_mask.nonzero(as_tuple=False).flatten()
+            for rank_index in candidate_indices.tolist():
+                candidate_records.append(
+                    (
+                        float(scores[rank_index].item()),
+                        index,
+                        int(rank_index),
+                    )
+                )
+
+        candidate_records.sort(key=lambda item: item[0])
+        candidate_records = candidate_records[: self.lora_search_counterfactual_max_candidates]
+        baseline_loss = float(eval_loss_fn())
+
+        for _, layer_index, rank_index in candidate_records:
+            layer = layers[layer_index]
+            temp_mask = current_masks[layer_index].clone()
+            temp_mask[rank_index] = 0.0
+            layer.set_rank_mask(temp_mask)
+            drop_loss = float(eval_loss_fn())
+            layer.set_rank_mask(current_masks[layer_index])
+
+            delta = drop_loss - baseline_loss
+            tested_masks[layer_index][rank_index] = True
+            if delta <= self.lora_search_counterfactual_delta:
+                safe_masks[layer_index][rank_index] = True
+
+        final_masks = [mask.clone() for mask in current_masks]
+        confirmed_pruned = 0
+        tested_candidates = len(candidate_records)
+        accepted_candidates = 0
+        for index, layer in enumerate(layers):
+            layer.update_counterfactual_confirm(
+                candidate_masks[index],
+                tested_masks[index],
+                safe_masks[index],
+            )
+            confirmed_mask = candidate_masks[index] & layer.counterfactual_confirm.ge(
+                self.lora_search_counterfactual_patience
+            )
+            accepted_candidates += int(safe_masks[index].sum().item())
+            confirmed_pruned += int(confirmed_mask.sum().item())
+            final_masks[index][confirmed_mask] = 0.0
+
+        self._apply_rank_masks(layers, final_masks)
+
+        active_ranks = [int(layer.active_rank.item()) for layer in layers]
+        group_active_ranks = {}
+        for layer in layers:
+            group_active_ranks[layer.group_name] = (
+                group_active_ranks.get(layer.group_name, 0)
+                + int(layer.active_rank.item())
+            )
+
+        return {
+            "total_active_rank": int(sum(active_ranks)),
+            "active_ranks": active_ranks,
+            "group_active_ranks": group_active_ranks,
+            "counterfactual_tested": tested_candidates,
+            "counterfactual_accepted": accepted_candidates,
+            "counterfactual_pruned": confirmed_pruned,
+            "counterfactual_baseline_loss": baseline_loss,
+            "counterfactual_budget_gap": int(max(0, sum(active_ranks) - total_budget)),
+        }
+
     @torch.no_grad()
     def update_lora_rank_budget(self, budget_rank: int):
         layers = list(self.iter_searchable_lora_layers())
         if not layers:
             return None
 
-        budget_rank = int(max(0, min(budget_rank, self.lora_r)))
-        total_capacity = sum(layer.r_max for layer in layers)
-        total_budget = min(total_capacity, budget_rank * len(layers))
+        budget_rank, total_capacity, total_budget = self._compute_rank_budget(
+            layers,
+            budget_rank,
+        )
 
         if total_budget <= 0:
             for layer in layers:
@@ -242,66 +430,16 @@ class DINOV3Wrapper(nn.Module):
             for layer in layers:
                 layer.set_active_rank(layer.r_max)
         else:
-            layer_scores = [layer.importance_scores() for layer in layers]
-            group_to_indices = {}
-            group_capacity = {}
-            for index, layer in enumerate(layers):
-                group_name = layer.group_name
-                group_to_indices.setdefault(group_name, []).append(index)
-                group_capacity[group_name] = group_capacity.get(group_name, 0) + layer.r_max
-
-            normalized_scores = [None] * len(layers)
-            for group_name, indices in group_to_indices.items():
-                group_scores = [layer_scores[index] for index in indices]
-                group_scores = self._normalize_group_scores(
-                    group_scores,
-                    self.lora_search_score_norm,
-                )
-                for index, scores in zip(indices, group_scores):
-                    normalized_scores[index] = scores
-
-            if self.lora_search_budget_mode == "global":
-                flat_scores = torch.cat(normalized_scores, dim=0)
-                keep_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
-                keep_idx = flat_scores.topk(total_budget, largest=True, sorted=False).indices
-                keep_mask[keep_idx] = True
-
-                offset = 0
-                for layer in layers:
-                    next_offset = offset + layer.r_max
-                    local_mask = keep_mask[offset:next_offset].to(dtype=layer.rank_mask.dtype)
-                    layer.set_rank_mask(local_mask)
-                    offset = next_offset
-            else:
-                group_budgets = self._allocate_group_budgets(
-                    total_budget,
-                    group_capacity,
-                    self.lora_search_group_weights,
-                )
-                for group_name, indices in group_to_indices.items():
-                    group_budget = min(group_capacity[group_name], group_budgets.get(group_name, 0))
-                    if group_budget <= 0:
-                        for index in indices:
-                            layers[index].set_active_rank(0)
-                        continue
-                    if group_budget >= group_capacity[group_name]:
-                        for index in indices:
-                            layers[index].set_active_rank(layers[index].r_max)
-                        continue
-
-                    group_scores = [normalized_scores[index] for index in indices]
-                    flat_scores = torch.cat(group_scores, dim=0)
-                    keep_mask = torch.zeros_like(flat_scores, dtype=torch.bool)
-                    keep_idx = flat_scores.topk(group_budget, largest=True, sorted=False).indices
-                    keep_mask[keep_idx] = True
-
-                    offset = 0
-                    for index in indices:
-                        layer = layers[index]
-                        next_offset = offset + layer.r_max
-                        local_mask = keep_mask[offset:next_offset].to(dtype=layer.rank_mask.dtype)
-                        layer.set_rank_mask(local_mask)
-                        offset = next_offset
+            normalized_scores, group_to_indices, group_capacity = self._compute_normalized_scores(layers)
+            keep_masks, _ = self._build_keep_masks(
+                layers,
+                normalized_scores,
+                total_budget,
+                total_capacity,
+                group_to_indices,
+                group_capacity,
+            )
+            self._apply_rank_masks(layers, keep_masks)
 
         active_ranks = [int(layer.active_rank.item()) for layer in layers]
         group_active_ranks = {}
@@ -319,7 +457,7 @@ class DINOV3Wrapper(nn.Module):
         }
 
     @torch.no_grad()
-    def update_lora_rank_search(self, epoch: int, total_epochs: int):
+    def update_lora_rank_search(self, epoch: int, total_epochs: int, eval_loss_fn=None):
         if not self.lora_search or epoch % self.lora_search_interval != 0:
             return None
 
@@ -334,7 +472,48 @@ class DINOV3Wrapper(nn.Module):
         budget_rank = int(
             round(self.lora_r + (self.lora_r_target - self.lora_r) * progress)
         )
-        return self.update_lora_rank_budget(budget_rank)
+        layers = list(self.iter_searchable_lora_layers())
+        if not layers:
+            return None
+
+        budget_rank, total_capacity, total_budget = self._compute_rank_budget(
+            layers,
+            budget_rank,
+        )
+        if (
+            not self.lora_search_counterfactual
+            or eval_loss_fn is None
+            or total_budget <= 0
+            or total_budget >= total_capacity
+        ):
+            return self.update_lora_rank_budget(budget_rank)
+
+        normalized_scores, group_to_indices, group_capacity = self._compute_normalized_scores(layers)
+        keep_masks, group_budgets = self._build_keep_masks(
+            layers,
+            normalized_scores,
+            total_budget,
+            total_capacity,
+            group_to_indices,
+            group_capacity,
+        )
+        summary = self._update_lora_rank_budget_with_counterfactual(
+            layers,
+            normalized_scores,
+            keep_masks,
+            total_budget,
+            eval_loss_fn,
+        )
+        summary.update(
+            {
+                "budget_rank": budget_rank,
+                "budget_mode": self.lora_search_budget_mode,
+                "counterfactual": True,
+                "target_total_budget": int(total_budget),
+                "group_budgets": group_budgets,
+            }
+        )
+        return summary
 
     def forward(self, x):
         scale_factor = 2 / (512 / x.shape[-1])
