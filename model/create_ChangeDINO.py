@@ -75,6 +75,15 @@ class Model(nn.Module):
             mfce_rf_search_interval=opt.mfce_rf_search_interval,
             mfce_rf_max_search_step=opt.mfce_rf_max_search_step,
             mfce_rf_init_weight=opt.mfce_rf_init_weight,
+            decoder_rf_enable=opt.decoder_rf_enable,
+            decoder_rf_mode=opt.decoder_rf_mode,
+            decoder_rf_num_branches=opt.decoder_rf_num_branches,
+            decoder_rf_expand_rate=opt.decoder_rf_expand_rate,
+            decoder_rf_min_dilation=opt.decoder_rf_min_dilation,
+            decoder_rf_max_dilations=opt.decoder_rf_max_dilations,
+            decoder_rf_search_interval=opt.decoder_rf_search_interval,
+            decoder_rf_max_search_step=opt.decoder_rf_max_search_step,
+            decoder_rf_init_weight=opt.decoder_rf_init_weight,
             dino_temporal_exchange_enable=opt.dino_temporal_exchange_enable,
             dino_temporal_exchange_mode=opt.dino_temporal_exchange_mode,
             dino_temporal_exchange_thresh=opt.dino_temporal_exchange_thresh,
@@ -95,8 +104,20 @@ class Model(nn.Module):
         if opt.load_pretrain:
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
         should_merge_rf = opt.load_pretrain and (
-            getattr(opt, "mfce_rf_merge_on_eval", False)
-            or getattr(opt, "mfce_rf_mode", "") == "rfmerge"
+            (
+                getattr(opt, "mfce_rf_enable", False)
+                and (
+                    getattr(opt, "mfce_rf_merge_on_eval", False)
+                    or getattr(opt, "mfce_rf_mode", "") == "rfmerge"
+                )
+            )
+            or (
+                getattr(opt, "decoder_rf_enable", False)
+                and (
+                    getattr(opt, "decoder_rf_merge_on_eval", False)
+                    or getattr(opt, "decoder_rf_mode", "") == "rfmerge"
+                )
+            )
         )
         if should_merge_rf:
             self.merge_rf_branches()
@@ -177,62 +198,126 @@ class Model(nn.Module):
         encoder = getattr(network, "encoder", None)
         return getattr(encoder, "dense_adp", None)
 
-    def _log_rf_states(self, prefix="current"):
-        if not getattr(self.opt, "mfce_rf_enable", False):
-            return
-        dense_adapter = self._collect_dense_adapter()
-        if dense_adapter is None or not hasattr(dense_adapter, "rf_states"):
-            return
-        states = dense_adapter.rf_states()
-        if not states:
-            return
+    def _collect_detector(self):
+        network = self._unwrap_model(self.model)
+        return getattr(network, "detector", None)
 
-        print(f"{prefix} MFCE RF states:")
-        for branch_index, state in enumerate(states):
-            rates = ", ".join(
-                f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
-            )
-            weights = ", ".join(f"{weight:.3f}" for weight in state.get("weights", []))
-            print(
-                f"  branch{branch_index}: mode={state.get('mode')} "
-                f"dilation={state.get('dilation')} kernel={state.get('kernel_size')} "
-                f"rates=[{rates}] weights=[{weights}] merged={state.get('merged', False)} "
-                f"search_step={state.get('search_step', 0)} "
-                f"interval={state.get('search_interval')} "
-                f"window=[{state.get('start_step')},{state.get('stop_step')}]"
-            )
+    def _log_rf_states(self, prefix="current"):
+        dense_adapter = self._collect_dense_adapter()
+        if getattr(self.opt, "mfce_rf_enable", False) and dense_adapter is not None:
+            states = dense_adapter.rf_states() if hasattr(dense_adapter, "rf_states") else []
+            if states:
+                print(f"{prefix} MFCE RF states:")
+                for branch_index, state in enumerate(states):
+                    rates = ", ".join(
+                        f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
+                    )
+                    weights = ", ".join(
+                        f"{weight:.3f}" for weight in state.get("weights", [])
+                    )
+                    print(
+                        f"  branch{branch_index}: mode={state.get('mode')} "
+                        f"dilation={state.get('dilation')} kernel={state.get('kernel_size')} "
+                        f"rates=[{rates}] weights=[{weights}] merged={state.get('merged', False)} "
+                        f"search_step={state.get('search_step', 0)} "
+                        f"interval={state.get('search_interval')} "
+                        f"window=[{state.get('start_step')},{state.get('stop_step')}]"
+                    )
+
+        detector = self._collect_detector()
+        if getattr(self.opt, "decoder_rf_enable", False) and detector is not None:
+            states = detector.rf_states() if hasattr(detector, "rf_states") else []
+            if states:
+                print(f"{prefix} Decoder RF states:")
+                for state in states:
+                    rates = ", ".join(
+                        f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
+                    )
+                    weights = ", ".join(
+                        f"{weight:.3f}" for weight in state.get("weights", [])
+                    )
+                    print(
+                        f"  {state.get('name')}: mode={state.get('mode')} "
+                        f"dilation={state.get('dilation')} kernel={state.get('kernel_size')} "
+                        f"rates=[{rates}] weights=[{weights}] merged={state.get('merged', False)} "
+                        f"search_step={state.get('search_step', 0)} "
+                        f"interval={state.get('search_interval')} "
+                        f"window=[{state.get('start_step')},{state.get('stop_step')}]"
+                    )
 
     def configure_rf_search(self, steps_per_epoch: int):
-        if not getattr(self.opt, "mfce_rf_enable", False):
-            return None
         dense_adapter = self._collect_dense_adapter()
-        if dense_adapter is None or not hasattr(dense_adapter, "configure_rf_search"):
-            return None
+        detector = self._collect_detector()
+        summaries = {}
 
-        schedule_mode = getattr(self.opt, "mfce_rf_schedule_mode", "manual")
-        summary = dense_adapter.configure_rf_search(
-            schedule_mode=schedule_mode,
-            steps_per_epoch=max(1, int(steps_per_epoch)),
-            total_epochs=self.opt.num_epochs,
-            search_interval=self.opt.mfce_rf_search_interval,
-            max_search_step=self.opt.mfce_rf_max_search_step,
-            warmup_epochs=self.opt.mfce_rf_search_warmup_epochs,
-            search_epochs=self.opt.mfce_rf_search_epochs,
-        )
-        if summary and self.opt.is_main_process:
-            print(
-                "RF search schedule -> "
-                f"mode={schedule_mode}, interval={summary.get('search_interval')}, "
-                f"max_steps={summary.get('max_search_step')}, "
-                f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
+        if (
+            getattr(self.opt, "mfce_rf_enable", False)
+            and dense_adapter is not None
+            and hasattr(dense_adapter, "configure_rf_search")
+        ):
+            schedule_mode = getattr(self.opt, "mfce_rf_schedule_mode", "manual")
+            summary = dense_adapter.configure_rf_search(
+                schedule_mode=schedule_mode,
+                steps_per_epoch=max(1, int(steps_per_epoch)),
+                total_epochs=self.opt.num_epochs,
+                search_interval=self.opt.mfce_rf_search_interval,
+                max_search_step=self.opt.mfce_rf_max_search_step,
+                warmup_epochs=self.opt.mfce_rf_search_warmup_epochs,
+                search_epochs=self.opt.mfce_rf_search_epochs,
             )
-        return summary
+            if summary:
+                summaries["mfce"] = summary
+                if self.opt.is_main_process:
+                    print(
+                        "MFCE RF search schedule -> "
+                        f"mode={schedule_mode}, interval={summary.get('search_interval')}, "
+                        f"max_steps={summary.get('max_search_step')}, "
+                        f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
+                    )
+
+        if (
+            getattr(self.opt, "decoder_rf_enable", False)
+            and detector is not None
+            and hasattr(detector, "configure_rf_search")
+        ):
+            schedule_mode = getattr(self.opt, "decoder_rf_schedule_mode", "manual")
+            summary = detector.configure_rf_search(
+                schedule_mode=schedule_mode,
+                steps_per_epoch=max(1, int(steps_per_epoch)),
+                total_epochs=self.opt.num_epochs,
+                search_interval=self.opt.decoder_rf_search_interval,
+                max_search_step=self.opt.decoder_rf_max_search_step,
+                warmup_epochs=self.opt.decoder_rf_search_warmup_epochs,
+                search_epochs=self.opt.decoder_rf_search_epochs,
+            )
+            if summary:
+                summaries["decoder"] = summary
+                if self.opt.is_main_process:
+                    print(
+                        "Decoder RF search schedule -> "
+                        f"mode={schedule_mode}, interval={summary.get('search_interval')}, "
+                        f"max_steps={summary.get('max_search_step')}, "
+                        f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
+                    )
+        return summaries if summaries else None
 
     def merge_rf_branches(self):
+        merged = {}
         dense_adapter = self._collect_dense_adapter()
-        if dense_adapter is None or not hasattr(dense_adapter, "merge_rf_branches_"):
-            return None
-        return dense_adapter.merge_rf_branches_()
+        if (
+            getattr(self.opt, "mfce_rf_enable", False)
+            and dense_adapter is not None
+            and hasattr(dense_adapter, "merge_rf_branches_")
+        ):
+            merged["mfce"] = dense_adapter.merge_rf_branches_()
+        detector = self._collect_detector()
+        if (
+            getattr(self.opt, "decoder_rf_enable", False)
+            and detector is not None
+            and hasattr(detector, "merge_rf_branches_")
+        ):
+            merged["decoder"] = detector.merge_rf_branches_()
+        return merged if merged else None
 
     def rf_diversity_loss(self):
         if (

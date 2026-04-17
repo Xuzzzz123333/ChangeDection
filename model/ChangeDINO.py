@@ -8,7 +8,7 @@ from .blocks.cbam import CBAM
 from .blocks.adapter import DINOV3Wrapper, DenseAdapterLite
 from .blocks.change_prior import AdaptiveChangePriorPyramid
 from .blocks.diffatts import TransformerBlock
-from .blocks.mfce import MFCEPyramidAdapter, TemporalFeatureExchange
+from .blocks.mfce import MFCEPyramidAdapter, RFConv2d, TemporalFeatureExchange
 from .blocks.pair_local import PairLocalPyramid
 from .blocks.refine import LearnableSoftMorph
 from .backbone.mobilenetv2 import mobilenet_v2
@@ -75,6 +75,59 @@ class PyramidFeatureFusion(nn.Module):
         x1 = self.c1(x1)
 
         return x1, x2, x3, x4
+
+
+class RFConvBnAct(nn.Module):
+    def __init__(
+        self,
+        dim,
+        kernel_size=3,
+        stride=1,
+        act=nn.SiLU,
+        rf_mode="rfsearch",
+        rf_num_branches=3,
+        rf_expand_rate=0.5,
+        rf_min_dilation=1,
+        rf_max_dilation=None,
+        rf_search_interval=100,
+        rf_max_search_step=8,
+        rf_init_weight=0.01,
+    ):
+        super().__init__()
+        self.conv = RFConv2d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=0,
+            dilation=1,
+            bias=False,
+            num_branches=rf_num_branches,
+            expand_rate=rf_expand_rate,
+            min_dilation=rf_min_dilation,
+            max_dilation=rf_max_dilation,
+            init_weight=rf_init_weight,
+            search_interval=rf_search_interval,
+            max_search_step=rf_max_search_step,
+            rf_mode=rf_mode,
+        )
+        self.bn = nn.BatchNorm2d(dim)
+        self.act = act(inplace=True)
+
+    def rf_state(self):
+        return self.conv.rf_state()
+
+    def configure_search_schedule(self, **kwargs):
+        return self.conv.configure_search_schedule(**kwargs)
+
+    def merge_branches_(self):
+        return self.conv.merge_branches_()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
 
 
 class Encoder(nn.Module):
@@ -189,14 +242,56 @@ class Encoder(nn.Module):
 
 
 class FuseGated(nn.Module):
-    def __init__(self, dim):
+    def __init__(
+        self,
+        dim,
+        rf_enable=False,
+        rf_mode="rfsearch",
+        rf_num_branches=3,
+        rf_expand_rate=0.5,
+        rf_min_dilation=1,
+        rf_max_dilation=None,
+        rf_search_interval=100,
+        rf_max_search_step=8,
+        rf_init_weight=0.01,
+    ):
         super().__init__()
+        self.rf_enable = bool(rf_enable)
         self.gate = nn.Sequential(nn.Conv2d(2 * dim, dim, 1, bias=True), nn.Sigmoid())
-        self.mix = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.SiLU(inplace=True),
-        )
+        if self.rf_enable:
+            self.mix = RFConvBnAct(
+                dim,
+                kernel_size=3,
+                rf_mode=rf_mode,
+                rf_num_branches=rf_num_branches,
+                rf_expand_rate=rf_expand_rate,
+                rf_min_dilation=rf_min_dilation,
+                rf_max_dilation=rf_max_dilation,
+                rf_search_interval=rf_search_interval,
+                rf_max_search_step=rf_max_search_step,
+                rf_init_weight=rf_init_weight,
+            )
+        else:
+            self.mix = nn.Sequential(
+                nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+                nn.BatchNorm2d(dim),
+                nn.SiLU(inplace=True),
+            )
+
+    def rf_state(self):
+        if not self.rf_enable:
+            return {}
+        return self.mix.rf_state()
+
+    def configure_rf_search(self, **kwargs):
+        if not self.rf_enable:
+            return None
+        return self.mix.configure_search_schedule(**kwargs)
+
+    def merge_rf_branches_(self):
+        if not self.rf_enable:
+            return None
+        return self.mix.merge_branches_()
 
     def forward(self, x1, x2):
         x1 = F.interpolate(x1, size=x2.shape[-2:], mode="bilinear", align_corners=False)
@@ -214,6 +309,7 @@ class Detector(nn.Module):
     ):
         super().__init__()
         self.acpc_enable = kwargs.get("acpc_enable", False)
+        self.decoder_rf_enable = kwargs.get("decoder_rf_enable", False)
         self.change_prior = None
         if self.acpc_enable:
             self.change_prior = AdaptiveChangePriorPyramid(
@@ -225,9 +321,45 @@ class Detector(nn.Module):
                 norm_groups=kwargs.get("acpc_norm_groups", 8),
                 residual_scale=kwargs.get("acpc_residual_scale", 0.05),
             )
-        self.p5_to_p4 = FuseGated(fpn_channels)
-        self.p4_to_p3 = FuseGated(fpn_channels)
-        self.p3_to_p2 = FuseGated(fpn_channels)
+        decoder_rf_max_dilations = kwargs.get("decoder_rf_max_dilations", None)
+        if decoder_rf_max_dilations is None:
+            decoder_rf_max_dilations = [None, None, None]
+        self.p5_to_p4 = FuseGated(
+            fpn_channels,
+            rf_enable=self.decoder_rf_enable,
+            rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
+            rf_num_branches=kwargs.get("decoder_rf_num_branches", 3),
+            rf_expand_rate=kwargs.get("decoder_rf_expand_rate", 0.5),
+            rf_min_dilation=kwargs.get("decoder_rf_min_dilation", 1),
+            rf_max_dilation=decoder_rf_max_dilations[0],
+            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
+            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
+            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+        )
+        self.p4_to_p3 = FuseGated(
+            fpn_channels,
+            rf_enable=self.decoder_rf_enable,
+            rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
+            rf_num_branches=kwargs.get("decoder_rf_num_branches", 3),
+            rf_expand_rate=kwargs.get("decoder_rf_expand_rate", 0.5),
+            rf_min_dilation=kwargs.get("decoder_rf_min_dilation", 1),
+            rf_max_dilation=decoder_rf_max_dilations[1],
+            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
+            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
+            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+        )
+        self.p3_to_p2 = FuseGated(
+            fpn_channels,
+            rf_enable=self.decoder_rf_enable,
+            rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
+            rf_num_branches=kwargs.get("decoder_rf_num_branches", 3),
+            rf_expand_rate=kwargs.get("decoder_rf_expand_rate", 0.5),
+            rf_min_dilation=kwargs.get("decoder_rf_min_dilation", 1),
+            rf_max_dilation=decoder_rf_max_dilations[2],
+            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
+            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
+            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+        )
 
         self.tb5 = nn.Sequential(
             *[
@@ -297,6 +429,39 @@ class Detector(nn.Module):
         self.p4_head = nn.Conv2d(fpn_channels, 2, 1)
         self.p3_head = nn.Conv2d(fpn_channels, 2, 1)
         self.p2_head = nn.Conv2d(fpn_channels, 2, 1)
+
+    def _iter_rf_fuse_modules(self):
+        if not self.decoder_rf_enable:
+            return []
+        return [
+            ("p5_to_p4", self.p5_to_p4),
+            ("p4_to_p3", self.p4_to_p3),
+            ("p3_to_p2", self.p3_to_p2),
+        ]
+
+    def rf_states(self):
+        return [
+            {"name": name, **module.rf_state()}
+            for name, module in self._iter_rf_fuse_modules()
+        ]
+
+    def configure_rf_search(self, **kwargs):
+        stage_summaries = []
+        for name, module in self._iter_rf_fuse_modules():
+            summary = module.configure_rf_search(**kwargs)
+            if summary is not None:
+                stage_summaries.append({"name": name, **summary})
+        if not stage_summaries:
+            return None
+        summary = stage_summaries[0].copy()
+        summary["stages"] = stage_summaries
+        return summary
+
+    def merge_rf_branches_(self):
+        return [
+            {"name": name, **module.merge_rf_branches_()}
+            for name, module in self._iter_rf_fuse_modules()
+        ]
 
     def _build_change_priors(self, x1s, x2s):
         if self.change_prior is not None:

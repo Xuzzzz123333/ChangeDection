@@ -362,9 +362,18 @@ if __name__ == "__main__":
             trainval._append_log_line(epoch, train_stats, val_scores)
             if (
                 opt.is_main_process
-                and opt.mfce_rf_enable
-                and opt.mfce_rf_log_interval > 0
-                and epoch % opt.mfce_rf_log_interval == 0
+                and (
+                    (
+                        opt.mfce_rf_enable
+                        and opt.mfce_rf_log_interval > 0
+                        and epoch % opt.mfce_rf_log_interval == 0
+                    )
+                    or (
+                        opt.decoder_rf_enable
+                        and opt.decoder_rf_log_interval > 0
+                        and epoch % opt.decoder_rf_log_interval == 0
+                    )
+                )
             ):
                 trainval.model._log_rf_states(f"epoch {epoch}")
 
