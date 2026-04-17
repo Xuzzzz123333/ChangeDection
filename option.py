@@ -78,6 +78,11 @@ class Options:
         self.parser.add_argument("--lr", type=float, default=5e-4)
         self.parser.add_argument("--weight_decay", type=float, default=5e-4)
         self.parser.add_argument("--dino_lora", action="store_true")
+        self.parser.add_argument(
+            "--dino_dora",
+            action="store_true",
+            help="use fixed-rank DoRA adapters on DINOv3 linear layers instead of LoRA",
+        )
         self.parser.add_argument("--dino_lora_r", type=int, default=8)
         self.parser.add_argument("--dino_lora_alpha", type=int, default=16)
         self.parser.add_argument("--dino_lora_dropout", type=float, default=0.05)
@@ -502,8 +507,14 @@ class Options:
             )
         if self.opt.vis_interval < 0:
             raise ValueError("--vis_interval must be >= 0.")
+        if self.opt.dino_lora and self.opt.dino_dora:
+            raise ValueError("--dino_lora and --dino_dora are mutually exclusive.")
+        if (self.opt.dino_lora or self.opt.dino_dora) and self.opt.dino_lora_r <= 0:
+            raise ValueError("--dino_lora_r must be > 0 when LoRA or DoRA is enabled.")
         if self.opt.dino_lora_search and not self.opt.dino_lora:
             raise ValueError("--dino_lora_search requires --dino_lora to be enabled.")
+        if self.opt.dino_dora and self.opt.dino_lora_search:
+            raise ValueError("--dino_dora currently supports only fixed-rank baselines, not rank search.")
         if self.opt.dino_lora_search and self.opt.dino_lora_r <= 0:
             raise ValueError("--dino_lora_r must be > 0 when --dino_lora_search is enabled.")
         if self.opt.dino_lora_r_target < 0:

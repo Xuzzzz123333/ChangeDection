@@ -45,6 +45,7 @@ class Model(nn.Module):
             n_layers=opt.n_layers,
             extract_ids=opt.extract_ids,
             dino_lora=opt.dino_lora,
+            dino_dora=opt.dino_dora,
             dino_lora_r=opt.dino_lora_r,
             dino_lora_alpha=opt.dino_lora_alpha,
             dino_lora_dropout=opt.dino_lora_dropout,
@@ -169,7 +170,7 @@ class Model(nn.Module):
         print(f"trainable parameter tensors: {len(trainable)}")
         print(f"trainable parameters total: {total_trainable}")
 
-        if self.opt.dino_lora:
+        if self.opt.dino_lora or getattr(self.opt, "dino_dora", False):
             dino_trainable = [
                 (name, numel)
                 for name, numel in trainable
@@ -178,18 +179,21 @@ class Model(nn.Module):
             lora_trainable = [
                 (name, numel)
                 for name, numel in trainable
-                if ".lora_" in name
+                if ".lora_" in name or ".dora_" in name
             ]
             print(f"trainable DINO tensors: {len(dino_trainable)}")
             print(f"trainable DINO parameters total: {sum(numel for _, numel in dino_trainable)}")
-            print(f"trainable LoRA tensors: {len(lora_trainable)}")
-            print(f"trainable LoRA parameters total: {sum(numel for _, numel in lora_trainable)}")
+            adapter_label = "DoRA" if getattr(self.opt, "dino_dora", False) else "LoRA"
+            print(f"trainable {adapter_label} tensors: {len(lora_trainable)}")
+            print(f"trainable {adapter_label} parameters total: {sum(numel for _, numel in lora_trainable)}")
 
             if not lora_trainable:
-                raise RuntimeError("LoRA is enabled, but no trainable LoRA parameters were found.")
+                raise RuntimeError(
+                    f"{adapter_label} is enabled, but no trainable adapter parameters were found."
+                )
 
             preview_limit = 12
-            print("sample trainable LoRA parameter names:")
+            print(f"sample trainable {adapter_label} parameter names:")
             for name, _ in lora_trainable[:preview_limit]:
                 print(f"  {name}")
 

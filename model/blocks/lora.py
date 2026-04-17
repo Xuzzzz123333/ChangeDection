@@ -35,6 +35,65 @@ class LoRALinear(nn.Module):
         return self.base_layer(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
 
 
+class DoRALinear(nn.Module):
+    def __init__(self, base_layer: nn.Linear, r=4, alpha=16, dropout=0.05, eps=1e-6):
+        super().__init__()
+        assert isinstance(base_layer, nn.Linear), "DoRA can only be applied to nn.Linear layers."
+
+        self.base_layer = base_layer
+        self.r = int(r)
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        self.alpha = alpha
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.scaling = alpha / r if r > 0 else 0.0
+        self.eps = float(eps)
+
+        for p in self.base_layer.parameters():
+            p.requires_grad = False
+
+        self.lora_A = None
+        self.lora_B = None
+        self.dora_magnitude = None
+        if self.r > 0:
+            self.lora_A = nn.Linear(self.in_features, self.r, bias=False)
+            self.lora_B = nn.Linear(self.r, self.out_features, bias=False)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+
+            with torch.no_grad():
+                init_magnitude = base_layer.weight.detach().float().norm(dim=1)
+            self.dora_magnitude = nn.Parameter(init_magnitude)
+
+    def _reshape_scale(self, ref_tensor, scale):
+        shape = [1] * (ref_tensor.dim() - 1) + [scale.numel()]
+        return scale.view(*shape)
+
+    def forward(self, x):
+        if self.r <= 0 or self.lora_A is None or self.lora_B is None:
+            return self.base_layer(x)
+
+        base_result = self.base_layer(x)
+        base_linear = nn.functional.linear(x, self.base_layer.weight, bias=None)
+        lora_update = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+
+        delta_weight = torch.matmul(self.lora_B.weight, self.lora_A.weight) * self.scaling
+        adapted_weight = self.base_layer.weight + delta_weight.to(
+            dtype=self.base_layer.weight.dtype
+        )
+        weight_norm = adapted_weight.float().norm(dim=1).clamp_min(self.eps).detach()
+        magnitude_scale = self._reshape_scale(
+            base_linear,
+            self.dora_magnitude.to(weight_norm.dtype) / weight_norm,
+        ).to(dtype=base_linear.dtype)
+
+        return (
+            base_result
+            + (magnitude_scale - 1.0) * base_linear
+            + magnitude_scale * lora_update
+        )
+
+
 class SearchableLoRALinear(nn.Module):
     def __init__(
         self,

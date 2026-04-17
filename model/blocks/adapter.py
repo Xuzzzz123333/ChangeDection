@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lora import LoRALinear, SearchableLoRALinear
+from .lora import DoRALinear, LoRALinear, SearchableLoRALinear
 
 REPO_DIR = "dinov3"
 DINO_NAME = "dinov3_vitl16"
@@ -25,6 +25,7 @@ class DINOV3Wrapper(nn.Module):
         extract_ids=[5, 11, 17, 23],
         device="cuda",
         use_lora=False,
+        use_dora=False,
         lora_r=4,
         lora_alpha=16,
         lora_dropout=0.05,
@@ -46,7 +47,8 @@ class DINOV3Wrapper(nn.Module):
     ):
         super().__init__()
         self.device = device
-        self.use_lora = use_lora
+        self.use_dora = bool(use_dora)
+        self.use_lora = bool(use_lora or self.use_dora)
         self.lora_search = self.use_lora and lora_search
         self.lora_r = int(lora_r)
         self.lora_r_target = (
@@ -103,6 +105,7 @@ class DINOV3Wrapper(nn.Module):
                 alpha=lora_alpha,
                 dropout=lora_dropout,
                 search=self.lora_search,
+                use_dora=self.use_dora,
                 alpha_over_r=self.lora_alpha_over_r,
                 score_ema_decay=self.lora_search_ema_decay,
                 grad_weight=self.lora_search_grad_weight,
@@ -141,6 +144,7 @@ class DINOV3Wrapper(nn.Module):
         alpha=16,
         dropout=0.05,
         search=False,
+        use_dora=False,
         alpha_over_r=1.0,
         score_ema_decay=0.9,
         grad_weight=0.5,
@@ -149,6 +153,8 @@ class DINOV3Wrapper(nn.Module):
             full_name = f"{prefix}.{name}" if prefix else name
             if isinstance(child, nn.Linear) and DINOV3Wrapper.should_apply_lora(full_name):
                 if search:
+                    if use_dora:
+                        raise ValueError("Searchable DoRA is not supported yet.")
                     setattr(
                         module,
                         name,
@@ -164,7 +170,18 @@ class DINOV3Wrapper(nn.Module):
                         ),
                     )
                 else:
-                    setattr(module, name, LoRALinear(child, r=r, alpha=alpha, dropout=dropout))
+                    if use_dora:
+                        setattr(
+                            module,
+                            name,
+                            DoRALinear(child, r=r, alpha=alpha, dropout=dropout),
+                        )
+                    else:
+                        setattr(
+                            module,
+                            name,
+                            LoRALinear(child, r=r, alpha=alpha, dropout=dropout),
+                        )
             else:
                 DINOV3Wrapper.inject_lora(
                     child,
@@ -173,6 +190,7 @@ class DINOV3Wrapper(nn.Module):
                     alpha=alpha,
                     dropout=dropout,
                     search=search,
+                    use_dora=use_dora,
                     alpha_over_r=alpha_over_r,
                     score_ema_decay=score_ema_decay,
                     grad_weight=grad_weight,

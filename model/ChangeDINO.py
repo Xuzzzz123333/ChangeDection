@@ -159,6 +159,7 @@ class Encoder(nn.Module):
             device=device,
             extract_ids=extract_ids,
             use_lora=kwargs.get("dino_lora", False),
+            use_dora=kwargs.get("dino_dora", False),
             lora_r=kwargs.get("dino_lora_r", 8),
             lora_alpha=kwargs.get("dino_lora_alpha", 16),
             lora_dropout=kwargs.get("dino_lora_dropout", 0.05),
