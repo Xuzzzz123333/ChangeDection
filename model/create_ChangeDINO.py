@@ -95,6 +95,15 @@ class Model(nn.Module):
             pairlocal_hidden_ratio=opt.pairlocal_hidden_ratio,
             pairlocal_norm_groups=opt.pairlocal_norm_groups,
             pairlocal_residual_scale=opt.pairlocal_residual_scale,
+            pairlocal_rf_enable=opt.pairlocal_rf_enable,
+            pairlocal_rf_mode=opt.pairlocal_rf_mode,
+            pairlocal_rf_num_branches=opt.pairlocal_rf_num_branches,
+            pairlocal_rf_expand_rate=opt.pairlocal_rf_expand_rate,
+            pairlocal_rf_min_dilation=opt.pairlocal_rf_min_dilation,
+            pairlocal_rf_max_dilations=opt.pairlocal_rf_max_dilations,
+            pairlocal_rf_search_interval=opt.pairlocal_rf_search_interval,
+            pairlocal_rf_max_search_step=opt.pairlocal_rf_max_search_step,
+            pairlocal_rf_init_weight=opt.pairlocal_rf_init_weight,
             acpc_enable=opt.acpc_enable,
             acpc_stage_modes=opt.acpc_stage_modes,
             acpc_hidden_ratio=opt.acpc_hidden_ratio,
@@ -117,6 +126,13 @@ class Model(nn.Module):
                 and (
                     getattr(opt, "decoder_rf_merge_on_eval", False)
                     or getattr(opt, "decoder_rf_mode", "") == "rfmerge"
+                )
+            )
+            or (
+                getattr(opt, "pairlocal_rf_enable", False)
+                and (
+                    getattr(opt, "pairlocal_rf_merge_on_eval", False)
+                    or getattr(opt, "pairlocal_rf_mode", "") == "rfmerge"
                 )
             )
         )
@@ -206,6 +222,10 @@ class Model(nn.Module):
         network = self._unwrap_model(self.model)
         return getattr(network, "detector", None)
 
+    def _collect_pairlocal(self):
+        network = self._unwrap_model(self.model)
+        return getattr(network, "pairlocal", None)
+
     def _log_rf_states(self, prefix="current"):
         dense_adapter = self._collect_dense_adapter()
         if getattr(self.opt, "mfce_rf_enable", False) and dense_adapter is not None:
@@ -249,9 +269,31 @@ class Model(nn.Module):
                         f"window=[{state.get('start_step')},{state.get('stop_step')}]"
                     )
 
+        pairlocal = self._collect_pairlocal()
+        if getattr(self.opt, "pairlocal_rf_enable", False) and pairlocal is not None:
+            states = pairlocal.rf_states() if hasattr(pairlocal, "rf_states") else []
+            if states:
+                print(f"{prefix} PairLocal RF states:")
+                for state in states:
+                    rates = ", ".join(
+                        f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
+                    )
+                    weights = ", ".join(
+                        f"{weight:.3f}" for weight in state.get("weights", [])
+                    )
+                    print(
+                        f"  {state.get('name')}: mode={state.get('mode')} "
+                        f"dilation={state.get('dilation')} kernel={state.get('kernel_size')} "
+                        f"rates=[{rates}] weights=[{weights}] merged={state.get('merged', False)} "
+                        f"search_step={state.get('search_step', 0)} "
+                        f"interval={state.get('search_interval')} "
+                        f"window=[{state.get('start_step')},{state.get('stop_step')}]"
+                    )
+
     def configure_rf_search(self, steps_per_epoch: int):
         dense_adapter = self._collect_dense_adapter()
         detector = self._collect_detector()
+        pairlocal = self._collect_pairlocal()
         summaries = {}
 
         if (
@@ -303,6 +345,30 @@ class Model(nn.Module):
                         f"max_steps={summary.get('max_search_step')}, "
                         f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
                     )
+        if (
+            getattr(self.opt, "pairlocal_rf_enable", False)
+            and pairlocal is not None
+            and hasattr(pairlocal, "configure_rf_search")
+        ):
+            schedule_mode = getattr(self.opt, "pairlocal_rf_schedule_mode", "manual")
+            summary = pairlocal.configure_rf_search(
+                schedule_mode=schedule_mode,
+                steps_per_epoch=max(1, int(steps_per_epoch)),
+                total_epochs=self.opt.num_epochs,
+                search_interval=self.opt.pairlocal_rf_search_interval,
+                max_search_step=self.opt.pairlocal_rf_max_search_step,
+                warmup_epochs=self.opt.pairlocal_rf_search_warmup_epochs,
+                search_epochs=self.opt.pairlocal_rf_search_epochs,
+            )
+            if summary:
+                summaries["pairlocal"] = summary
+                if self.opt.is_main_process:
+                    print(
+                        "PairLocal RF search schedule -> "
+                        f"mode={schedule_mode}, interval={summary.get('search_interval')}, "
+                        f"max_steps={summary.get('max_search_step')}, "
+                        f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
+                    )
         return summaries if summaries else None
 
     def merge_rf_branches(self):
@@ -321,6 +387,13 @@ class Model(nn.Module):
             and hasattr(detector, "merge_rf_branches_")
         ):
             merged["decoder"] = detector.merge_rf_branches_()
+        pairlocal = self._collect_pairlocal()
+        if (
+            getattr(self.opt, "pairlocal_rf_enable", False)
+            and pairlocal is not None
+            and hasattr(pairlocal, "merge_rf_branches_")
+        ):
+            merged["pairlocal"] = pairlocal.merge_rf_branches_()
         return merged if merged else None
 
     def rf_diversity_loss(self):

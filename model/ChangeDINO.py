@@ -522,6 +522,15 @@ class ChangeModel(nn.Module):
                 hidden_ratio=kwargs.get("pairlocal_hidden_ratio", 1.0),
                 norm_groups=kwargs.get("pairlocal_norm_groups", 8),
                 residual_scale=kwargs.get("pairlocal_residual_scale", 0.1),
+                rf_enable=kwargs.get("pairlocal_rf_enable", False),
+                rf_mode=kwargs.get("pairlocal_rf_mode", "rfsearch"),
+                rf_num_branches=kwargs.get("pairlocal_rf_num_branches", 3),
+                rf_expand_rate=kwargs.get("pairlocal_rf_expand_rate", 0.5),
+                rf_min_dilation=kwargs.get("pairlocal_rf_min_dilation", 1),
+                rf_max_dilations=kwargs.get("pairlocal_rf_max_dilations", None),
+                rf_search_interval=kwargs.get("pairlocal_rf_search_interval", 100),
+                rf_max_search_step=kwargs.get("pairlocal_rf_max_search_step", 8),
+                rf_init_weight=kwargs.get("pairlocal_rf_init_weight", 0.01),
             )
         self.temporal_exchange = None
         if kwargs.get("dino_temporal_exchange_enable", False):

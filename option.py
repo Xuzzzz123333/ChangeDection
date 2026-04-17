@@ -458,6 +458,91 @@ class Options:
             help="initial residual scale for pair-local feature updates",
         )
         self.parser.add_argument(
+            "--pairlocal_rf_enable",
+            action="store_true",
+            help="replace full-mode PairLocal context depthwise convolutions with RF-Next style receptive-field search",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_mode",
+            type=str,
+            default="rfsearch",
+            choices=["rfsearch", "rfsingle", "rfmultiple", "rfmerge"],
+            help="RF-Next mode used inside full-mode PairLocal context convolutions",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_num_branches",
+            type=int,
+            default=3,
+            help="number of local dilation candidates maintained by each PairLocal RF branch",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_expand_rate",
+            type=float,
+            default=0.5,
+            help="local expansion ratio used by PairLocal RF search",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_min_dilation",
+            type=int,
+            default=1,
+            help="minimum dilation allowed by PairLocal RF search",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_max_dilations",
+            nargs="+",
+            type=int,
+            default=None,
+            help="optional per-stage max dilations for PairLocal RF search; provide one value or one per p2-p5 stage",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_search_interval",
+            type=int,
+            default=100,
+            help="forward-step interval between PairLocal RF estimate-expand updates",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_max_search_step",
+            type=int,
+            default=8,
+            help="maximum number of PairLocal RF local search refinements; 0 disables iterative updates",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_init_weight",
+            type=float,
+            default=0.01,
+            help="initial branch weight used by PairLocal RF search",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_schedule_mode",
+            type=str,
+            default="epoch",
+            choices=["manual", "epoch"],
+            help="manual step schedule or epoch-aware PairLocal RF search schedule",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_search_warmup_epochs",
+            type=int,
+            default=0,
+            help="delay PairLocal RF search updates for the first N epochs",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_search_epochs",
+            type=int,
+            default=20,
+            help="number of epochs allocated to PairLocal RF refinement in epoch schedule mode; <=0 uses the remaining training epochs",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_log_interval",
+            type=int,
+            default=5,
+            help="log PairLocal RF states every N epochs during training; set to 0 to disable",
+        )
+        self.parser.add_argument(
+            "--pairlocal_rf_merge_on_eval",
+            action="store_true",
+            help="merge searched PairLocal RF branches into a single equivalent convolution after loading checkpoints for evaluation",
+        )
+        self.parser.add_argument(
             "--acpc_enable",
             action="store_true",
             help="enable adaptive change prior construction before the decoder",
@@ -613,6 +698,33 @@ class Options:
             raise ValueError("--dino_temporal_exchange_p must be > 0.")
         if not self.opt.dino_temporal_exchange_layers:
             raise ValueError("--dino_temporal_exchange_layers expects at least one index.")
+        if self.opt.pairlocal_rf_enable and not self.opt.pairlocal_enable:
+            raise ValueError("--pairlocal_rf_enable requires --pairlocal_enable to be enabled.")
+        if self.opt.pairlocal_rf_num_branches <= 0:
+            raise ValueError("--pairlocal_rf_num_branches must be > 0.")
+        if (
+            self.opt.pairlocal_rf_mode in {"rfsearch", "rfmultiple"}
+            and self.opt.pairlocal_rf_num_branches < 2
+        ):
+            raise ValueError(
+                "--pairlocal_rf_num_branches must be >= 2 for rfsearch or rfmultiple mode."
+            )
+        if self.opt.pairlocal_rf_expand_rate <= 0:
+            raise ValueError("--pairlocal_rf_expand_rate must be > 0.")
+        if self.opt.pairlocal_rf_min_dilation <= 0:
+            raise ValueError("--pairlocal_rf_min_dilation must be > 0.")
+        if self.opt.pairlocal_rf_search_interval <= 0:
+            raise ValueError("--pairlocal_rf_search_interval must be > 0.")
+        if self.opt.pairlocal_rf_max_search_step < 0:
+            raise ValueError("--pairlocal_rf_max_search_step must be >= 0.")
+        if self.opt.pairlocal_rf_init_weight < 0:
+            raise ValueError("--pairlocal_rf_init_weight must be >= 0.")
+        if self.opt.pairlocal_rf_search_warmup_epochs < 0:
+            raise ValueError("--pairlocal_rf_search_warmup_epochs must be >= 0.")
+        if self.opt.pairlocal_rf_search_epochs < 0:
+            raise ValueError("--pairlocal_rf_search_epochs must be >= 0.")
+        if self.opt.pairlocal_rf_log_interval < 0:
+            raise ValueError("--pairlocal_rf_log_interval must be >= 0.")
         if self.opt.acpc_hidden_ratio <= 0:
             raise ValueError("--acpc_hidden_ratio must be > 0.")
         if self.opt.acpc_norm_groups <= 0:
@@ -692,6 +804,24 @@ class Options:
             if max_rate < 1:
                 raise ValueError("--decoder_rf_max_dilations must be >= 1.")
         self.opt.decoder_rf_max_dilations = decoder_rf_max_dilations
+
+        pairlocal_rf_max_dilations = self.opt.pairlocal_rf_max_dilations
+        if pairlocal_rf_max_dilations is None:
+            pairlocal_rf_max_dilations = [4, 4, 3, 3]
+        elif len(pairlocal_rf_max_dilations) == 1:
+            pairlocal_rf_max_dilations = pairlocal_rf_max_dilations * 4
+        elif len(pairlocal_rf_max_dilations) != 4:
+            raise ValueError(
+                "--pairlocal_rf_max_dilations expects either one value or one per p2-p5 stage."
+            )
+        for max_rate in pairlocal_rf_max_dilations:
+            if max_rate < self.opt.pairlocal_rf_min_dilation:
+                raise ValueError(
+                    "--pairlocal_rf_max_dilations must be >= --pairlocal_rf_min_dilation."
+                )
+            if max_rate < 1:
+                raise ValueError("--pairlocal_rf_max_dilations must be >= 1.")
+        self.opt.pairlocal_rf_max_dilations = pairlocal_rf_max_dilations
 
         str_ids = self.opt.gpu_ids.split(",")
         self.opt.gpu_ids = []

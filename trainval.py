@@ -373,6 +373,11 @@ if __name__ == "__main__":
                         and opt.decoder_rf_log_interval > 0
                         and epoch % opt.decoder_rf_log_interval == 0
                     )
+                    or (
+                        opt.pairlocal_rf_enable
+                        and opt.pairlocal_rf_log_interval > 0
+                        and epoch % opt.pairlocal_rf_log_interval == 0
+                    )
                 )
             ):
                 trainval.model._log_rf_states(f"epoch {epoch}")
