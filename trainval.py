@@ -108,6 +108,10 @@ class Trainval(object):
                 )
                 f.write("val_metrics(json)\n")
 
+        # Build one fixed, representative validation anchor set for counterfactual
+        # rank search so pruning decisions are comparable across epochs.
+        self.lora_search_val_batches = self._build_lora_search_val_batches()
+
     def _clone_batch(self, batch):
         cloned = {}
         for key, value in batch.items():
@@ -119,7 +123,134 @@ class Trainval(object):
                 cloned[key] = value
         return cloned
 
-    def _sample_lora_search_val_batches(self, epoch: int):
+    def _extract_lora_search_feature(self, sample):
+        img1 = sample["img1"].float()
+        img2 = sample["img2"].float()
+        label = sample["cd_label"].float()
+        diff = (img1 - img2).abs()
+
+        img1_mean = img1.mean(dim=(1, 2))
+        img2_mean = img2.mean(dim=(1, 2))
+        diff_mean = diff.mean(dim=(1, 2))
+        diff_std = diff.std(dim=(1, 2), unbiased=False)
+
+        change_ratio = label.mean()
+        label_std = label.std(unbiased=False)
+        h_edge = (
+            (label[1:, :] != label[:-1, :]).float().mean()
+            if label.shape[0] > 1
+            else label.new_zeros(())
+        )
+        w_edge = (
+            (label[:, 1:] != label[:, :-1]).float().mean()
+            if label.shape[1] > 1
+            else label.new_zeros(())
+        )
+
+        feature = torch.cat(
+            [
+                img1_mean,
+                img2_mean,
+                diff_mean,
+                diff_std,
+                torch.stack([change_ratio, label_std, h_edge, w_edge]),
+            ],
+            dim=0,
+        )
+        return feature.cpu().numpy().astype(np.float32, copy=False)
+
+    @staticmethod
+    def _kmeans_representative_indices(features: np.ndarray, num_clusters: int):
+        num_samples = features.shape[0]
+        if num_clusters >= num_samples:
+            return list(range(num_samples))
+        if num_clusters <= 1:
+            center = features.mean(axis=0, keepdims=True)
+            distances = ((features - center) ** 2).sum(axis=1)
+            return [int(np.argmin(distances))]
+
+        mean = features.mean(axis=0, keepdims=True)
+        std = features.std(axis=0, keepdims=True)
+        normalized = (features - mean) / np.clip(std, a_min=1e-6, a_max=None)
+
+        rng = np.random.default_rng(20260418)
+        center_indices = [int(np.argmax(np.linalg.norm(normalized, axis=1)))]
+        while len(center_indices) < num_clusters:
+            center_feats = normalized[center_indices]
+            distances = ((normalized[:, None, :] - center_feats[None, :, :]) ** 2).sum(
+                axis=2
+            )
+            min_dist = distances.min(axis=1)
+            min_dist[center_indices] = 0.0
+            if float(min_dist.sum()) <= 1e-12:
+                remaining = [index for index in range(num_samples) if index not in center_indices]
+                center_indices.append(int(remaining[0]))
+                continue
+            next_index = int(rng.choice(num_samples, p=min_dist / min_dist.sum()))
+            if next_index in center_indices:
+                remaining = [index for index in range(num_samples) if index not in center_indices]
+                next_index = int(remaining[0])
+            center_indices.append(next_index)
+
+        centers = normalized[center_indices].copy()
+        assignments = np.zeros(num_samples, dtype=np.int64)
+        for _ in range(12):
+            distances = ((normalized[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+            assignments = distances.argmin(axis=1)
+            new_centers = centers.copy()
+            for cluster_index in range(num_clusters):
+                member_mask = assignments == cluster_index
+                if np.any(member_mask):
+                    new_centers[cluster_index] = normalized[member_mask].mean(axis=0)
+            if np.allclose(new_centers, centers):
+                break
+            centers = new_centers
+
+        selected_indices = []
+        used_indices = set()
+        for cluster_index in range(num_clusters):
+            member_indices = np.where(assignments == cluster_index)[0]
+            if member_indices.size == 0:
+                continue
+            member_feats = normalized[member_indices]
+            center = centers[cluster_index : cluster_index + 1]
+            distances = ((member_feats - center) ** 2).sum(axis=1)
+            ordered = member_indices[np.argsort(distances)]
+            chosen_index = None
+            for candidate_index in ordered.tolist():
+                if candidate_index not in used_indices:
+                    chosen_index = int(candidate_index)
+                    break
+            if chosen_index is None:
+                chosen_index = int(ordered[0])
+            selected_indices.append(chosen_index)
+            used_indices.add(chosen_index)
+
+        if len(selected_indices) < num_clusters:
+            remaining = [index for index in range(num_samples) if index not in used_indices]
+            if not selected_indices:
+                selected_indices.extend(remaining[:num_clusters])
+            else:
+                selected_feats = normalized[selected_indices]
+                while remaining and len(selected_indices) < num_clusters:
+                    remaining_feats = normalized[remaining]
+                    distances = (
+                        (
+                            remaining_feats[:, None, :]
+                            - selected_feats[None, :, :]
+                        )
+                        ** 2
+                    ).sum(axis=2)
+                    next_pos = int(np.argmax(distances.min(axis=1)))
+                    next_index = int(remaining[next_pos])
+                    selected_indices.append(next_index)
+                    used_indices.add(next_index)
+                    remaining.pop(next_pos)
+                    selected_feats = normalized[selected_indices]
+
+        return selected_indices[:num_clusters]
+
+    def _build_lora_search_val_batches(self):
         if not (
             getattr(self.opt, "dino_lora_search", False)
             and getattr(self.opt, "dino_lora_search_counterfactual", False)
@@ -142,9 +273,19 @@ class Trainval(object):
 
         batch_size = max(1, int(self.opt.batch_size))
         total_samples = min(dataset_size, max_batches * batch_size)
-        generator = torch.Generator()
-        generator.manual_seed(1009 + int(epoch))
-        sample_indices = torch.randperm(dataset_size, generator=generator)[:total_samples].tolist()
+        if total_samples <= 0:
+            return []
+
+        if total_samples >= dataset_size:
+            sample_indices = list(range(dataset_size))
+        else:
+            features = []
+            for index in range(dataset_size):
+                features.append(self._extract_lora_search_feature(dataset[index]))
+            sample_indices = self._kmeans_representative_indices(
+                np.stack(features, axis=0),
+                total_samples,
+            )
 
         cached_batches = []
         for start in range(0, len(sample_indices), batch_size):
@@ -154,7 +295,8 @@ class Trainval(object):
 
         if self.opt.is_main_process:
             print(
-                f"sampled {len(cached_batches)} random val batches for LoRA counterfactual rank search"
+                f"built {len(cached_batches)} clustered representative val batches "
+                f"({len(sample_indices)} samples) for LoRA counterfactual rank search"
             )
         return cached_batches
 
@@ -350,10 +492,9 @@ if __name__ == "__main__":
                     "\n==> Name %s, Epoch %i, previous best = %.3f"
                     % (opt.name, epoch, trainval.previous_best * 100)
                 )
-            lora_search_val_batches = trainval._sample_lora_search_val_batches(epoch)
             trainval.model.update_lora_rank_search_with_val(
                 epoch,
-                lora_search_val_batches,
+                trainval.lora_search_val_batches,
             )
             if epoch == int(opt.num_epochs * 0.9):
                 trainval._rescheduler(opt)

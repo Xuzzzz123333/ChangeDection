@@ -161,7 +161,7 @@ class Options:
             "--dino_lora_search_counterfactual_val_batches",
             type=int,
             default=4,
-            help="number of randomly sampled validation batches used by counterfactual LoRA rank testing",
+            help="number of representative validation batches used by counterfactual LoRA rank testing",
         )
         self.parser.add_argument(
             "--dino_lora_search_counterfactual_metric",
