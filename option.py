@@ -150,7 +150,13 @@ class Options:
                 "mlp.fc1=1.0",
                 "mlp.fc2=1.0",
             ],
-            help="per-group budget weights for searchable LoRA, formatted as group=value",
+            help="per-group budget weights for searchable LoRA, formatted as group=value; supports base groups and optional depth-bucket groups",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_depth_buckets",
+            type=int,
+            default=3,
+            help="number of depth buckets used for grouped LoRA rank search; set to 1 to recover position-only grouping",
         )
         self.parser.add_argument(
             "--dino_lora_search_counterfactual",
@@ -614,6 +620,8 @@ class Options:
             raise ValueError("--dino_lora_search_ema_decay must be in [0, 1).")
         if self.opt.dino_lora_search_grad_weight < 0:
             raise ValueError("--dino_lora_search_grad_weight must be >= 0.")
+        if self.opt.dino_lora_search_depth_buckets <= 0:
+            raise ValueError("--dino_lora_search_depth_buckets must be > 0.")
         if self.opt.dino_lora_search_counterfactual and not self.opt.dino_lora_search:
             raise ValueError(
                 "--dino_lora_search_counterfactual requires --dino_lora_search to be enabled."
@@ -741,10 +749,14 @@ class Options:
                 )
             group_name, value = item.split("=", 1)
             group_name = group_name.strip()
-            if group_name not in valid_search_groups:
+            if not any(
+                group_name == base_group
+                or group_name.startswith(base_group + ".")
+                for base_group in valid_search_groups
+            ):
                 raise ValueError(
                     f"Unsupported searchable LoRA group '{group_name}'. "
-                    f"Expected one of {sorted(valid_search_groups)}."
+                    f"Expected one of {sorted(valid_search_groups)} or a depth-bucketed variant."
                 )
             try:
                 weight = float(value)

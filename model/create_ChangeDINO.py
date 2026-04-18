@@ -59,6 +59,7 @@ class Model(nn.Module):
             dino_lora_search_grad_weight=opt.dino_lora_search_grad_weight,
             dino_lora_search_budget_mode=opt.dino_lora_search_budget_mode,
             dino_lora_search_group_weights=opt.dino_lora_search_group_weights,
+            dino_lora_search_depth_buckets=opt.dino_lora_search_depth_buckets,
             dino_lora_search_counterfactual=opt.dino_lora_search_counterfactual,
             dino_lora_search_counterfactual_val_batches=opt.dino_lora_search_counterfactual_val_batches,
             dino_lora_search_counterfactual_max_candidates=opt.dino_lora_search_counterfactual_max_candidates,

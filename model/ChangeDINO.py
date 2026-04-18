@@ -173,6 +173,7 @@ class Encoder(nn.Module):
             lora_search_grad_weight=kwargs.get("dino_lora_search_grad_weight", 0.5),
             lora_search_budget_mode=kwargs.get("dino_lora_search_budget_mode", "grouped"),
             lora_search_group_weights=kwargs.get("dino_lora_search_group_weights", None),
+            lora_search_depth_buckets=kwargs.get("dino_lora_search_depth_buckets", 3),
             lora_search_counterfactual=kwargs.get("dino_lora_search_counterfactual", False),
             lora_search_counterfactual_val_batches=kwargs.get(
                 "dino_lora_search_counterfactual_val_batches", 2

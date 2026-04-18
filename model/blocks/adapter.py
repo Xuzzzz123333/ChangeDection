@@ -39,6 +39,7 @@ class DINOV3Wrapper(nn.Module):
         lora_search_grad_weight=0.5,
         lora_search_budget_mode="grouped",
         lora_search_group_weights=None,
+        lora_search_depth_buckets=3,
         lora_search_counterfactual=False,
         lora_search_counterfactual_val_batches=2,
         lora_search_counterfactual_max_candidates=64,
@@ -61,6 +62,7 @@ class DINOV3Wrapper(nn.Module):
         self.lora_search_score_norm = lora_search_score_norm
         self.lora_search_grad_weight = float(lora_search_grad_weight)
         self.lora_search_budget_mode = lora_search_budget_mode
+        self.lora_search_depth_buckets = int(max(1, lora_search_depth_buckets))
         self.lora_search_counterfactual = bool(lora_search_counterfactual)
         self.lora_search_counterfactual_val_batches = int(
             max(0, lora_search_counterfactual_val_batches)
@@ -109,6 +111,8 @@ class DINOV3Wrapper(nn.Module):
                 alpha_over_r=self.lora_alpha_over_r,
                 score_ema_decay=self.lora_search_ema_decay,
                 grad_weight=self.lora_search_grad_weight,
+                num_layers=self.n_layers,
+                depth_buckets=self.lora_search_depth_buckets,
             )
             if self.lora_search:
                 self.update_lora_rank_budget(self.lora_r)
@@ -124,7 +128,30 @@ class DINOV3Wrapper(nn.Module):
         return any(full_name.endswith(target) for target in targets)
 
     @staticmethod
-    def get_lora_group_name(full_name: str) -> str:
+    def _extract_layer_index(full_name: str):
+        match = re.search(r"(?:^|\.)blocks\.(\d+)\.", full_name)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    @staticmethod
+    def _get_depth_bucket_label(layer_index: int, num_layers: int, num_buckets: int) -> str:
+        if num_buckets <= 1 or num_layers <= 1:
+            return "all"
+        bucket_index = min(
+            num_buckets - 1,
+            int(layer_index * num_buckets / max(1, num_layers)),
+        )
+        if num_buckets == 2:
+            labels = ("early", "late")
+            return labels[bucket_index]
+        if num_buckets == 3:
+            labels = ("early", "middle", "late")
+            return labels[bucket_index]
+        return f"depth{bucket_index}"
+
+    @staticmethod
+    def get_lora_group_name(full_name: str, num_layers: int, depth_buckets: int) -> str:
         targets = (
             "attn.qkv",
             "attn.proj",
@@ -133,7 +160,17 @@ class DINOV3Wrapper(nn.Module):
         )
         for target in targets:
             if full_name.endswith(target):
-                return target
+                if depth_buckets <= 1:
+                    return target
+                layer_index = DINOV3Wrapper._extract_layer_index(full_name)
+                if layer_index is None:
+                    return target
+                bucket_label = DINOV3Wrapper._get_depth_bucket_label(
+                    layer_index,
+                    num_layers,
+                    depth_buckets,
+                )
+                return f"{target}.{bucket_label}"
         return "other"
 
     @staticmethod
@@ -148,6 +185,8 @@ class DINOV3Wrapper(nn.Module):
         alpha_over_r=1.0,
         score_ema_decay=0.9,
         grad_weight=0.5,
+        num_layers=24,
+        depth_buckets=1,
     ):
         for name, child in list(module.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
@@ -164,7 +203,11 @@ class DINOV3Wrapper(nn.Module):
                             alpha_over_r=alpha_over_r,
                             dropout=dropout,
                             module_name=full_name,
-                            group_name=DINOV3Wrapper.get_lora_group_name(full_name),
+                            group_name=DINOV3Wrapper.get_lora_group_name(
+                                full_name,
+                                num_layers,
+                                depth_buckets,
+                            ),
                             score_ema_decay=score_ema_decay,
                             grad_weight=grad_weight,
                         ),
@@ -194,7 +237,20 @@ class DINOV3Wrapper(nn.Module):
                     alpha_over_r=alpha_over_r,
                     score_ema_decay=score_ema_decay,
                     grad_weight=grad_weight,
+                    num_layers=num_layers,
+                    depth_buckets=depth_buckets,
                 )
+
+    def _resolve_group_weight(self, group_name: str) -> float:
+        if group_name in self.lora_search_group_weights:
+            return max(0.0, float(self.lora_search_group_weights[group_name]))
+        for base_group_name in ("attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"):
+            if group_name == base_group_name or group_name.startswith(base_group_name + "."):
+                return max(
+                    0.0,
+                    float(self.lora_search_group_weights.get(base_group_name, 1.0)),
+                )
+        return 1.0
 
     def iter_searchable_lora_layers(self):
         for module in self.model.modules():
@@ -217,14 +273,13 @@ class DINOV3Wrapper(nn.Module):
         std = flat_scores.std(unbiased=False).clamp_min(1e-6)
         return [(scores - mean) / std for scores in score_chunks]
 
-    @staticmethod
-    def _allocate_group_budgets(total_budget: int, group_capacity: dict, group_weights: dict):
+    def _allocate_group_budgets(self, total_budget: int, group_capacity: dict):
         if total_budget <= 0:
             return {group_name: 0 for group_name in group_capacity}
 
         weighted_capacity = {}
         for group_name, capacity in group_capacity.items():
-            weight = max(0.0, float(group_weights.get(group_name, 1.0)))
+            weight = self._resolve_group_weight(group_name)
             weighted_capacity[group_name] = capacity * weight
 
         if sum(weighted_capacity.values()) <= 0:
@@ -251,7 +306,7 @@ class DINOV3Wrapper(nn.Module):
             candidates.sort(
                 key=lambda group_name: (
                     raw_budget[group_name] - int(raw_budget[group_name]),
-                    group_weights.get(group_name, 1.0),
+                    self._resolve_group_weight(group_name),
                     group_capacity[group_name] - allocated[group_name],
                 ),
                 reverse=True,
@@ -309,11 +364,7 @@ class DINOV3Wrapper(nn.Module):
                 offset = next_offset
             return keep_masks, {}
 
-        group_budgets = self._allocate_group_budgets(
-            total_budget,
-            group_capacity,
-            self.lora_search_group_weights,
-        )
+        group_budgets = self._allocate_group_budgets(total_budget, group_capacity)
         for group_name, indices in group_to_indices.items():
             group_budget = min(group_capacity[group_name], group_budgets.get(group_name, 0))
             if group_budget <= 0:
