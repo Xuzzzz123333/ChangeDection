@@ -83,6 +83,30 @@ class Options:
             action="store_true",
             help="use fixed-rank DoRA adapters on DINOv3 linear layers instead of LoRA",
         )
+        self.parser.add_argument(
+            "--dino_local_conv_enable",
+            action="store_true",
+            help="insert a lightweight local convolution branch into selected DINO transformer blocks",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_blocks",
+            nargs="+",
+            type=int,
+            default=[5, 11, 17, 23],
+            help="DINO block indices that receive the local convolution branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_kernel_size",
+            type=int,
+            default=3,
+            help="odd kernel size used by the DINO local convolution branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_init_scale",
+            type=float,
+            default=0.0,
+            help="initial residual scale for the DINO local convolution branch; 0 keeps the pretrained backbone unchanged at startup",
+        )
         self.parser.add_argument("--dino_lora_r", type=int, default=8)
         self.parser.add_argument("--dino_lora_alpha", type=int, default=16)
         self.parser.add_argument("--dino_lora_dropout", type=float, default=0.05)
@@ -600,6 +624,12 @@ class Options:
             raise ValueError("--vis_interval must be >= 0.")
         if self.opt.dino_lora and self.opt.dino_dora:
             raise ValueError("--dino_lora and --dino_dora are mutually exclusive.")
+        if not self.opt.dino_local_conv_blocks:
+            raise ValueError("--dino_local_conv_blocks expects at least one block index.")
+        if any(block_index < 0 for block_index in self.opt.dino_local_conv_blocks):
+            raise ValueError("--dino_local_conv_blocks must use non-negative integers.")
+        if self.opt.dino_local_conv_kernel_size <= 0 or self.opt.dino_local_conv_kernel_size % 2 == 0:
+            raise ValueError("--dino_local_conv_kernel_size must be a positive odd integer.")
         if (self.opt.dino_lora or self.opt.dino_dora) and self.opt.dino_lora_r <= 0:
             raise ValueError("--dino_lora_r must be > 0 when LoRA or DoRA is enabled.")
         if self.opt.dino_lora_search and not self.opt.dino_lora:
@@ -772,6 +802,7 @@ class Options:
         for group_name in valid_search_groups:
             parsed_group_weights.setdefault(group_name, 1.0)
         self.opt.dino_lora_search_group_weights = parsed_group_weights
+        self.opt.dino_local_conv_blocks = sorted(set(self.opt.dino_local_conv_blocks))
 
         rf_max_dilations = self.opt.mfce_rf_max_dilations
         if rf_max_dilations is None:

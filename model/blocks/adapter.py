@@ -1,3 +1,4 @@
+import math
 import re
 
 import torch
@@ -16,6 +17,87 @@ MODEL_TO_NUM_LAYERS = {
     "VITHP": 32,
     "VIT7B": 40,
 }
+
+
+class DINOConvTokenBranch(nn.Module):
+    def __init__(self, dim: int, kernel_size: int = 3):
+        super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("DINOConvTokenBranch expects a positive odd kernel size.")
+        padding = kernel_size // 2
+        self.depthwise = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=dim,
+            bias=False,
+        )
+        self.act = nn.GELU()
+        self.pointwise = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+
+    @staticmethod
+    def infer_spatial_shape(num_patches: int):
+        if num_patches <= 0:
+            return 0, 0
+        height = int(math.sqrt(num_patches))
+        while height > 1 and num_patches % height != 0:
+            height -= 1
+        width = num_patches // height
+        return height, width
+
+    def forward(self, patch_tokens: torch.Tensor):
+        batch_size, num_patches, channels = patch_tokens.shape
+        height, width = self.infer_spatial_shape(num_patches)
+        if height * width != num_patches:
+            raise ValueError(
+                f"Cannot infer a valid spatial shape from {num_patches} patch tokens."
+            )
+        feat = patch_tokens.transpose(1, 2).reshape(batch_size, channels, height, width)
+        feat = self.depthwise(feat)
+        feat = self.act(feat)
+        feat = self.pointwise(feat)
+        return feat.flatten(2).transpose(1, 2)
+
+
+class DINOBlockLocalConvAdapter(nn.Module):
+    def __init__(
+        self,
+        block: nn.Module,
+        dim: int,
+        num_prefix_tokens: int,
+        kernel_size: int = 3,
+        init_scale: float = 0.0,
+    ):
+        super().__init__()
+        self.block = block
+        self.num_prefix_tokens = int(max(0, num_prefix_tokens))
+        self.norm = nn.LayerNorm(dim)
+        self.local_branch = DINOConvTokenBranch(dim=dim, kernel_size=kernel_size)
+        self.gamma = nn.Parameter(torch.full((dim,), float(init_scale)))
+
+    def _forward_tensor(self, x: torch.Tensor):
+        if x.ndim != 3 or x.shape[1] <= self.num_prefix_tokens:
+            return x
+
+        normed = self.norm(x)
+        patch_tokens = normed[:, self.num_prefix_tokens :]
+        local_tokens = self.local_branch(patch_tokens)
+        if self.num_prefix_tokens > 0:
+            prefix_tokens = x[:, : self.num_prefix_tokens]
+            patch_tokens = x[:, self.num_prefix_tokens :] + local_tokens * self.gamma.view(
+                1, 1, -1
+            )
+            return torch.cat([prefix_tokens, patch_tokens], dim=1)
+        return x + local_tokens * self.gamma.view(1, 1, -1)
+
+    def forward(self, x_or_x_list, rope_or_rope_list=None):
+        out = self.block(x_or_x_list, rope_or_rope_list)
+        if isinstance(out, torch.Tensor):
+            return self._forward_tensor(out)
+        if isinstance(out, list):
+            return [self._forward_tensor(x) for x in out]
+        raise TypeError(f"Unsupported DINO block output type: {type(out)!r}")
 
 
 class DINOV3Wrapper(nn.Module):
@@ -45,6 +127,10 @@ class DINOV3Wrapper(nn.Module):
         lora_search_counterfactual_max_candidates=64,
         lora_search_counterfactual_delta=0.0,
         lora_search_counterfactual_patience=1,
+        local_conv_enable=False,
+        local_conv_blocks=(5, 11, 17, 23),
+        local_conv_kernel_size=3,
+        local_conv_init_scale=0.0,
     ):
         super().__init__()
         self.device = device
@@ -76,6 +162,10 @@ class DINOV3Wrapper(nn.Module):
         self.lora_search_counterfactual_patience = int(
             max(1, lora_search_counterfactual_patience)
         )
+        self.local_conv_enable = bool(local_conv_enable)
+        self.local_conv_blocks = tuple(sorted(set(int(index) for index in local_conv_blocks)))
+        self.local_conv_kernel_size = int(local_conv_kernel_size)
+        self.local_conv_init_scale = float(local_conv_init_scale)
         self.lora_search_group_weights = {
             "attn.qkv": 1.0,
             "attn.proj": 1.0,
@@ -99,6 +189,13 @@ class DINOV3Wrapper(nn.Module):
 
         for p in self.model.parameters():
             p.requires_grad = False
+
+        if self.local_conv_enable:
+            self.inject_local_conv(
+                block_indices=self.local_conv_blocks,
+                kernel_size=self.local_conv_kernel_size,
+                init_scale=self.local_conv_init_scale,
+            )
 
         if self.use_lora:
             self.inject_lora(
@@ -240,6 +337,34 @@ class DINOV3Wrapper(nn.Module):
                     num_layers=num_layers,
                     depth_buckets=depth_buckets,
                 )
+
+    def inject_local_conv(self, block_indices, kernel_size=3, init_scale=0.0):
+        blocks = getattr(self.model, "blocks", None)
+        if blocks is None:
+            raise ValueError("The loaded DINO backbone does not expose a blocks module list.")
+
+        dim = int(getattr(self.model, "embed_dim"))
+        num_prefix_tokens = 1 + int(getattr(self.model, "n_storage_tokens", 0))
+        total_blocks = len(blocks)
+        valid_indices = []
+        for block_index in block_indices:
+            if block_index < 0 or block_index >= total_blocks:
+                raise ValueError(
+                    f"Requested DINO local conv block index {block_index}, but the model only has {total_blocks} blocks."
+                )
+            valid_indices.append(int(block_index))
+
+        for block_index in valid_indices:
+            block = blocks[block_index]
+            if isinstance(block, DINOBlockLocalConvAdapter):
+                continue
+            blocks[block_index] = DINOBlockLocalConvAdapter(
+                block=block,
+                dim=dim,
+                num_prefix_tokens=num_prefix_tokens,
+                kernel_size=kernel_size,
+                init_scale=init_scale,
+            ).to(self.device)
 
     def _resolve_group_weight(self, group_name: str) -> float:
         if group_name in self.lora_search_group_weights:
