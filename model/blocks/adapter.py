@@ -719,7 +719,7 @@ class DINOV3Wrapper(nn.Module):
             x, size=(512, 512), mode="bilinear", align_corners=True, antialias=True
         )
 
-        use_grad = self.training and self.use_lora
+        use_grad = self.training and (self.use_lora or self.local_conv_enable)
 
         with torch.set_grad_enabled(use_grad):
             feats = self.model.get_intermediate_layers(
