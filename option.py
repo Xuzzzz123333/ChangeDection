@@ -196,6 +196,19 @@ class Options:
             help="number of representative training batches used by the RF-style LoRA layer probe",
         )
         self.parser.add_argument(
+            "--dino_lora_search_probe_refresh_interval",
+            type=int,
+            default=10,
+            help="refresh the RF-style LoRA probe every N search epochs after initialization; 0 keeps one-shot probing",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_probe_score_norm",
+            type=str,
+            default="zscore",
+            choices=["none", "median", "zscore"],
+            help="normalization applied to probe scores before quantile-based RF-style LoRA prior construction",
+        )
+        self.parser.add_argument(
             "--dino_lora_search_probe_keep_ratio",
             type=float,
             default=0.5,
@@ -685,6 +698,8 @@ class Options:
             raise ValueError("--dino_lora_search_depth_buckets must be > 0.")
         if self.opt.dino_lora_search_probe_batches < 0:
             raise ValueError("--dino_lora_search_probe_batches must be >= 0.")
+        if self.opt.dino_lora_search_probe_refresh_interval < 0:
+            raise ValueError("--dino_lora_search_probe_refresh_interval must be >= 0.")
         if not (0.0 < self.opt.dino_lora_search_probe_keep_ratio <= 1.0):
             raise ValueError("--dino_lora_search_probe_keep_ratio must be in (0, 1].")
         if self.opt.dino_lora_search_rf_delta < 0:

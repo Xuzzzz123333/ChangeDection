@@ -180,6 +180,12 @@ class Encoder(nn.Module):
             lora_search_depth_buckets=kwargs.get("dino_lora_search_depth_buckets", 3),
             lora_search_strategy=kwargs.get("dino_lora_search_strategy", "classic"),
             lora_search_probe_batches=kwargs.get("dino_lora_search_probe_batches", 5),
+            lora_search_probe_refresh_interval=kwargs.get(
+                "dino_lora_search_probe_refresh_interval", 10
+            ),
+            lora_search_probe_score_norm=kwargs.get(
+                "dino_lora_search_probe_score_norm", "zscore"
+            ),
             lora_search_probe_keep_ratio=kwargs.get("dino_lora_search_probe_keep_ratio", 0.5),
             lora_search_rf_delta=kwargs.get("dino_lora_search_rf_delta", 2),
             lora_search_rf_temperature=kwargs.get("dino_lora_search_rf_temperature", 1.0),

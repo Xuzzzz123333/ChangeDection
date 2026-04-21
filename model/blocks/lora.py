@@ -144,6 +144,11 @@ class SearchableLoRALinear(nn.Module):
             "rank_center", torch.tensor(float(self.r_max), dtype=torch.float32)
         )
         self.register_buffer("probe_score", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("probe_block_score", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer(
+            "probe_module_residual", torch.tensor(0.0, dtype=torch.float32)
+        )
+        self.register_buffer("probe_rank_prior", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("probe_selected", torch.tensor(True, dtype=torch.bool))
         self.register_buffer(
             "counterfactual_confirm", torch.zeros(self.r_max, dtype=torch.int64)
@@ -235,6 +240,17 @@ class SearchableLoRALinear(nn.Module):
     @torch.no_grad()
     def set_probe_score(self, score: float):
         self.probe_score.fill_(float(score))
+
+    @torch.no_grad()
+    def set_probe_prior(
+        self,
+        block_score: float,
+        module_residual: float,
+        rank_prior: float,
+    ):
+        self.probe_block_score.fill_(float(block_score))
+        self.probe_module_residual.fill_(float(module_residual))
+        self.probe_rank_prior.fill_(float(rank_prior))
 
     @torch.no_grad()
     def set_probe_selected(self, selected: bool):

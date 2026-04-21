@@ -66,6 +66,8 @@ class Model(nn.Module):
             dino_lora_search_depth_buckets=opt.dino_lora_search_depth_buckets,
             dino_lora_search_strategy=opt.dino_lora_search_strategy,
             dino_lora_search_probe_batches=opt.dino_lora_search_probe_batches,
+            dino_lora_search_probe_refresh_interval=opt.dino_lora_search_probe_refresh_interval,
+            dino_lora_search_probe_score_norm=opt.dino_lora_search_probe_score_norm,
             dino_lora_search_probe_keep_ratio=opt.dino_lora_search_probe_keep_ratio,
             dino_lora_search_rf_delta=opt.dino_lora_search_rf_delta,
             dino_lora_search_rf_temperature=opt.dino_lora_search_rf_temperature,
@@ -500,38 +502,39 @@ class Model(nn.Module):
         score_sums = {layer.module_name: 0.0 for layer in probe_layers}
         score_counts = {layer.module_name: 0 for layer in probe_layers}
 
-        for batch in probe_batches:
-            network.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            for batch in probe_batches:
+                network.zero_grad(set_to_none=True)
 
-            x1 = batch["img1"].to(self.device, non_blocking=True)
-            x2 = batch["img2"].to(self.device, non_blocking=True)
-            label = batch["cd_label"].to(self.device, non_blocking=True).long()
+                x1 = batch["img1"].to(self.device, non_blocking=True)
+                x2 = batch["img2"].to(self.device, non_blocking=True)
+                label = batch["cd_label"].to(self.device, non_blocking=True).long()
 
-            final_pred, preds = network(x1, x2)
-            focal = self.focal(final_pred, label)
-            dice = self.dice(final_pred, label)
-            for pred in preds:
-                focal = focal + self.focal(pred, label)
-                dice = dice + 0.5 * self.dice(pred, label)
-            loss = focal * self.opt.alpha + dice
-            loss.backward()
+                final_pred, preds = network(x1, x2)
+                focal = self.focal(final_pred, label)
+                dice = self.dice(final_pred, label)
+                for pred in preds:
+                    focal = focal + self.focal(pred, label)
+                    dice = dice + 0.5 * self.dice(pred, label)
+                loss = focal * self.opt.alpha + dice
+                loss.backward()
 
-            for layer in probe_layers:
-                grad_a = layer.lora_A.weight.grad
-                grad_b = layer.lora_B.weight.grad
-                grad_sq = 0.0
-                param_count = 0
-                if grad_a is not None:
-                    grad_sq += float(grad_a.detach().float().pow(2).sum().item())
-                    param_count += grad_a.numel()
-                if grad_b is not None:
-                    grad_sq += float(grad_b.detach().float().pow(2).sum().item())
-                    param_count += grad_b.numel()
-                if param_count <= 0:
-                    continue
-                score = (grad_sq ** 0.5) / (param_count ** 0.5)
-                score_sums[layer.module_name] += score
-                score_counts[layer.module_name] += 1
+                for layer in probe_layers:
+                    grad_a = layer.lora_A.weight.grad
+                    grad_b = layer.lora_B.weight.grad
+                    grad_sq = 0.0
+                    param_count = 0
+                    if grad_a is not None:
+                        grad_sq += float(grad_a.detach().float().pow(2).sum().item())
+                        param_count += grad_a.numel()
+                    if grad_b is not None:
+                        grad_sq += float(grad_b.detach().float().pow(2).sum().item())
+                        param_count += grad_b.numel()
+                    if param_count <= 0:
+                        continue
+                    score = (grad_sq ** 0.5) / (param_count ** 0.5)
+                    score_sums[layer.module_name] += score
+                    score_counts[layer.module_name] += 1
 
         network.zero_grad(set_to_none=True)
         if not was_training:
@@ -617,6 +620,8 @@ class Model(nn.Module):
                     f", strategy=rfnext"
                     f", probe_blocks={summary.get('probe_selected_blocks', 0)}"
                     f", probe_layers={summary.get('probe_selected_layers', 0)}"
+                    f", probe_epoch={summary.get('probe_epoch', -1)}"
+                    f", probe_refresh={int(bool(summary.get('probe_refreshed', False)))}"
                 )
             print(
                 f"LoRA rank search -> budget={summary['budget_rank']}, "

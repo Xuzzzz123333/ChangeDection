@@ -124,6 +124,8 @@ class DINOV3Wrapper(nn.Module):
         lora_search_depth_buckets=3,
         lora_search_strategy="classic",
         lora_search_probe_batches=5,
+        lora_search_probe_refresh_interval=10,
+        lora_search_probe_score_norm="zscore",
         lora_search_probe_keep_ratio=0.5,
         lora_search_rf_delta=2,
         lora_search_rf_temperature=1.0,
@@ -156,6 +158,10 @@ class DINOV3Wrapper(nn.Module):
         self.lora_search_depth_buckets = int(max(1, lora_search_depth_buckets))
         self.lora_search_strategy = lora_search_strategy
         self.lora_search_probe_batches = int(max(0, lora_search_probe_batches))
+        self.lora_search_probe_refresh_interval = int(
+            max(0, lora_search_probe_refresh_interval)
+        )
+        self.lora_search_probe_score_norm = lora_search_probe_score_norm
         self.lora_search_probe_keep_ratio = float(lora_search_probe_keep_ratio)
         self.lora_search_rf_delta = int(max(0, lora_search_rf_delta))
         self.lora_search_rf_temperature = float(max(1e-6, lora_search_rf_temperature))
@@ -178,6 +184,8 @@ class DINOV3Wrapper(nn.Module):
         self.local_conv_init_scale = float(local_conv_init_scale)
         self.lora_rf_probe_ready = False
         self.lora_rf_selected_blocks = tuple()
+        self.lora_rf_probe_epoch = -1
+        self.lora_rf_probe_runs = 0
         self.lora_search_group_weights = {
             "attn.qkv": 1.0,
             "attn.proj": 1.0,
@@ -429,85 +437,229 @@ class DINOV3Wrapper(nn.Module):
         top_scores = torch.topk(scores, rank, largest=True, sorted=False).values
         return float(top_scores.sum().item())
 
-    def _local_rank_candidates(self, center: float, r_max: int):
-        center_int = int(round(float(center)))
-        candidates = {
-            max(0, min(r_max, center_int - self.lora_search_rf_delta)),
-            max(0, min(r_max, center_int)),
-            max(0, min(r_max, center_int + self.lora_search_rf_delta)),
+    @staticmethod
+    def _normalize_score_map(score_map: dict, mode: str):
+        if not score_map:
+            return {}
+
+        keys = list(score_map.keys())
+        values = torch.tensor(
+            [float(score_map[key]) for key in keys],
+            dtype=torch.float32,
+        )
+        if mode == "median":
+            values = values / values.median().clamp_min(1e-6)
+        elif mode == "zscore":
+            if values.numel() > 1:
+                values = (values - values.mean()) / values.std(unbiased=False).clamp_min(
+                    1e-6
+                )
+            else:
+                values = values - values.mean()
+        return {key: float(value.item()) for key, value in zip(keys, values)}
+
+    @staticmethod
+    def _quantile_map(score_map: dict):
+        if not score_map:
+            return {}
+
+        items = sorted(
+            score_map.items(),
+            key=lambda item: (float(item[1]), str(item[0])),
+        )
+        if len(items) == 1:
+            return {items[0][0]: 1.0}
+
+        mapped = {}
+        index = 0
+        while index < len(items):
+            next_index = index
+            current_value = float(items[index][1])
+            while (
+                next_index + 1 < len(items)
+                and abs(float(items[next_index + 1][1]) - current_value) <= 1e-12
+            ):
+                next_index += 1
+            quantile = 0.5 * (index + next_index) / float(len(items) - 1)
+            for item_index in range(index, next_index + 1):
+                mapped[items[item_index][0]] = quantile
+            index = next_index + 1
+        return mapped
+
+    def _build_rfnext_probe_state(self, layers, probe_scores: dict):
+        module_raw_scores = {
+            layer.module_name: float(probe_scores.get(layer.module_name, 0.0))
+            for layer in layers
         }
-        return sorted(candidates)
+        module_norm_scores = self._normalize_score_map(
+            module_raw_scores,
+            self.lora_search_probe_score_norm,
+        )
+        module_quantiles = self._quantile_map(module_norm_scores)
 
-    def _initialize_rfnext_probe(self, layers, total_budget: int, probe_scores: dict):
-        block_scores = {}
-        block_counts = {}
-        layer_block_indices = []
-        bucket_best_blocks = {}
-
+        block_to_modules = {}
+        layer_block_indices = {}
         for layer in layers:
-            module_name = layer.module_name
-            block_index = self._extract_block_index_from_module_name(module_name)
-            layer_block_indices.append(block_index)
-            score = float(probe_scores.get(module_name, 0.0))
-            layer.set_probe_score(score)
+            block_index = self._extract_block_index_from_module_name(layer.module_name)
+            layer_block_indices[layer.module_name] = block_index
             if block_index is None:
                 continue
-            block_scores[block_index] = block_scores.get(block_index, 0.0) + score
-            block_counts[block_index] = block_counts.get(block_index, 0) + 1
+            block_to_modules.setdefault(block_index, []).append(layer.module_name)
 
-        for block_index in list(block_scores.keys()):
-            block_scores[block_index] = block_scores[block_index] / max(
-                1, block_counts[block_index]
-            )
+        block_raw_scores = {}
+        bucket_best_blocks = {}
+        for block_index, module_names in block_to_modules.items():
+            block_raw_scores[block_index] = sum(
+                module_norm_scores[name] for name in module_names
+            ) / max(1, len(module_names))
             bucket_label = self._get_depth_bucket_label(
                 block_index,
                 self.n_layers,
                 self.lora_search_depth_buckets,
             )
-            current = bucket_best_blocks.get(bucket_label)
-            if current is None or block_scores[block_index] > block_scores[current]:
+            current_best = bucket_best_blocks.get(bucket_label)
+            if (
+                current_best is None
+                or block_raw_scores[block_index] > block_raw_scores[current_best]
+            ):
                 bucket_best_blocks[bucket_label] = block_index
 
+        block_quantiles = self._quantile_map(block_raw_scores)
         sorted_blocks = sorted(
-            block_scores,
-            key=lambda block_index: block_scores[block_index],
+            block_raw_scores,
+            key=lambda block_index: (
+                block_quantiles.get(block_index, 0.0),
+                block_raw_scores[block_index],
+                -block_index,
+            ),
             reverse=True,
         )
         keep_count = min(
             len(sorted_blocks),
-            max(1, int(math.ceil(len(sorted_blocks) * self.lora_search_probe_keep_ratio))),
+            max(
+                1,
+                int(math.ceil(len(sorted_blocks) * self.lora_search_probe_keep_ratio)),
+            ),
         )
         selected_blocks = set(sorted_blocks[:keep_count])
-        if len(selected_blocks) < keep_count:
-            selected_blocks = set(sorted_blocks[:keep_count])
-        for block_index in bucket_best_blocks.values():
-            if len(selected_blocks) >= keep_count and block_index not in selected_blocks:
-                continue
-            selected_blocks.add(block_index)
+        selected_blocks.update(bucket_best_blocks.values())
 
-        capacities = {}
-        weights = {}
-        for layer, block_index in zip(layers, layer_block_indices):
-            selected = block_index in selected_blocks if block_index is not None else False
-            layer.set_probe_selected(selected)
-            capacities[layer.module_name] = layer.r_max
-            weights[layer.module_name] = (
-                max(0.0, float(block_scores.get(block_index, 0.0))) if selected else 0.0
+        module_residuals = {}
+        for block_index, module_names in block_to_modules.items():
+            block_module_scores = {
+                module_name: module_quantiles.get(module_name, 0.0)
+                for module_name in module_names
+            }
+            module_residuals.update(self._quantile_map(block_module_scores))
+
+        module_state = {}
+        for layer in layers:
+            module_name = layer.module_name
+            block_index = layer_block_indices[module_name]
+            block_score = (
+                float(block_quantiles.get(block_index, 0.0))
+                if block_index is not None
+                else 0.0
             )
+            module_score = float(module_quantiles.get(module_name, 0.0))
+            module_residual = float(module_residuals.get(module_name, 0.0))
+            selected = block_index in selected_blocks if block_index is not None else False
+            rank_prior = (0.7 * block_score + 0.3 * module_residual) if selected else 0.0
+            module_state[module_name] = {
+                "block_index": block_index,
+                "module_score": module_score,
+                "block_score": block_score,
+                "module_residual": module_residual,
+                "rank_prior": rank_prior,
+                "selected": selected,
+            }
+
+        return {
+            "module_state": module_state,
+            "selected_blocks": tuple(sorted(selected_blocks)),
+        }
+
+    def _refresh_rfnext_probe(
+        self,
+        layers,
+        total_budget: int,
+        probe_scores: dict,
+        epoch: int,
+    ):
+        probe_state = self._build_rfnext_probe_state(layers, probe_scores)
+        module_state = probe_state["module_state"]
+
+        capacities = {layer.module_name: layer.r_max for layer in layers}
+        weights = {}
+        selected_layers = []
+        for layer in layers:
+            state = module_state.get(
+                layer.module_name,
+                {
+                    "module_score": 0.0,
+                    "block_score": 0.0,
+                    "module_residual": 0.0,
+                    "rank_prior": 0.0,
+                    "selected": False,
+                },
+            )
+            layer.set_probe_score(state["module_score"])
+            layer.set_probe_prior(
+                state["block_score"],
+                state["module_residual"],
+                state["rank_prior"],
+            )
+            layer.set_probe_selected(state["selected"])
+            weights[layer.module_name] = max(0.0, float(state["rank_prior"]))
+            if state["selected"]:
+                selected_layers.append(layer.module_name)
+
+        if selected_layers and sum(weights[name] for name in selected_layers) <= 0:
+            for module_name in selected_layers:
+                weights[module_name] = 1.0
 
         layer_budgets = self._allocate_weighted_budgets(total_budget, capacities, weights)
+        is_refresh = self.lora_rf_probe_ready
         for layer in layers:
-            layer.set_rank_center(layer_budgets.get(layer.module_name, 0))
+            target_center = (
+                float(layer_budgets.get(layer.module_name, 0))
+                if bool(layer.probe_selected.item())
+                else 0.0
+            )
+            if is_refresh:
+                target_center = 0.5 * float(layer.rank_center.item()) + 0.5 * target_center
+            layer.set_rank_center(target_center)
 
         self.lora_rf_probe_ready = True
-        self.lora_rf_selected_blocks = tuple(sorted(selected_blocks))
+        self.lora_rf_selected_blocks = probe_state["selected_blocks"]
+        self.lora_rf_probe_epoch = int(epoch)
+        self.lora_rf_probe_runs += 1
         return {
-            "probe_selected_blocks": len(selected_blocks),
+            "probe_selected_blocks": len(self.lora_rf_selected_blocks),
             "probe_selected_layers": int(
                 sum(int(layer.probe_selected.item()) for layer in layers)
             ),
-            "probe_block_indices": tuple(sorted(selected_blocks)),
+            "probe_block_indices": self.lora_rf_selected_blocks,
+            "probe_epoch": int(self.lora_rf_probe_epoch),
+            "probe_refreshed": bool(is_refresh),
+            "probe_runs": int(self.lora_rf_probe_runs),
         }
+
+    def _adaptive_rf_delta(self, layer: SearchableLoRALinear):
+        if self.lora_search_rf_delta <= 0:
+            return 0
+        prior = float(layer.probe_rank_prior.item())
+        delta = int(round(self.lora_search_rf_delta * (0.5 + prior)))
+        return max(1, min(layer.r_max, delta))
+
+    def _local_rank_candidates(self, layer: SearchableLoRALinear):
+        center_int = int(round(float(layer.rank_center.item())))
+        candidates = {max(0, min(layer.r_max, center_int))}
+        delta = self._adaptive_rf_delta(layer)
+        if delta > 0:
+            candidates.add(max(0, min(layer.r_max, center_int - delta)))
+            candidates.add(max(0, min(layer.r_max, center_int + delta)))
+        return sorted(candidates)
 
     def _allocate_rfnext_layer_budgets(self, layers, normalized_scores, total_budget):
         capacities = {layer.module_name: layer.r_max for layer in layers}
@@ -519,10 +671,7 @@ class DINOV3Wrapper(nn.Module):
                 layer.set_rank_center(0.0)
                 continue
 
-            candidates = self._local_rank_candidates(
-                float(layer.rank_center.item()),
-                layer.r_max,
-            )
+            candidates = self._local_rank_candidates(layer)
             utilities = torch.tensor(
                 [self._layer_rank_utility(scores, rank) for rank in candidates],
                 dtype=torch.float32,
@@ -533,8 +682,21 @@ class DINOV3Wrapper(nn.Module):
             expected_rank = float(
                 sum(rank * float(prob.item()) for rank, prob in zip(candidates, probs))
             )
-            expected_weights[layer.module_name] = max(0.0, expected_rank)
-            layer.set_rank_center(expected_rank)
+            prior_rank = float(layer.probe_rank_prior.item()) * float(layer.r_max)
+            refined_rank = 0.5 * expected_rank + 0.5 * prior_rank
+            expected_weights[layer.module_name] = max(0.0, refined_rank)
+            layer.set_rank_center(refined_rank)
+
+        selected_layers = [
+            layer.module_name for layer in layers if bool(layer.probe_selected.item())
+        ]
+        if selected_layers and sum(expected_weights[name] for name in selected_layers) <= 0:
+            for layer in layers:
+                if bool(layer.probe_selected.item()):
+                    expected_weights[layer.module_name] = max(
+                        1.0,
+                        float(layer.probe_rank_prior.item()) * float(layer.r_max),
+                    )
 
         return self._allocate_weighted_budgets(
             total_budget,
@@ -879,8 +1041,8 @@ class DINOV3Wrapper(nn.Module):
         )
         if (
             self.lora_search_strategy == "rfnext"
-            and not self.lora_rf_probe_ready
             and probe_score_fn is None
+            and not self.lora_rf_probe_ready
         ):
             summary = self.update_lora_rank_budget(budget_rank)
             if summary is not None:
@@ -889,13 +1051,24 @@ class DINOV3Wrapper(nn.Module):
             return summary
         if self.lora_search_strategy == "rfnext" and total_budget > 0 and total_budget < total_capacity:
             probe_summary = {}
-            if (not self.lora_rf_probe_ready) and probe_score_fn is not None:
-                probe_scores = probe_score_fn()
+            should_refresh_probe = False
+            if probe_score_fn is not None:
+                if not self.lora_rf_probe_ready:
+                    should_refresh_probe = True
+                elif self.lora_search_probe_refresh_interval > 0:
+                    should_refresh_probe = (
+                        epoch - self.lora_rf_probe_epoch
+                        >= self.lora_search_probe_refresh_interval
+                    )
+            if should_refresh_probe:
+                with torch.enable_grad():
+                    probe_scores = probe_score_fn()
                 if probe_scores:
-                    probe_summary = self._initialize_rfnext_probe(
+                    probe_summary = self._refresh_rfnext_probe(
                         layers,
                         total_budget,
                         probe_scores,
+                        epoch,
                     )
             normalized_scores, group_to_indices, group_capacity = self._compute_normalized_scores(layers)
             layer_budgets = self._allocate_rfnext_layer_budgets(
@@ -934,6 +1107,9 @@ class DINOV3Wrapper(nn.Module):
                                 sum(int(layer.probe_selected.item()) for layer in layers)
                             ),
                             "probe_block_indices": self.lora_rf_selected_blocks,
+                            "probe_epoch": int(self.lora_rf_probe_epoch),
+                            "probe_refreshed": False,
+                            "probe_runs": int(self.lora_rf_probe_runs),
                         }
                     )
                 return summary
@@ -964,6 +1140,9 @@ class DINOV3Wrapper(nn.Module):
                             sum(int(layer.probe_selected.item()) for layer in layers)
                         ),
                         "probe_block_indices": self.lora_rf_selected_blocks,
+                        "probe_epoch": int(self.lora_rf_probe_epoch),
+                        "probe_refreshed": False,
+                        "probe_runs": int(self.lora_rf_probe_runs),
                     }
                 )
             return summary
