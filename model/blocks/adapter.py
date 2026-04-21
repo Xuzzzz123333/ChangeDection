@@ -127,6 +127,7 @@ class DINOV3Wrapper(nn.Module):
         lora_search_probe_refresh_interval=10,
         lora_search_probe_score_norm="zscore",
         lora_search_probe_keep_ratio=0.5,
+        lora_search_probe_module_keep_ratio=0.75,
         lora_search_rf_delta=2,
         lora_search_rf_temperature=1.0,
         lora_search_counterfactual=False,
@@ -163,6 +164,9 @@ class DINOV3Wrapper(nn.Module):
         )
         self.lora_search_probe_score_norm = lora_search_probe_score_norm
         self.lora_search_probe_keep_ratio = float(lora_search_probe_keep_ratio)
+        self.lora_search_probe_module_keep_ratio = float(
+            lora_search_probe_module_keep_ratio
+        )
         self.lora_search_rf_delta = int(max(0, lora_search_rf_delta))
         self.lora_search_rf_temperature = float(max(1e-6, lora_search_rf_temperature))
         self.lora_search_counterfactual = bool(lora_search_counterfactual)
@@ -544,6 +548,34 @@ class DINOV3Wrapper(nn.Module):
         selected_blocks = set(sorted_blocks[:keep_count])
         selected_blocks.update(bucket_best_blocks.values())
 
+        selected_modules = set()
+        for block_index in selected_blocks:
+            module_names = block_to_modules.get(block_index, [])
+            if not module_names:
+                continue
+            module_keep_count = min(
+                len(module_names),
+                max(
+                    1,
+                    int(
+                        math.ceil(
+                            len(module_names)
+                            * self.lora_search_probe_module_keep_ratio
+                        )
+                    ),
+                ),
+            )
+            ranked_modules = sorted(
+                module_names,
+                key=lambda module_name: (
+                    module_quantiles.get(module_name, 0.0),
+                    module_norm_scores.get(module_name, 0.0),
+                    module_name,
+                ),
+                reverse=True,
+            )
+            selected_modules.update(ranked_modules[:module_keep_count])
+
         module_residuals = {}
         for block_index, module_names in block_to_modules.items():
             block_module_scores = {
@@ -563,7 +595,11 @@ class DINOV3Wrapper(nn.Module):
             )
             module_score = float(module_quantiles.get(module_name, 0.0))
             module_residual = float(module_residuals.get(module_name, 0.0))
-            selected = block_index in selected_blocks if block_index is not None else False
+            selected = (
+                block_index in selected_blocks and module_name in selected_modules
+                if block_index is not None
+                else False
+            )
             rank_prior = (0.7 * block_score + 0.3 * module_residual) if selected else 0.0
             module_state[module_name] = {
                 "block_index": block_index,
@@ -577,7 +613,78 @@ class DINOV3Wrapper(nn.Module):
         return {
             "module_state": module_state,
             "selected_blocks": tuple(sorted(selected_blocks)),
+            "selected_modules": tuple(sorted(selected_modules)),
         }
+
+    def _allocate_rfnext_hierarchical_budgets(
+        self,
+        layers,
+        total_budget: int,
+        module_weights: dict,
+    ):
+        layer_budgets = {layer.module_name: 0 for layer in layers}
+        selected_layers = [layer for layer in layers if bool(layer.probe_selected.item())]
+        if total_budget <= 0 or not selected_layers:
+            return layer_budgets
+
+        block_to_layers = {}
+        block_capacities = {}
+        block_weights = {}
+        for layer in selected_layers:
+            block_index = self._extract_block_index_from_module_name(layer.module_name)
+            if block_index is None:
+                continue
+            block_to_layers.setdefault(block_index, []).append(layer)
+            block_capacities[block_index] = block_capacities.get(block_index, 0) + layer.r_max
+            block_weights[block_index] = block_weights.get(block_index, 0.0) + max(
+                0.0,
+                float(module_weights.get(layer.module_name, 0.0)),
+            )
+
+        if not block_to_layers:
+            return layer_budgets
+
+        for block_index, block_layers in block_to_layers.items():
+            if block_weights.get(block_index, 0.0) <= 0:
+                block_weights[block_index] = max(
+                    1e-6,
+                    sum(float(layer.probe_block_score.item()) for layer in block_layers)
+                    / max(1, len(block_layers)),
+                )
+
+        block_budgets = self._allocate_weighted_budgets(
+            total_budget,
+            block_capacities,
+            block_weights,
+        )
+        for block_index, block_layers in block_to_layers.items():
+            block_budget = int(block_budgets.get(block_index, 0))
+            if block_budget <= 0:
+                continue
+            module_capacities = {
+                layer.module_name: layer.r_max for layer in block_layers
+            }
+            module_weight_map = {
+                layer.module_name: max(
+                    0.0,
+                    float(module_weights.get(layer.module_name, 0.0)),
+                )
+                for layer in block_layers
+            }
+            if sum(module_weight_map.values()) <= 0:
+                for layer in block_layers:
+                    module_weight_map[layer.module_name] = max(
+                        1e-6,
+                        0.7 * float(layer.probe_rank_prior.item())
+                        + 0.3 * float(layer.probe_module_residual.item()),
+                    )
+            block_layer_budgets = self._allocate_weighted_budgets(
+                block_budget,
+                module_capacities,
+                module_weight_map,
+            )
+            layer_budgets.update(block_layer_budgets)
+        return layer_budgets
 
     def _refresh_rfnext_probe(
         self,
@@ -589,7 +696,6 @@ class DINOV3Wrapper(nn.Module):
         probe_state = self._build_rfnext_probe_state(layers, probe_scores)
         module_state = probe_state["module_state"]
 
-        capacities = {layer.module_name: layer.r_max for layer in layers}
         weights = {}
         selected_layers = []
         for layer in layers:
@@ -618,7 +724,11 @@ class DINOV3Wrapper(nn.Module):
             for module_name in selected_layers:
                 weights[module_name] = 1.0
 
-        layer_budgets = self._allocate_weighted_budgets(total_budget, capacities, weights)
+        layer_budgets = self._allocate_rfnext_hierarchical_budgets(
+            layers,
+            total_budget,
+            weights,
+        )
         is_refresh = self.lora_rf_probe_ready
         for layer in layers:
             target_center = (
@@ -637,6 +747,9 @@ class DINOV3Wrapper(nn.Module):
         return {
             "probe_selected_blocks": len(self.lora_rf_selected_blocks),
             "probe_selected_layers": int(
+                sum(int(layer.probe_selected.item()) for layer in layers)
+            ),
+            "probe_selected_modules": int(
                 sum(int(layer.probe_selected.item()) for layer in layers)
             ),
             "probe_block_indices": self.lora_rf_selected_blocks,
@@ -662,7 +775,6 @@ class DINOV3Wrapper(nn.Module):
         return sorted(candidates)
 
     def _allocate_rfnext_layer_budgets(self, layers, normalized_scores, total_budget):
-        capacities = {layer.module_name: layer.r_max for layer in layers}
         expected_weights = {}
 
         for layer, scores in zip(layers, normalized_scores):
@@ -698,9 +810,9 @@ class DINOV3Wrapper(nn.Module):
                         float(layer.probe_rank_prior.item()) * float(layer.r_max),
                     )
 
-        return self._allocate_weighted_budgets(
+        return self._allocate_rfnext_hierarchical_budgets(
+            layers,
             total_budget,
-            capacities,
             expected_weights,
         )
 
@@ -1106,6 +1218,9 @@ class DINOV3Wrapper(nn.Module):
                             "probe_selected_layers": int(
                                 sum(int(layer.probe_selected.item()) for layer in layers)
                             ),
+                            "probe_selected_modules": int(
+                                sum(int(layer.probe_selected.item()) for layer in layers)
+                            ),
                             "probe_block_indices": self.lora_rf_selected_blocks,
                             "probe_epoch": int(self.lora_rf_probe_epoch),
                             "probe_refreshed": False,
@@ -1137,6 +1252,9 @@ class DINOV3Wrapper(nn.Module):
                     {
                         "probe_selected_blocks": len(self.lora_rf_selected_blocks),
                         "probe_selected_layers": int(
+                            sum(int(layer.probe_selected.item()) for layer in layers)
+                        ),
+                        "probe_selected_modules": int(
                             sum(int(layer.probe_selected.item()) for layer in layers)
                         ),
                         "probe_block_indices": self.lora_rf_selected_blocks,

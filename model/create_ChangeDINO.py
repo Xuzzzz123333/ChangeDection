@@ -69,6 +69,7 @@ class Model(nn.Module):
             dino_lora_search_probe_refresh_interval=opt.dino_lora_search_probe_refresh_interval,
             dino_lora_search_probe_score_norm=opt.dino_lora_search_probe_score_norm,
             dino_lora_search_probe_keep_ratio=opt.dino_lora_search_probe_keep_ratio,
+            dino_lora_search_probe_module_keep_ratio=opt.dino_lora_search_probe_module_keep_ratio,
             dino_lora_search_rf_delta=opt.dino_lora_search_rf_delta,
             dino_lora_search_rf_temperature=opt.dino_lora_search_rf_temperature,
             dino_lora_search_counterfactual=opt.dino_lora_search_counterfactual,
@@ -620,6 +621,7 @@ class Model(nn.Module):
                     f", strategy=rfnext"
                     f", probe_blocks={summary.get('probe_selected_blocks', 0)}"
                     f", probe_layers={summary.get('probe_selected_layers', 0)}"
+                    f", probe_modules={summary.get('probe_selected_modules', summary.get('probe_selected_layers', 0))}"
                     f", probe_epoch={summary.get('probe_epoch', -1)}"
                     f", probe_refresh={int(bool(summary.get('probe_refreshed', False)))}"
                 )

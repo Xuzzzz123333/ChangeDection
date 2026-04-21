@@ -215,6 +215,12 @@ class Options:
             help="fraction of transformer blocks kept after the probe stage in RF-style LoRA search",
         )
         self.parser.add_argument(
+            "--dino_lora_search_probe_module_keep_ratio",
+            type=float,
+            default=0.75,
+            help="fraction of LoRA target modules kept inside each selected transformer block during RF-style probe selection",
+        )
+        self.parser.add_argument(
             "--dino_lora_search_rf_delta",
             type=int,
             default=2,
@@ -702,6 +708,10 @@ class Options:
             raise ValueError("--dino_lora_search_probe_refresh_interval must be >= 0.")
         if not (0.0 < self.opt.dino_lora_search_probe_keep_ratio <= 1.0):
             raise ValueError("--dino_lora_search_probe_keep_ratio must be in (0, 1].")
+        if not (0.0 < self.opt.dino_lora_search_probe_module_keep_ratio <= 1.0):
+            raise ValueError(
+                "--dino_lora_search_probe_module_keep_ratio must be in (0, 1]."
+            )
         if self.opt.dino_lora_search_rf_delta < 0:
             raise ValueError("--dino_lora_search_rf_delta must be >= 0.")
         if self.opt.dino_lora_search_rf_temperature <= 0:

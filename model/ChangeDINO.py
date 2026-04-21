@@ -187,6 +187,9 @@ class Encoder(nn.Module):
                 "dino_lora_search_probe_score_norm", "zscore"
             ),
             lora_search_probe_keep_ratio=kwargs.get("dino_lora_search_probe_keep_ratio", 0.5),
+            lora_search_probe_module_keep_ratio=kwargs.get(
+                "dino_lora_search_probe_module_keep_ratio", 0.75
+            ),
             lora_search_rf_delta=kwargs.get("dino_lora_search_rf_delta", 2),
             lora_search_rf_temperature=kwargs.get("dino_lora_search_rf_temperature", 1.0),
             lora_search_counterfactual=kwargs.get("dino_lora_search_counterfactual", False),
