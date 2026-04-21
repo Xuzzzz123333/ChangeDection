@@ -108,9 +108,10 @@ class Trainval(object):
                 )
                 f.write("val_metrics(json)\n")
 
-        # Build one fixed, representative validation anchor set for counterfactual
-        # rank search so pruning decisions are comparable across epochs.
+        # Build fixed representative anchor sets so search decisions are
+        # comparable across epochs.
         self.lora_search_val_batches = self._build_lora_search_val_batches()
+        self.lora_search_probe_batches = self._build_lora_search_probe_batches()
 
     def _clone_batch(self, batch):
         cloned = {}
@@ -250,23 +251,14 @@ class Trainval(object):
 
         return selected_indices[:num_clusters]
 
-    def _build_lora_search_val_batches(self):
-        if not (
-            getattr(self.opt, "dino_lora_search", False)
-            and getattr(self.opt, "dino_lora_search_counterfactual", False)
-        ):
-            return []
+    def _build_representative_batches(self, dataset, max_batches, label):
         if self.opt.distributed and not self.opt.is_main_process:
             return []
 
-        max_batches = max(
-            0,
-            int(getattr(self.opt, "dino_lora_search_counterfactual_val_batches", 0)),
-        )
+        max_batches = max(0, int(max_batches))
         if max_batches <= 0:
             return []
 
-        dataset = self.val_loader.dataset
         dataset_size = len(dataset)
         if dataset_size <= 0:
             return []
@@ -295,10 +287,34 @@ class Trainval(object):
 
         if self.opt.is_main_process:
             print(
-                f"built {len(cached_batches)} clustered representative val batches "
-                f"({len(sample_indices)} samples) for LoRA counterfactual rank search"
+                f"built {len(cached_batches)} clustered representative {label} batches "
+                f"({len(sample_indices)} samples)"
             )
         return cached_batches
+
+    def _build_lora_search_val_batches(self):
+        if not (
+            getattr(self.opt, "dino_lora_search", False)
+            and getattr(self.opt, "dino_lora_search_counterfactual", False)
+        ):
+            return []
+        return self._build_representative_batches(
+            self.val_loader.dataset,
+            getattr(self.opt, "dino_lora_search_counterfactual_val_batches", 0),
+            "val anchors for LoRA counterfactual rank search",
+        )
+
+    def _build_lora_search_probe_batches(self):
+        if not (
+            getattr(self.opt, "dino_lora_search", False)
+            and getattr(self.opt, "dino_lora_search_strategy", "classic") == "rfnext"
+        ):
+            return []
+        return self._build_representative_batches(
+            self.train_loader.dataset,
+            getattr(self.opt, "dino_lora_search_probe_batches", 0),
+            "train probe batches for RF-style LoRA search",
+        )
 
     def _rescheduler(self, opt):
         self.model.optimizer = optim.AdamW(
@@ -495,6 +511,7 @@ if __name__ == "__main__":
             trainval.model.update_lora_rank_search_with_val(
                 epoch,
                 trainval.lora_search_val_batches,
+                trainval.lora_search_probe_batches,
             )
             if epoch == int(opt.num_epochs * 0.9):
                 trainval._rescheduler(opt)

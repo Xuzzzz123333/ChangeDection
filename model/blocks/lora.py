@@ -141,6 +141,11 @@ class SearchableLoRALinear(nn.Module):
         self.register_buffer("grad_a_ema_ready", torch.tensor(False, dtype=torch.bool))
         self.register_buffer("grad_b_ema_ready", torch.tensor(False, dtype=torch.bool))
         self.register_buffer(
+            "rank_center", torch.tensor(float(self.r_max), dtype=torch.float32)
+        )
+        self.register_buffer("probe_score", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("probe_selected", torch.tensor(True, dtype=torch.bool))
+        self.register_buffer(
             "counterfactual_confirm", torch.zeros(self.r_max, dtype=torch.int64)
         )
 
@@ -221,6 +226,19 @@ class SearchableLoRALinear(nn.Module):
     @torch.no_grad()
     def get_rank_mask(self):
         return self.rank_mask.clone()
+
+    @torch.no_grad()
+    def set_rank_center(self, rank_center: float):
+        rank_center = float(max(0.0, min(float(rank_center), float(self.r_max))))
+        self.rank_center.fill_(rank_center)
+
+    @torch.no_grad()
+    def set_probe_score(self, score: float):
+        self.probe_score.fill_(float(score))
+
+    @torch.no_grad()
+    def set_probe_selected(self, selected: bool):
+        self.probe_selected.fill_(bool(selected))
 
     @torch.no_grad()
     def update_counterfactual_confirm(self, candidate_mask, tested_mask, safe_mask):

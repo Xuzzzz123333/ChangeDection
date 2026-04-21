@@ -178,6 +178,11 @@ class Encoder(nn.Module):
             lora_search_budget_mode=kwargs.get("dino_lora_search_budget_mode", "grouped"),
             lora_search_group_weights=kwargs.get("dino_lora_search_group_weights", None),
             lora_search_depth_buckets=kwargs.get("dino_lora_search_depth_buckets", 3),
+            lora_search_strategy=kwargs.get("dino_lora_search_strategy", "classic"),
+            lora_search_probe_batches=kwargs.get("dino_lora_search_probe_batches", 5),
+            lora_search_probe_keep_ratio=kwargs.get("dino_lora_search_probe_keep_ratio", 0.5),
+            lora_search_rf_delta=kwargs.get("dino_lora_search_rf_delta", 2),
+            lora_search_rf_temperature=kwargs.get("dino_lora_search_rf_temperature", 1.0),
             lora_search_counterfactual=kwargs.get("dino_lora_search_counterfactual", False),
             lora_search_counterfactual_val_batches=kwargs.get(
                 "dino_lora_search_counterfactual_val_batches", 2

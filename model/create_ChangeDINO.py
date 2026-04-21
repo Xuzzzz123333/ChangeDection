@@ -64,6 +64,11 @@ class Model(nn.Module):
             dino_lora_search_budget_mode=opt.dino_lora_search_budget_mode,
             dino_lora_search_group_weights=opt.dino_lora_search_group_weights,
             dino_lora_search_depth_buckets=opt.dino_lora_search_depth_buckets,
+            dino_lora_search_strategy=opt.dino_lora_search_strategy,
+            dino_lora_search_probe_batches=opt.dino_lora_search_probe_batches,
+            dino_lora_search_probe_keep_ratio=opt.dino_lora_search_probe_keep_ratio,
+            dino_lora_search_rf_delta=opt.dino_lora_search_rf_delta,
+            dino_lora_search_rf_temperature=opt.dino_lora_search_rf_temperature,
             dino_lora_search_counterfactual=opt.dino_lora_search_counterfactual,
             dino_lora_search_counterfactual_val_batches=opt.dino_lora_search_counterfactual_val_batches,
             dino_lora_search_counterfactual_max_candidates=opt.dino_lora_search_counterfactual_max_candidates,
@@ -470,6 +475,74 @@ class Model(nn.Module):
             "metrics": scores,
         }
 
+    def _set_batchnorm_eval(self, module):
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+    def _evaluate_lora_probe_scores(self, probe_batches):
+        if not probe_batches:
+            return None
+
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
+        if dino is None or not hasattr(dino, "iter_searchable_lora_layers"):
+            return None
+
+        probe_layers = list(dino.iter_searchable_lora_layers())
+        if not probe_layers:
+            return None
+
+        was_training = network.training
+        network.train()
+        network.apply(self._set_batchnorm_eval)
+        network.zero_grad(set_to_none=True)
+
+        score_sums = {layer.module_name: 0.0 for layer in probe_layers}
+        score_counts = {layer.module_name: 0 for layer in probe_layers}
+
+        for batch in probe_batches:
+            network.zero_grad(set_to_none=True)
+
+            x1 = batch["img1"].to(self.device, non_blocking=True)
+            x2 = batch["img2"].to(self.device, non_blocking=True)
+            label = batch["cd_label"].to(self.device, non_blocking=True).long()
+
+            final_pred, preds = network(x1, x2)
+            focal = self.focal(final_pred, label)
+            dice = self.dice(final_pred, label)
+            for pred in preds:
+                focal = focal + self.focal(pred, label)
+                dice = dice + 0.5 * self.dice(pred, label)
+            loss = focal * self.opt.alpha + dice
+            loss.backward()
+
+            for layer in probe_layers:
+                grad_a = layer.lora_A.weight.grad
+                grad_b = layer.lora_B.weight.grad
+                grad_sq = 0.0
+                param_count = 0
+                if grad_a is not None:
+                    grad_sq += float(grad_a.detach().float().pow(2).sum().item())
+                    param_count += grad_a.numel()
+                if grad_b is not None:
+                    grad_sq += float(grad_b.detach().float().pow(2).sum().item())
+                    param_count += grad_b.numel()
+                if param_count <= 0:
+                    continue
+                score = (grad_sq ** 0.5) / (param_count ** 0.5)
+                score_sums[layer.module_name] += score
+                score_counts[layer.module_name] += 1
+
+        network.zero_grad(set_to_none=True)
+        if not was_training:
+            network.eval()
+
+        probe_scores = {}
+        for module_name, score_sum in score_sums.items():
+            count = max(1, score_counts[module_name])
+            probe_scores[module_name] = score_sum / count
+        return probe_scores
+
     def sync_lora_rank_masks(self):
         if not (self.use_distributed and getattr(self.opt, "dino_lora_search", False)):
             return
@@ -487,7 +560,7 @@ class Model(nn.Module):
             if hasattr(layer, "counterfactual_confirm"):
                 torch.distributed.broadcast(layer.counterfactual_confirm, src=0)
 
-    def update_lora_rank_search_with_val(self, epoch, val_batches=None):
+    def update_lora_rank_search_with_val(self, epoch, val_batches=None, probe_batches=None):
         if not getattr(self.opt, "dino_lora_search", False):
             return None
 
@@ -497,18 +570,26 @@ class Model(nn.Module):
 
         summary = None
         eval_metric_fn = None
+        probe_score_fn = None
         if (
             getattr(self.opt, "dino_lora_search_counterfactual", False)
             and val_batches
             and (not self.use_distributed or self.opt.is_main_process)
         ):
             eval_metric_fn = lambda: self._evaluate_lora_counterfactual_metric(val_batches)
+        if (
+            getattr(self.opt, "dino_lora_search_strategy", "classic") == "rfnext"
+            and probe_batches
+            and (not self.use_distributed or self.opt.is_main_process)
+        ):
+            probe_score_fn = lambda: self._evaluate_lora_probe_scores(probe_batches)
 
         if not self.use_distributed or self.opt.is_main_process:
             summary = network.encoder.dino.update_lora_rank_search(
                 epoch,
                 self.opt.num_epochs,
                 eval_metric_fn=eval_metric_fn,
+                probe_score_fn=probe_score_fn,
             )
 
         self.sync_lora_rank_masks()
@@ -530,12 +611,20 @@ class Model(nn.Module):
                     f", cf_metric={summary.get('counterfactual_metric_name', 'score')}"
                     f", cf_score={summary.get('counterfactual_baseline_score', float('nan')):.4f}"
                 )
+            probe_suffix = ""
+            if summary.get("search_strategy") == "rfnext":
+                probe_suffix = (
+                    f", strategy=rfnext"
+                    f", probe_blocks={summary.get('probe_selected_blocks', 0)}"
+                    f", probe_layers={summary.get('probe_selected_layers', 0)}"
+                )
             print(
                 f"LoRA rank search -> budget={summary['budget_rank']}, "
                 f"mode={summary.get('budget_mode', 'global')}, "
                 f"total_active={summary['total_active_rank']}, "
                 f"groups=[{group_preview}], "
                 f"layer_ranks=[{preview}{suffix}]"
+                f"{probe_suffix}"
                 f"{counterfactual_suffix}"
             )
         return summary

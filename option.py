@@ -183,6 +183,37 @@ class Options:
             help="number of depth buckets used for grouped LoRA rank search; set to 1 to recover position-only grouping",
         )
         self.parser.add_argument(
+            "--dino_lora_search_strategy",
+            type=str,
+            default="classic",
+            choices=["classic", "rfnext"],
+            help="classic grouped rank search or an RF-Next-style coarse-to-fine rank search",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_probe_batches",
+            type=int,
+            default=5,
+            help="number of representative training batches used by the RF-style LoRA layer probe",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_probe_keep_ratio",
+            type=float,
+            default=0.5,
+            help="fraction of transformer blocks kept after the probe stage in RF-style LoRA search",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_rf_delta",
+            type=int,
+            default=2,
+            help="local rank search radius around the current center for RF-style LoRA search",
+        )
+        self.parser.add_argument(
+            "--dino_lora_search_rf_temperature",
+            type=float,
+            default=1.0,
+            help="softmax temperature used when converting local rank candidate utilities into expected ranks",
+        )
+        self.parser.add_argument(
             "--dino_lora_search_counterfactual",
             action="store_true",
             help="use a small validation set to counterfactually test candidate LoRA rank deletions before pruning",
@@ -652,6 +683,14 @@ class Options:
             raise ValueError("--dino_lora_search_grad_weight must be >= 0.")
         if self.opt.dino_lora_search_depth_buckets <= 0:
             raise ValueError("--dino_lora_search_depth_buckets must be > 0.")
+        if self.opt.dino_lora_search_probe_batches < 0:
+            raise ValueError("--dino_lora_search_probe_batches must be >= 0.")
+        if not (0.0 < self.opt.dino_lora_search_probe_keep_ratio <= 1.0):
+            raise ValueError("--dino_lora_search_probe_keep_ratio must be in (0, 1].")
+        if self.opt.dino_lora_search_rf_delta < 0:
+            raise ValueError("--dino_lora_search_rf_delta must be >= 0.")
+        if self.opt.dino_lora_search_rf_temperature <= 0:
+            raise ValueError("--dino_lora_search_rf_temperature must be > 0.")
         if self.opt.dino_lora_search_counterfactual and not self.opt.dino_lora_search:
             raise ValueError(
                 "--dino_lora_search_counterfactual requires --dino_lora_search to be enabled."
