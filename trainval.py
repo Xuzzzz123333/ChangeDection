@@ -522,6 +522,11 @@ if __name__ == "__main__":
                 opt.is_main_process
                 and (
                     (
+                        opt.dino_local_conv_rf_enable
+                        and opt.dino_local_conv_rf_log_interval > 0
+                        and epoch % opt.dino_local_conv_rf_log_interval == 0
+                    )
+                    or (
                         opt.mfce_rf_enable
                         and opt.mfce_rf_log_interval > 0
                         and epoch % opt.mfce_rf_log_interval == 0

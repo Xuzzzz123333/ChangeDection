@@ -107,6 +107,91 @@ class Options:
             default=0.0,
             help="initial residual scale for the DINO local convolution branch; 0 keeps the pretrained backbone unchanged at startup",
         )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_enable",
+            action="store_true",
+            help="replace the DINO local-conv branch depthwise convolution with RF-Next receptive-field search",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_mode",
+            type=str,
+            default="rfsearch",
+            choices=["rfsearch", "rfsingle", "rfmultiple", "rfmerge"],
+            help="RF-Next mode used inside the DINO local-conv branch depthwise convolution",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_num_branches",
+            type=int,
+            default=3,
+            help="number of local dilation candidates maintained by each DINO local-conv RF branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_expand_rate",
+            type=float,
+            default=0.5,
+            help="local expansion ratio used by DINO local-conv RF search",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_min_dilation",
+            type=int,
+            default=1,
+            help="minimum dilation allowed by DINO local-conv RF search",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_max_dilations",
+            nargs="+",
+            type=int,
+            default=None,
+            help="optional per-block max dilations for DINO local-conv RF search; provide one value or one per selected DINO block",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_search_interval",
+            type=int,
+            default=100,
+            help="forward-step interval between DINO local-conv RF estimate-expand updates",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_max_search_step",
+            type=int,
+            default=8,
+            help="maximum number of DINO local-conv RF local search refinements; 0 disables iterative updates",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_init_weight",
+            type=float,
+            default=0.01,
+            help="initial branch weight used by DINO local-conv RF search",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_schedule_mode",
+            type=str,
+            default="epoch",
+            choices=["manual", "epoch"],
+            help="manual step schedule or epoch-aware DINO local-conv RF search schedule",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_search_warmup_epochs",
+            type=int,
+            default=0,
+            help="delay DINO local-conv RF search updates for the first N epochs",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_search_epochs",
+            type=int,
+            default=20,
+            help="number of epochs allocated to DINO local-conv RF refinement in epoch schedule mode; <=0 uses the remaining training epochs",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_log_interval",
+            type=int,
+            default=5,
+            help="log DINO local-conv RF states every N epochs during training; set to 0 to disable",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_rf_merge_on_eval",
+            action="store_true",
+            help="merge searched DINO local-conv RF branches into a single equivalent convolution after loading checkpoints for evaluation",
+        )
         self.parser.add_argument("--dino_lora_r", type=int, default=8)
         self.parser.add_argument("--dino_lora_alpha", type=int, default=16)
         self.parser.add_argument("--dino_lora_dropout", type=float, default=0.05)
@@ -680,6 +765,16 @@ class Options:
             raise ValueError("--dino_local_conv_blocks must use non-negative integers.")
         if self.opt.dino_local_conv_kernel_size <= 0 or self.opt.dino_local_conv_kernel_size % 2 == 0:
             raise ValueError("--dino_local_conv_kernel_size must be a positive odd integer.")
+        if self.opt.dino_local_conv_rf_enable and not self.opt.dino_local_conv_enable:
+            raise ValueError("--dino_local_conv_rf_enable requires --dino_local_conv_enable to be enabled.")
+        if self.opt.dino_local_conv_rf_num_branches <= 0:
+            raise ValueError("--dino_local_conv_rf_num_branches must be > 0.")
+        if self.opt.dino_local_conv_rf_search_interval <= 0:
+            raise ValueError("--dino_local_conv_rf_search_interval must be > 0.")
+        if self.opt.dino_local_conv_rf_max_search_step < 0:
+            raise ValueError("--dino_local_conv_rf_max_search_step must be >= 0.")
+        if self.opt.dino_local_conv_rf_search_warmup_epochs < 0:
+            raise ValueError("--dino_local_conv_rf_search_warmup_epochs must be >= 0.")
         if (self.opt.dino_lora or self.opt.dino_dora) and self.opt.dino_lora_r <= 0:
             raise ValueError("--dino_lora_r must be > 0 when LoRA or DoRA is enabled.")
         if self.opt.dino_lora_search and not self.opt.dino_lora:
@@ -867,6 +962,17 @@ class Options:
             parsed_group_weights.setdefault(group_name, 1.0)
         self.opt.dino_lora_search_group_weights = parsed_group_weights
         self.opt.dino_local_conv_blocks = sorted(set(self.opt.dino_local_conv_blocks))
+        if self.opt.dino_local_conv_rf_max_dilations is not None:
+            if any(rate <= 0 for rate in self.opt.dino_local_conv_rf_max_dilations):
+                raise ValueError("--dino_local_conv_rf_max_dilations must use positive integers.")
+            if len(self.opt.dino_local_conv_rf_max_dilations) == 1:
+                self.opt.dino_local_conv_rf_max_dilations = (
+                    self.opt.dino_local_conv_rf_max_dilations * len(self.opt.dino_local_conv_blocks)
+                )
+            elif len(self.opt.dino_local_conv_rf_max_dilations) != len(self.opt.dino_local_conv_blocks):
+                raise ValueError(
+                    "--dino_local_conv_rf_max_dilations expects one value or one per selected DINO local-conv block."
+                )
 
         rf_max_dilations = self.opt.mfce_rf_max_dilations
         if rf_max_dilations is None:

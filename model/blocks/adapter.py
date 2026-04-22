@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .mfce import RFConv2d
 from .lora import DoRALinear, LoRALinear, SearchableLoRALinear
 
 REPO_DIR = "dinov3"
@@ -20,21 +21,69 @@ MODEL_TO_NUM_LAYERS = {
 
 
 class DINOConvTokenBranch(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 3):
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 3,
+        rf_enable: bool = False,
+        rf_mode: str = "rfsearch",
+        rf_num_branches: int = 3,
+        rf_expand_rate: float = 0.5,
+        rf_min_dilation: int = 1,
+        rf_max_dilation=None,
+        rf_search_interval: int = 100,
+        rf_max_search_step: int = 8,
+        rf_init_weight: float = 0.01,
+    ):
         super().__init__()
         if kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError("DINOConvTokenBranch expects a positive odd kernel size.")
-        padding = kernel_size // 2
-        self.depthwise = nn.Conv2d(
-            dim,
-            dim,
-            kernel_size=kernel_size,
-            padding=padding,
-            groups=dim,
-            bias=False,
-        )
+        self.rf_enable = bool(rf_enable)
+        if self.rf_enable:
+            self.depthwise = RFConv2d(
+                dim,
+                dim,
+                kernel_size=kernel_size,
+                padding=0,
+                dilation=1,
+                groups=dim,
+                bias=False,
+                num_branches=rf_num_branches,
+                expand_rate=rf_expand_rate,
+                min_dilation=rf_min_dilation,
+                max_dilation=rf_max_dilation,
+                init_weight=rf_init_weight,
+                search_interval=rf_search_interval,
+                max_search_step=rf_max_search_step,
+                rf_mode=rf_mode,
+            )
+        else:
+            padding = kernel_size // 2
+            self.depthwise = nn.Conv2d(
+                dim,
+                dim,
+                kernel_size=kernel_size,
+                padding=padding,
+                groups=dim,
+                bias=False,
+            )
         self.act = nn.GELU()
         self.pointwise = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+
+    def rf_state(self):
+        if not self.rf_enable:
+            return {}
+        return self.depthwise.rf_state()
+
+    def configure_rf_search(self, **kwargs):
+        if not self.rf_enable:
+            return None
+        return self.depthwise.configure_search_schedule(**kwargs)
+
+    def merge_rf_branches_(self):
+        if not self.rf_enable:
+            return None
+        return self.depthwise.merge_branches_()
 
     @staticmethod
     def infer_spatial_shape(num_patches: int):
@@ -68,13 +117,43 @@ class DINOBlockLocalConvAdapter(nn.Module):
         num_prefix_tokens: int,
         kernel_size: int = 3,
         init_scale: float = 0.0,
+        rf_enable: bool = False,
+        rf_mode: str = "rfsearch",
+        rf_num_branches: int = 3,
+        rf_expand_rate: float = 0.5,
+        rf_min_dilation: int = 1,
+        rf_max_dilation=None,
+        rf_search_interval: int = 100,
+        rf_max_search_step: int = 8,
+        rf_init_weight: float = 0.01,
     ):
         super().__init__()
         self.block = block
         self.num_prefix_tokens = int(max(0, num_prefix_tokens))
         self.norm = nn.LayerNorm(dim)
-        self.local_branch = DINOConvTokenBranch(dim=dim, kernel_size=kernel_size)
+        self.local_branch = DINOConvTokenBranch(
+            dim=dim,
+            kernel_size=kernel_size,
+            rf_enable=rf_enable,
+            rf_mode=rf_mode,
+            rf_num_branches=rf_num_branches,
+            rf_expand_rate=rf_expand_rate,
+            rf_min_dilation=rf_min_dilation,
+            rf_max_dilation=rf_max_dilation,
+            rf_search_interval=rf_search_interval,
+            rf_max_search_step=rf_max_search_step,
+            rf_init_weight=rf_init_weight,
+        )
         self.gamma = nn.Parameter(torch.full((dim,), float(init_scale)))
+
+    def rf_state(self):
+        return self.local_branch.rf_state()
+
+    def configure_rf_search(self, **kwargs):
+        return self.local_branch.configure_rf_search(**kwargs)
+
+    def merge_rf_branches_(self):
+        return self.local_branch.merge_rf_branches_()
 
     def _forward_tensor(self, x: torch.Tensor):
         if x.ndim != 3 or x.shape[1] <= self.num_prefix_tokens:
@@ -139,6 +218,15 @@ class DINOV3Wrapper(nn.Module):
         local_conv_blocks=(5, 11, 17, 23),
         local_conv_kernel_size=3,
         local_conv_init_scale=0.0,
+        local_conv_rf_enable=False,
+        local_conv_rf_mode="rfsearch",
+        local_conv_rf_num_branches=3,
+        local_conv_rf_expand_rate=0.5,
+        local_conv_rf_min_dilation=1,
+        local_conv_rf_max_dilations=None,
+        local_conv_rf_search_interval=100,
+        local_conv_rf_max_search_step=8,
+        local_conv_rf_init_weight=0.01,
     ):
         super().__init__()
         self.device = device
@@ -186,6 +274,15 @@ class DINOV3Wrapper(nn.Module):
         self.local_conv_blocks = tuple(sorted(set(int(index) for index in local_conv_blocks)))
         self.local_conv_kernel_size = int(local_conv_kernel_size)
         self.local_conv_init_scale = float(local_conv_init_scale)
+        self.local_conv_rf_enable = bool(local_conv_rf_enable and self.local_conv_enable)
+        self.local_conv_rf_mode = local_conv_rf_mode
+        self.local_conv_rf_num_branches = int(max(1, local_conv_rf_num_branches))
+        self.local_conv_rf_expand_rate = float(local_conv_rf_expand_rate)
+        self.local_conv_rf_min_dilation = int(max(1, local_conv_rf_min_dilation))
+        self.local_conv_rf_max_dilations = local_conv_rf_max_dilations
+        self.local_conv_rf_search_interval = int(max(1, local_conv_rf_search_interval))
+        self.local_conv_rf_max_search_step = int(max(0, local_conv_rf_max_search_step))
+        self.local_conv_rf_init_weight = float(local_conv_rf_init_weight)
         self.lora_rf_probe_ready = False
         self.lora_rf_selected_blocks = tuple()
         self.lora_rf_probe_epoch = -1
@@ -382,13 +479,70 @@ class DINOV3Wrapper(nn.Module):
             block = blocks[block_index]
             if isinstance(block, DINOBlockLocalConvAdapter):
                 continue
+            rf_max_dilation = None
+            if self.local_conv_rf_max_dilations is not None:
+                if len(self.local_conv_rf_max_dilations) == 1:
+                    rf_max_dilation = self.local_conv_rf_max_dilations[0]
+                else:
+                    try:
+                        block_pos = valid_indices.index(block_index)
+                    except ValueError:
+                        block_pos = 0
+                    rf_max_dilation = self.local_conv_rf_max_dilations[block_pos]
             blocks[block_index] = DINOBlockLocalConvAdapter(
                 block=block,
                 dim=dim,
                 num_prefix_tokens=num_prefix_tokens,
                 kernel_size=kernel_size,
                 init_scale=init_scale,
+                rf_enable=self.local_conv_rf_enable,
+                rf_mode=self.local_conv_rf_mode,
+                rf_num_branches=self.local_conv_rf_num_branches,
+                rf_expand_rate=self.local_conv_rf_expand_rate,
+                rf_min_dilation=self.local_conv_rf_min_dilation,
+                rf_max_dilation=rf_max_dilation,
+                rf_search_interval=self.local_conv_rf_search_interval,
+                rf_max_search_step=self.local_conv_rf_max_search_step,
+                rf_init_weight=self.local_conv_rf_init_weight,
             ).to(self.device)
+
+    def _iter_local_conv_rf_blocks(self):
+        if not self.local_conv_rf_enable:
+            return []
+        blocks = getattr(self.model, "blocks", None)
+        if blocks is None:
+            return []
+        return [
+            (f"block{block_index}", blocks[block_index])
+            for block_index in self.local_conv_blocks
+            if block_index < len(blocks)
+            and isinstance(blocks[block_index], DINOBlockLocalConvAdapter)
+            and blocks[block_index].rf_state()
+        ]
+
+    def local_conv_rf_states(self):
+        return [
+            {"name": name, **module.rf_state()}
+            for name, module in self._iter_local_conv_rf_blocks()
+        ]
+
+    def configure_local_conv_rf_search(self, **kwargs):
+        stage_summaries = []
+        for name, module in self._iter_local_conv_rf_blocks():
+            summary = module.configure_rf_search(**kwargs)
+            if summary is not None:
+                stage_summaries.append({"name": name, **summary})
+        if not stage_summaries:
+            return None
+        summary = stage_summaries[0].copy()
+        summary["stages"] = stage_summaries
+        return summary
+
+    def merge_local_conv_rf_branches_(self):
+        return [
+            {"name": name, **module.merge_rf_branches_()}
+            for name, module in self._iter_local_conv_rf_blocks()
+        ]
 
     @staticmethod
     def _extract_block_index_from_module_name(module_name: str):
@@ -731,13 +885,21 @@ class DINOV3Wrapper(nn.Module):
         )
         is_refresh = self.lora_rf_probe_ready
         for layer in layers:
+            is_selected = bool(layer.probe_selected.item())
             target_center = (
                 float(layer_budgets.get(layer.module_name, 0))
-                if bool(layer.probe_selected.item())
+                if is_selected
                 else 0.0
             )
-            if is_refresh:
-                target_center = 0.5 * float(layer.rank_center.item()) + 0.5 * target_center
+            if is_selected:
+                # Smooth the first rfnext transition from the currently active rank
+                # instead of hard-resetting centers from the full-rank/classic phase.
+                previous_center = (
+                    float(layer.rank_center.item())
+                    if is_refresh
+                    else float(layer.active_rank.item())
+                )
+                target_center = 0.5 * previous_center + 0.5 * target_center
             layer.set_rank_center(target_center)
 
         self.lora_rf_probe_ready = True

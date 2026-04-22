@@ -48,6 +48,15 @@ class Model(nn.Module):
             dino_local_conv_blocks=opt.dino_local_conv_blocks,
             dino_local_conv_kernel_size=opt.dino_local_conv_kernel_size,
             dino_local_conv_init_scale=opt.dino_local_conv_init_scale,
+            dino_local_conv_rf_enable=opt.dino_local_conv_rf_enable,
+            dino_local_conv_rf_mode=opt.dino_local_conv_rf_mode,
+            dino_local_conv_rf_num_branches=opt.dino_local_conv_rf_num_branches,
+            dino_local_conv_rf_expand_rate=opt.dino_local_conv_rf_expand_rate,
+            dino_local_conv_rf_min_dilation=opt.dino_local_conv_rf_min_dilation,
+            dino_local_conv_rf_max_dilations=opt.dino_local_conv_rf_max_dilations,
+            dino_local_conv_rf_search_interval=opt.dino_local_conv_rf_search_interval,
+            dino_local_conv_rf_max_search_step=opt.dino_local_conv_rf_max_search_step,
+            dino_local_conv_rf_init_weight=opt.dino_local_conv_rf_init_weight,
             dino_lora=opt.dino_lora,
             dino_dora=opt.dino_dora,
             dino_lora_r=opt.dino_lora_r,
@@ -128,6 +137,13 @@ class Model(nn.Module):
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
         should_merge_rf = opt.load_pretrain and (
             (
+                getattr(opt, "dino_local_conv_rf_enable", False)
+                and (
+                    getattr(opt, "dino_local_conv_rf_merge_on_eval", False)
+                    or getattr(opt, "dino_local_conv_rf_mode", "") == "rfmerge"
+                )
+            )
+            or (
                 getattr(opt, "mfce_rf_enable", False)
                 and (
                     getattr(opt, "mfce_rf_merge_on_eval", False)
@@ -240,6 +256,28 @@ class Model(nn.Module):
         return getattr(network, "pairlocal", None)
 
     def _log_rf_states(self, prefix="current"):
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
+        if getattr(self.opt, "dino_local_conv_rf_enable", False) and dino is not None:
+            states = dino.local_conv_rf_states() if hasattr(dino, "local_conv_rf_states") else []
+            if states:
+                print(f"{prefix} DINO local-conv RF states:")
+                for state in states:
+                    rates = ", ".join(
+                        f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
+                    )
+                    weights = ", ".join(
+                        f"{weight:.3f}" for weight in state.get("weights", [])
+                    )
+                    print(
+                        f"  {state.get('name')}: mode={state.get('mode')} "
+                        f"dilation={state.get('dilation')} kernel={state.get('kernel_size')} "
+                        f"rates=[{rates}] weights=[{weights}] merged={state.get('merged', False)} "
+                        f"search_step={state.get('search_step', 0)} "
+                        f"interval={state.get('search_interval')} "
+                        f"window=[{state.get('start_step')},{state.get('stop_step')}]"
+                    )
+
         dense_adapter = self._collect_dense_adapter()
         if getattr(self.opt, "mfce_rf_enable", False) and dense_adapter is not None:
             states = dense_adapter.rf_states() if hasattr(dense_adapter, "rf_states") else []
@@ -304,10 +342,37 @@ class Model(nn.Module):
                     )
 
     def configure_rf_search(self, steps_per_epoch: int):
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
         dense_adapter = self._collect_dense_adapter()
         detector = self._collect_detector()
         pairlocal = self._collect_pairlocal()
         summaries = {}
+
+        if (
+            getattr(self.opt, "dino_local_conv_rf_enable", False)
+            and dino is not None
+            and hasattr(dino, "configure_local_conv_rf_search")
+        ):
+            schedule_mode = getattr(self.opt, "dino_local_conv_rf_schedule_mode", "manual")
+            summary = dino.configure_local_conv_rf_search(
+                schedule_mode=schedule_mode,
+                steps_per_epoch=max(1, int(steps_per_epoch)),
+                total_epochs=self.opt.num_epochs,
+                search_interval=self.opt.dino_local_conv_rf_search_interval,
+                max_search_step=self.opt.dino_local_conv_rf_max_search_step,
+                warmup_epochs=self.opt.dino_local_conv_rf_search_warmup_epochs,
+                search_epochs=self.opt.dino_local_conv_rf_search_epochs,
+            )
+            if summary:
+                summaries["dino_local_conv"] = summary
+                if self.opt.is_main_process:
+                    print(
+                        "DINO local-conv RF search schedule -> "
+                        f"mode={schedule_mode}, interval={summary.get('search_interval')}, "
+                        f"max_steps={summary.get('max_search_step')}, "
+                        f"window=[{summary.get('start_step')},{summary.get('stop_step')}]"
+                    )
 
         if (
             getattr(self.opt, "mfce_rf_enable", False)
@@ -386,6 +451,14 @@ class Model(nn.Module):
 
     def merge_rf_branches(self):
         merged = {}
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
+        if (
+            getattr(self.opt, "dino_local_conv_rf_enable", False)
+            and dino is not None
+            and hasattr(dino, "merge_local_conv_rf_branches_")
+        ):
+            merged["dino_local_conv"] = dino.merge_local_conv_rf_branches_()
         dense_adapter = self._collect_dense_adapter()
         if (
             getattr(self.opt, "mfce_rf_enable", False)
@@ -677,7 +750,7 @@ class Model(nn.Module):
             )
         else:
             checkpoint = torch.load(
-                save_path, map_location=self.device, weights_only=True
+                save_path, map_location="cpu", weights_only=True
             )
             self._unwrap_model(network).load_state_dict(checkpoint["network"], strict=False)
             print("load pre-trained")
