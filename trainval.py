@@ -106,7 +106,7 @@ class Trainval(object):
                 f.write(
                     "# time,epoch,train_loss,train_focal,train_dice,train_rf_div,lr,"
                 )
-                f.write("val_metrics(json)\n")
+                f.write("val_metrics(json),spectral_metrics(json)\n")
 
         # Build fixed representative anchor sets so search decisions are
         # comparable across epochs.
@@ -332,6 +332,13 @@ class Trainval(object):
         if not self.opt.is_main_process:
             return
 
+        spectral_metrics = {}
+        if getattr(self.opt, "dino_lora_search_spectral", False):
+            spectral_metrics = {
+                "search": getattr(self.model, "last_spectral_search_stats", {}),
+                "probe": getattr(self.model, "last_spectral_probe_stats", {}),
+                "first_jump": train_stats.get("spectral_first_search_jump", {}),
+            }
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = (
             f"{ts},{epoch},"
@@ -341,6 +348,8 @@ class Trainval(object):
             f"{train_stats.get('rf_diversity', float('nan')):.6f},"
             f"{train_stats.get('lr', float('nan')):.8f},"
             + json.dumps(val_scores, ensure_ascii=False)
+            + ","
+            + json.dumps(spectral_metrics, ensure_ascii=False)
             + "\n"
         )
         with open(self.log_path, "a", encoding="utf-8") as f:
@@ -501,6 +510,8 @@ if __name__ == "__main__":
 
     try:
         trainval = Trainval(opt)
+        previous_train_loss = None
+        spectral_search_update_count = 0
 
         for epoch in range(1, opt.num_epochs + 1):
             if opt.is_main_process:
@@ -508,7 +519,7 @@ if __name__ == "__main__":
                     "\n==> Name %s, Epoch %i, previous best = %.3f"
                     % (opt.name, epoch, trainval.previous_best * 100)
                 )
-            trainval.model.update_lora_rank_search_with_val(
+            search_summary = trainval.model.update_lora_rank_search_with_val(
                 epoch,
                 trainval.lora_search_val_batches,
                 trainval.lora_search_probe_batches,
@@ -516,8 +527,58 @@ if __name__ == "__main__":
             if epoch == int(opt.num_epochs * 0.9):
                 trainval._rescheduler(opt)
             train_stats = trainval.train(epoch)
+            train_stats["spectral_first_search_jump"] = {}
+            if (
+                opt.is_main_process
+                and getattr(opt, "dino_lora_search_spectral", False)
+                and search_summary is not None
+                and epoch > opt.dino_lora_search_warmup_epochs
+            ):
+                spectral_search_update_count += 1
+                if spectral_search_update_count == 1:
+                    previous_loss = (
+                        float(previous_train_loss)
+                        if previous_train_loss is not None
+                        else float("nan")
+                    )
+                    loss_now = float(train_stats.get("loss", float("nan")))
+                    if previous_train_loss is None:
+                        loss_delta_pct = float("nan")
+                    else:
+                        denom = max(abs(float(previous_train_loss)), 1e-8)
+                        loss_delta_pct = 100.0 * (loss_now - float(previous_train_loss)) / denom
+                    train_stats["spectral_first_search_jump"] = {
+                        "epoch": int(epoch),
+                        "pre_active": int(
+                            search_summary.get("pre_total_active_rank", -1)
+                        ),
+                        "post_active": int(
+                            search_summary.get("total_active_rank", -1)
+                        ),
+                        "probe_blocks": int(
+                            search_summary.get("probe_selected_blocks", -1)
+                        ),
+                        "probe_modules": int(
+                            search_summary.get("probe_selected_modules", -1)
+                        ),
+                        "loss_prev": float(previous_loss),
+                        "loss_now": float(loss_now),
+                        "loss_delta_pct": float(loss_delta_pct),
+                    }
+                    print(
+                        "Spectral first-search jump -> "
+                        f"epoch={epoch}, "
+                        f"pre_active={search_summary.get('pre_total_active_rank', -1)}, "
+                        f"post_active={search_summary.get('total_active_rank', -1)}, "
+                        f"probe_blocks={search_summary.get('probe_selected_blocks', -1)}, "
+                        f"probe_modules={search_summary.get('probe_selected_modules', -1)}, "
+                        f"loss_prev={previous_loss:.6f}, "
+                        f"loss_now={loss_now:.6f}, "
+                        f"loss_delta_pct={loss_delta_pct:.2f}%"
+                    )
             val_scores = trainval.val(epoch)
             trainval._append_log_line(epoch, train_stats, val_scores)
+            previous_train_loss = float(train_stats.get("loss", float("nan")))
             if (
                 opt.is_main_process
                 and (

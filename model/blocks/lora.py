@@ -387,8 +387,10 @@ class SpectralSearchableLoRALinear(nn.Module):
         self.register_buffer(
             "counterfactual_confirm", torch.zeros(self.r_max, dtype=torch.int64)
         )
+        self.register_buffer("init_equiv_error", torch.tensor(0.0, dtype=torch.float32))
 
         self.spectral_scale.register_hook(self._scale_grad_hook)
+        self._compute_init_equiv_error()
 
     @staticmethod
     def _truncated_svd(weight: torch.Tensor, rank: int):
@@ -418,6 +420,35 @@ class SpectralSearchableLoRALinear(nn.Module):
         else:
             buffer.copy_(values)
             ready_flag.fill_(True)
+
+    @staticmethod
+    def _rank_correlation(a: torch.Tensor, b: torch.Tensor) -> float:
+        if a.numel() < 2 or b.numel() < 2:
+            return 1.0
+        a_rank = a.argsort().argsort().float()
+        b_rank = b.argsort().argsort().float()
+        a_rank = a_rank - a_rank.mean()
+        b_rank = b_rank - b_rank.mean()
+        denom = a_rank.norm() * b_rank.norm()
+        if float(denom.item()) <= 1e-12:
+            return 1.0 if torch.allclose(a, b) else 0.0
+        return float((a_rank * b_rank).sum().item() / denom.item())
+
+    @torch.no_grad()
+    def _compute_init_equiv_error(self):
+        was_training = self.training
+        self.eval()
+        sample_x = torch.randn(
+            2,
+            self.in_features,
+            device=self.base_layer.weight.device,
+            dtype=self.base_layer.weight.dtype,
+        )
+        base = self.base_layer(sample_x)
+        spec = self.forward(sample_x)
+        self.init_equiv_error.fill_(float((spec - base).abs().max().item()))
+        if was_training:
+            self.train()
 
     def _scale_grad_hook(self, grad):
         if grad is None:
@@ -485,6 +516,40 @@ class SpectralSearchableLoRALinear(nn.Module):
         if grad is None:
             return None
         return float(grad.detach().float().pow(2).mean().sqrt().item())
+
+    @torch.no_grad()
+    def prior_importance_rank_corr(self):
+        importance_ref = (
+            self.importance_ema.clone()
+            if bool(self.importance_ema_ready.item())
+            else self.raw_importance_scores()
+        )
+        return self._rank_correlation(
+            self.spectral_prior.float(),
+            importance_ref.float(),
+        )
+
+    @torch.no_grad()
+    def debug_state(self):
+        importance_ref = (
+            self.importance_ema.clone()
+            if bool(self.importance_ema_ready.item())
+            else self.raw_importance_scores()
+        )
+        uncertainty_ref = self.uncertainty_ema.clone()
+        uncertainty_ratio = uncertainty_ref / importance_ref.clamp_min(1e-6)
+        return {
+            "init_equiv_error": float(self.init_equiv_error.item()),
+            "scale_abs_median": float(self.spectral_scale.detach().abs().median().item()),
+            "scale_abs_max": float(self.spectral_scale.detach().abs().max().item()),
+            "importance_median": float(importance_ref.median().item()),
+            "importance_max": float(importance_ref.max().item()),
+            "uncertainty_median": float(uncertainty_ref.median().item()),
+            "uncertainty_max": float(uncertainty_ref.max().item()),
+            "uncertainty_ratio_median": float(uncertainty_ratio.median().item()),
+            "uncertainty_ratio_max": float(uncertainty_ratio.max().item()),
+            "prior_importance_rank_corr": float(self.prior_importance_rank_corr()),
+        }
 
     @torch.no_grad()
     def set_rank_mask(self, mask):

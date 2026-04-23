@@ -34,6 +34,8 @@ class Model(nn.Module):
         self.save_dir = os.path.join(opt.checkpoint_dir, opt.name)
         os.makedirs(self.save_dir, exist_ok=True)
         self.last_aux_losses = {}
+        self.last_spectral_probe_stats = {}
+        self.last_spectral_search_stats = {}
 
         self.model = get_model(
             backbone_name=opt.backbone,
@@ -137,6 +139,7 @@ class Model(nn.Module):
             acpc_residual_scale=opt.acpc_residual_scale,
         )
         self._log_trainable_parameters()
+        self._log_spectral_search_state("init")
         if opt.load_pretrain:
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
         should_merge_rf = opt.load_pretrain and (
@@ -262,6 +265,78 @@ class Model(nn.Module):
     def _collect_pairlocal(self):
         network = self._unwrap_model(self.model)
         return getattr(network, "pairlocal", None)
+
+    def _collect_spectral_search_layers(self):
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
+        if dino is None or not hasattr(dino, "iter_searchable_lora_layers"):
+            return []
+        return [
+            layer
+            for layer in dino.iter_searchable_lora_layers()
+            if hasattr(layer, "spectral_scale") and hasattr(layer, "debug_state")
+        ]
+
+    def _summarize_spectral_search_layers(self):
+        layers = self._collect_spectral_search_layers()
+        if not layers:
+            return None
+
+        records = []
+        for layer in layers:
+            state = layer.debug_state()
+            state["module_name"] = getattr(layer, "module_name", "unknown")
+            records.append(state)
+
+        init_worst = max(records, key=lambda item: item["init_equiv_error"])
+        corr_worst = min(records, key=lambda item: item["prior_importance_rank_corr"])
+        uncertainty_worst = max(records, key=lambda item: item["uncertainty_ratio_max"])
+        return {
+            "layer_count": len(records),
+            "init_equiv_error_max": float(init_worst["init_equiv_error"]),
+            "init_equiv_error_module": init_worst["module_name"],
+            "scale_abs_median_mean": float(
+                sum(item["scale_abs_median"] for item in records) / max(1, len(records))
+            ),
+            "scale_abs_max": float(max(item["scale_abs_max"] for item in records)),
+            "prior_importance_rank_corr_mean": float(
+                sum(item["prior_importance_rank_corr"] for item in records)
+                / max(1, len(records))
+            ),
+            "prior_importance_rank_corr_min": float(
+                corr_worst["prior_importance_rank_corr"]
+            ),
+            "prior_importance_rank_corr_min_module": corr_worst["module_name"],
+            "uncertainty_ratio_median_mean": float(
+                sum(item["uncertainty_ratio_median"] for item in records)
+                / max(1, len(records))
+            ),
+            "uncertainty_ratio_max": float(uncertainty_worst["uncertainty_ratio_max"]),
+            "uncertainty_ratio_max_module": uncertainty_worst["module_name"],
+        }
+
+    def _log_spectral_search_state(self, prefix="current"):
+        if not getattr(self.opt, "dino_lora_search_spectral", False):
+            return
+        if not getattr(self.opt, "is_main_process", True):
+            return
+        summary = self._summarize_spectral_search_layers()
+        if summary is None:
+            return
+        self.last_spectral_search_stats = {"prefix": prefix, **summary}
+        print(
+            f"Spectral search [{prefix}] -> layers={summary['layer_count']}, "
+            f"init_err_max={summary['init_equiv_error_max']:.3e}"
+            f" ({summary['init_equiv_error_module']}), "
+            f"scale_med_mean={summary['scale_abs_median_mean']:.3e}, "
+            f"scale_max={summary['scale_abs_max']:.3e}, "
+            f"prior_corr_mean={summary['prior_importance_rank_corr_mean']:.3f}, "
+            f"prior_corr_min={summary['prior_importance_rank_corr_min']:.3f}"
+            f" ({summary['prior_importance_rank_corr_min_module']}), "
+            f"unc_ratio_med_mean={summary['uncertainty_ratio_median_mean']:.3f}, "
+            f"unc_ratio_max={summary['uncertainty_ratio_max']:.3f}"
+            f" ({summary['uncertainty_ratio_max_module']})"
+        )
 
     def _log_rf_states(self, prefix="current"):
         network = self._unwrap_model(self.model)
@@ -634,6 +709,44 @@ class Model(nn.Module):
         for module_name, score_sum in score_sums.items():
             count = max(1, score_counts[module_name])
             probe_scores[module_name] = score_sum / count
+        if (
+            getattr(self.opt, "dino_lora_search_spectral", False)
+            and self.opt.is_main_process
+            and probe_scores
+        ):
+            sorted_scores = sorted(
+                probe_scores.items(),
+                key=lambda item: item[1],
+            )
+            values = torch.tensor(
+                [score for _, score in sorted_scores],
+                dtype=torch.float32,
+            )
+            top_preview = ", ".join(
+                f"{name}:{score:.3e}" for name, score in sorted_scores[-3:]
+            )
+            bottom_preview = ", ".join(
+                f"{name}:{score:.3e}" for name, score in sorted_scores[:3]
+            )
+            print(
+                "Spectral probe -> "
+                f"mean={values.mean().item():.3e}, "
+                f"std={values.std(unbiased=False).item():.3e}, "
+                f"min={values.min().item():.3e}, "
+                f"max={values.max().item():.3e}, "
+                f"bottom=[{bottom_preview}], "
+                f"top=[{top_preview}]"
+            )
+            self.last_spectral_probe_stats = {
+                "mean": float(values.mean().item()),
+                "std": float(values.std(unbiased=False).item()),
+                "min": float(values.min().item()),
+                "max": float(values.max().item()),
+                "bottom": sorted_scores[:3],
+                "top": sorted_scores[-3:],
+            }
+        elif getattr(self.opt, "dino_lora_search_spectral", False):
+            self.last_spectral_probe_stats = {}
         return probe_scores
 
     def sync_lora_rank_masks(self):
@@ -661,6 +774,10 @@ class Model(nn.Module):
         if not hasattr(network.encoder.dino, "update_lora_rank_search"):
             return None
 
+        spectral_layers = self._collect_spectral_search_layers()
+        pre_total_active_rank = int(
+            sum(int(layer.active_rank.item()) for layer in spectral_layers)
+        )
         summary = None
         eval_metric_fn = None
         probe_score_fn = None
@@ -688,6 +805,7 @@ class Model(nn.Module):
         self.sync_lora_rank_masks()
 
         if summary and self.opt.is_main_process:
+            summary["pre_total_active_rank"] = pre_total_active_rank
             preview = ", ".join(str(rank) for rank in summary["active_ranks"][:8])
             suffix = " ..." if len(summary["active_ranks"]) > 8 else ""
             group_preview = ", ".join(
@@ -723,6 +841,36 @@ class Model(nn.Module):
                 f"{probe_suffix}"
                 f"{counterfactual_suffix}"
             )
+            if getattr(self.opt, "dino_lora_search_spectral", False):
+                print(
+                    "Spectral rank search -> "
+                    f"pre_active={pre_total_active_rank}, "
+                    f"post_active={summary.get('total_active_rank', pre_total_active_rank)}, "
+                    f"delta_active={summary.get('total_active_rank', pre_total_active_rank) - pre_total_active_rank}"
+                )
+                self._log_spectral_search_state(f"epoch {epoch}")
+                self.last_spectral_search_stats.update(
+                    {
+                        "epoch": int(epoch),
+                        "pre_total_active_rank": int(pre_total_active_rank),
+                        "post_total_active_rank": int(
+                            summary.get("total_active_rank", pre_total_active_rank)
+                        ),
+                        "delta_total_active_rank": int(
+                            summary.get("total_active_rank", pre_total_active_rank)
+                            - pre_total_active_rank
+                        ),
+                        "search_strategy": summary.get("search_strategy", "classic"),
+                        "probe_selected_blocks": int(
+                            summary.get("probe_selected_blocks", 0)
+                        ),
+                        "probe_selected_modules": int(
+                            summary.get("probe_selected_modules", 0)
+                        ),
+                    }
+                )
+            else:
+                self.last_spectral_search_stats = {}
         return summary
 
     def forward(self, x1, x2, label):
