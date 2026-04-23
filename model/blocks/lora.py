@@ -328,10 +328,10 @@ class SpectralSearchableLoRALinear(nn.Module):
             raise ValueError("SpectralSearchableLoRALinear expects a positive max rank.")
 
         self.base_layer = base_layer
-        self.r_max = int(r)
-        self.r = self.r_max
         self.in_features = base_layer.in_features
         self.out_features = base_layer.out_features
+        self.r_max = int(max(1, min(int(r), self.in_features, self.out_features)))
+        self.r = self.r_max
         self.alpha_over_r = float(alpha_over_r)
         self.module_name = module_name
         self.group_name = group_name
