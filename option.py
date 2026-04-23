@@ -244,6 +244,29 @@ class Options:
             help="strength of gradient-sensitivity modulation for searchable LoRA scores",
         )
         self.parser.add_argument(
+            "--dino_lora_search_spectral",
+            action="store_true",
+            help="replace searchable LoRA channels with frozen SVD directions and trainable singular-value scales",
+        )
+        self.parser.add_argument(
+            "--dino_lora_spectral_prior_power",
+            type=float,
+            default=0.5,
+            help="strength of pretrained singular-value prior used by spectral searchable LoRA",
+        )
+        self.parser.add_argument(
+            "--dino_lora_spectral_uncertainty_weight",
+            type=float,
+            default=0.5,
+            help="AdaLoRA-style uncertainty weight applied to spectral searchable LoRA scores",
+        )
+        self.parser.add_argument(
+            "--dino_lora_spectral_init_scale",
+            type=float,
+            default=0.0,
+            help="initial singular scale for spectral searchable LoRA; 0 keeps the frozen DINO layer unchanged at startup",
+        )
+        self.parser.add_argument(
             "--dino_lora_search_budget_mode",
             type=str,
             default="grouped",
@@ -795,6 +818,16 @@ class Options:
             raise ValueError("--dino_lora_search_ema_decay must be in [0, 1).")
         if self.opt.dino_lora_search_grad_weight < 0:
             raise ValueError("--dino_lora_search_grad_weight must be >= 0.")
+        if self.opt.dino_lora_search_spectral and not self.opt.dino_lora_search:
+            raise ValueError(
+                "--dino_lora_search_spectral requires --dino_lora_search to be enabled."
+            )
+        if self.opt.dino_lora_spectral_prior_power < 0:
+            raise ValueError("--dino_lora_spectral_prior_power must be >= 0.")
+        if self.opt.dino_lora_spectral_uncertainty_weight < 0:
+            raise ValueError(
+                "--dino_lora_spectral_uncertainty_weight must be >= 0."
+            )
         if self.opt.dino_lora_search_depth_buckets <= 0:
             raise ValueError("--dino_lora_search_depth_buckets must be > 0.")
         if self.opt.dino_lora_search_probe_batches < 0:

@@ -86,6 +86,10 @@ class Model(nn.Module):
             dino_lora_search_counterfactual_max_candidates=opt.dino_lora_search_counterfactual_max_candidates,
             dino_lora_search_counterfactual_delta=opt.dino_lora_search_counterfactual_delta,
             dino_lora_search_counterfactual_patience=opt.dino_lora_search_counterfactual_patience,
+            dino_lora_search_spectral=opt.dino_lora_search_spectral,
+            dino_lora_spectral_prior_power=opt.dino_lora_spectral_prior_power,
+            dino_lora_spectral_uncertainty_weight=opt.dino_lora_spectral_uncertainty_weight,
+            dino_lora_spectral_init_scale=opt.dino_lora_spectral_init_scale,
             mfce_enable=opt.mfce_enable,
             mfce_mid_dim=opt.mfce_mid_dim,
             mfce_aspp_rates=opt.mfce_aspp_rates,
@@ -224,11 +228,15 @@ class Model(nn.Module):
             lora_trainable = [
                 (name, numel)
                 for name, numel in trainable
-                if ".lora_" in name or ".dora_" in name
+                if ".lora_" in name or ".dora_" in name or ".spectral_" in name
             ]
             print(f"trainable DINO tensors: {len(dino_trainable)}")
             print(f"trainable DINO parameters total: {sum(numel for _, numel in dino_trainable)}")
-            adapter_label = "DoRA" if getattr(self.opt, "dino_dora", False) else "LoRA"
+            adapter_label = "DoRA" if getattr(self.opt, "dino_dora", False) else (
+                "SpectralLoRA"
+                if getattr(self.opt, "dino_lora_search_spectral", False)
+                else "LoRA"
+            )
             print(f"trainable {adapter_label} tensors: {len(lora_trainable)}")
             print(f"trainable {adapter_label} parameters total: {sum(numel for _, numel in lora_trainable)}")
 
@@ -594,6 +602,14 @@ class Model(nn.Module):
                 loss.backward()
 
                 for layer in probe_layers:
+                    if hasattr(layer, "probe_gradient_score"):
+                        score = layer.probe_gradient_score()
+                        if score is None:
+                            continue
+                        score_sums[layer.module_name] += score
+                        score_counts[layer.module_name] += 1
+                        continue
+
                     grad_a = layer.lora_A.weight.grad
                     grad_b = layer.lora_B.weight.grad
                     grad_sq = 0.0

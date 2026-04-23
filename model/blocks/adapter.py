@@ -6,7 +6,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mfce import RFConv2d
-from .lora import DoRALinear, LoRALinear, SearchableLoRALinear
+from .lora import (
+    DoRALinear,
+    LoRALinear,
+    SearchableLoRALinear,
+    SpectralSearchableLoRALinear,
+)
 
 REPO_DIR = "dinov3"
 DINO_NAME = "dinov3_vitl16"
@@ -214,6 +219,10 @@ class DINOV3Wrapper(nn.Module):
         lora_search_counterfactual_max_candidates=64,
         lora_search_counterfactual_delta=0.0,
         lora_search_counterfactual_patience=1,
+        lora_search_spectral=False,
+        lora_spectral_prior_power=0.5,
+        lora_spectral_uncertainty_weight=0.5,
+        lora_spectral_init_scale=0.0,
         local_conv_enable=False,
         local_conv_blocks=(5, 11, 17, 23),
         local_conv_kernel_size=3,
@@ -270,6 +279,12 @@ class DINOV3Wrapper(nn.Module):
         self.lora_search_counterfactual_patience = int(
             max(1, lora_search_counterfactual_patience)
         )
+        self.lora_search_spectral = bool(lora_search_spectral and self.lora_search)
+        self.lora_spectral_prior_power = float(max(0.0, lora_spectral_prior_power))
+        self.lora_spectral_uncertainty_weight = float(
+            max(0.0, lora_spectral_uncertainty_weight)
+        )
+        self.lora_spectral_init_scale = float(lora_spectral_init_scale)
         self.local_conv_enable = bool(local_conv_enable)
         self.local_conv_blocks = tuple(sorted(set(int(index) for index in local_conv_blocks)))
         self.local_conv_kernel_size = int(local_conv_kernel_size)
@@ -331,6 +346,10 @@ class DINOV3Wrapper(nn.Module):
                 grad_weight=self.lora_search_grad_weight,
                 num_layers=self.n_layers,
                 depth_buckets=self.lora_search_depth_buckets,
+                spectral_search=self.lora_search_spectral,
+                spectral_prior_power=self.lora_spectral_prior_power,
+                spectral_uncertainty_weight=self.lora_spectral_uncertainty_weight,
+                spectral_init_scale=self.lora_spectral_init_scale,
             )
             if self.lora_search:
                 self.update_lora_rank_budget(self.lora_r)
@@ -405,6 +424,10 @@ class DINOV3Wrapper(nn.Module):
         grad_weight=0.5,
         num_layers=24,
         depth_buckets=1,
+        spectral_search=False,
+        spectral_prior_power=0.5,
+        spectral_uncertainty_weight=0.5,
+        spectral_init_scale=0.0,
     ):
         for name, child in list(module.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
@@ -412,10 +435,24 @@ class DINOV3Wrapper(nn.Module):
                 if search:
                     if use_dora:
                         raise ValueError("Searchable DoRA is not supported yet.")
+                    searchable_cls = (
+                        SpectralSearchableLoRALinear
+                        if spectral_search
+                        else SearchableLoRALinear
+                    )
+                    searchable_kwargs = {}
+                    if spectral_search:
+                        searchable_kwargs.update(
+                            {
+                                "spectral_prior_power": spectral_prior_power,
+                                "spectral_uncertainty_weight": spectral_uncertainty_weight,
+                                "spectral_init_scale": spectral_init_scale,
+                            }
+                        )
                     setattr(
                         module,
                         name,
-                        SearchableLoRALinear(
+                        searchable_cls(
                             child,
                             r=r,
                             alpha_over_r=alpha_over_r,
@@ -428,6 +465,7 @@ class DINOV3Wrapper(nn.Module):
                             ),
                             score_ema_decay=score_ema_decay,
                             grad_weight=grad_weight,
+                            **searchable_kwargs,
                         ),
                     )
                 else:
@@ -457,6 +495,10 @@ class DINOV3Wrapper(nn.Module):
                     grad_weight=grad_weight,
                     num_layers=num_layers,
                     depth_buckets=depth_buckets,
+                    spectral_search=spectral_search,
+                    spectral_prior_power=spectral_prior_power,
+                    spectral_uncertainty_weight=spectral_uncertainty_weight,
+                    spectral_init_scale=spectral_init_scale,
                 )
 
     def inject_local_conv(self, block_indices, kernel_size=3, init_scale=0.0):
@@ -991,7 +1033,10 @@ class DINOV3Wrapper(nn.Module):
 
     def iter_searchable_lora_layers(self):
         for module in self.model.modules():
-            if isinstance(module, SearchableLoRALinear):
+            if isinstance(
+                module,
+                (SearchableLoRALinear, SpectralSearchableLoRALinear),
+            ):
                 yield module
 
     @staticmethod

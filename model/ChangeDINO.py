@@ -214,6 +214,16 @@ class Encoder(nn.Module):
             lora_search_counterfactual_patience=kwargs.get(
                 "dino_lora_search_counterfactual_patience", 1
             ),
+            lora_search_spectral=kwargs.get("dino_lora_search_spectral", False),
+            lora_spectral_prior_power=kwargs.get(
+                "dino_lora_spectral_prior_power", 0.5
+            ),
+            lora_spectral_uncertainty_weight=kwargs.get(
+                "dino_lora_spectral_uncertainty_weight", 0.5
+            ),
+            lora_spectral_init_scale=kwargs.get(
+                "dino_lora_spectral_init_scale", 0.0
+            ),
         )
         if kwargs.get("mfce_enable", False):
             self.dense_adp = MFCEPyramidAdapter(
