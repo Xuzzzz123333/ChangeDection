@@ -32,6 +32,56 @@ def _resolve_group_count(channels: int, preferred_groups: int) -> int:
     return groups
 
 
+class ChangeDirectionalMixer2d(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 7,
+        norm_groups: int = 8,
+        residual_scale: float = 1.0,
+    ):
+        super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError("ChangeDirectionalMixer2d expects a positive odd kernel size.")
+        groups = _resolve_group_count(channels, norm_groups)
+        padding = kernel_size // 2
+        self.mix_width = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(1, kernel_size),
+            padding=(0, padding),
+            groups=channels,
+            bias=False,
+        )
+        self.mix_height = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=(kernel_size, 1),
+            padding=(padding, 0),
+            groups=channels,
+            bias=False,
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+        )
+        self.residual_scale = nn.Parameter(
+            torch.full((1, 1, 1, 1), float(residual_scale))
+        )
+        self._init_parameters()
+
+    def _init_parameters(self):
+        # Start from the original CGLA behavior and let the long-range branch
+        # grow in only after training confirms it is useful.
+        nn.init.zeros_(self.fuse[-1].weight)
+
+    def forward(self, x: torch.Tensor):
+        mixed = torch.cat([self.mix_width(x), self.mix_height(x)], dim=1)
+        return self.residual_scale * self.fuse(mixed)
+
+
 class DINOConvTokenBranch(nn.Module):
     def __init__(
         self,
@@ -224,6 +274,9 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         change_norm_groups: int = 8,
         change_residual_scale: float = 0.05,
         change_delta_scale: float = 0.05,
+        change_mixer_enable: bool = False,
+        change_mixer_kernel_size: int = 7,
+        change_mixer_residual_scale: float = 1.0,
     ):
         super().__init__()
         self.block = block
@@ -280,6 +333,14 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
             )
         self.change_context_norm = nn.GroupNorm(hidden_groups, hidden_dim)
         self.change_context_act = nn.SiLU(inplace=True)
+        self.change_mixer = None
+        if change_mixer_enable:
+            self.change_mixer = ChangeDirectionalMixer2d(
+                channels=hidden_dim,
+                kernel_size=change_mixer_kernel_size,
+                norm_groups=change_norm_groups,
+                residual_scale=change_mixer_residual_scale,
+            )
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
             nn.Sigmoid(),
@@ -377,6 +438,8 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         relation = self.change_context(relation)
         relation = self.change_context_norm(relation)
         relation = self.change_context_act(relation)
+        if self.change_mixer is not None:
+            relation = relation + self.change_mixer(relation)
         return relation
 
     def _forward_tensor(self, x: torch.Tensor):
@@ -490,6 +553,9 @@ class DINOV3Wrapper(nn.Module):
         local_conv_change_norm_groups=8,
         local_conv_change_residual_scale=0.05,
         local_conv_change_delta_scale=0.05,
+        local_conv_change_mixer_enable=False,
+        local_conv_change_mixer_kernel_size=7,
+        local_conv_change_mixer_residual_scale=1.0,
         local_conv_rf_enable=False,
         local_conv_rf_mode="rfsearch",
         local_conv_rf_num_branches=3,
@@ -559,6 +625,13 @@ class DINOV3Wrapper(nn.Module):
         self.local_conv_change_norm_groups = int(max(1, local_conv_change_norm_groups))
         self.local_conv_change_residual_scale = float(local_conv_change_residual_scale)
         self.local_conv_change_delta_scale = float(local_conv_change_delta_scale)
+        self.local_conv_change_mixer_enable = bool(
+            local_conv_change_mixer_enable and self.local_conv_change_aware_enable
+        )
+        self.local_conv_change_mixer_kernel_size = int(local_conv_change_mixer_kernel_size)
+        self.local_conv_change_mixer_residual_scale = float(
+            local_conv_change_mixer_residual_scale
+        )
         self.local_conv_rf_enable = bool(local_conv_rf_enable and self.local_conv_enable)
         self.local_conv_rf_mode = local_conv_rf_mode
         self.local_conv_rf_num_branches = int(max(1, local_conv_rf_num_branches))
@@ -817,6 +890,9 @@ class DINOV3Wrapper(nn.Module):
                         "change_norm_groups": self.local_conv_change_norm_groups,
                         "change_residual_scale": self.local_conv_change_residual_scale,
                         "change_delta_scale": self.local_conv_change_delta_scale,
+                        "change_mixer_enable": self.local_conv_change_mixer_enable,
+                        "change_mixer_kernel_size": self.local_conv_change_mixer_kernel_size,
+                        "change_mixer_residual_scale": self.local_conv_change_mixer_residual_scale,
                     }
                 )
             blocks[block_index] = adapter_cls(

@@ -177,6 +177,15 @@ class Encoder(nn.Module):
             local_conv_change_delta_scale=kwargs.get(
                 "dino_local_conv_change_delta_scale", 0.05
             ),
+            local_conv_change_mixer_enable=kwargs.get(
+                "dino_local_conv_change_mixer_enable", False
+            ),
+            local_conv_change_mixer_kernel_size=kwargs.get(
+                "dino_local_conv_change_mixer_kernel_size", 7
+            ),
+            local_conv_change_mixer_residual_scale=kwargs.get(
+                "dino_local_conv_change_mixer_residual_scale", 1.0
+            ),
             local_conv_rf_enable=kwargs.get("dino_local_conv_rf_enable", False),
             local_conv_rf_mode=kwargs.get("dino_local_conv_rf_mode", "rfsearch"),
             local_conv_rf_num_branches=kwargs.get("dino_local_conv_rf_num_branches", 3),

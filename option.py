@@ -137,6 +137,23 @@ class Options:
             help="initial signed delta residual scale for the change-aware DINO local branch",
         )
         self.parser.add_argument(
+            "--dino_local_conv_change_mixer_enable",
+            action="store_true",
+            help="add a lightweight directional long-range mixer inside the change-aware DINO relation branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_change_mixer_kernel_size",
+            type=int,
+            default=7,
+            help="odd kernel size used by the lightweight directional relation mixer",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_change_mixer_residual_scale",
+            type=float,
+            default=1.0,
+            help="initial residual scale used by the lightweight directional relation mixer",
+        )
+        self.parser.add_argument(
             "--dino_local_conv_rf_enable",
             action="store_true",
             help="replace the DINO local-conv branch depthwise convolution with RF-Next receptive-field search",
@@ -829,6 +846,24 @@ class Options:
             raise ValueError("--dino_local_conv_change_residual_scale must be >= 0.")
         if self.opt.dino_local_conv_change_delta_scale < 0:
             raise ValueError("--dino_local_conv_change_delta_scale must be >= 0.")
+        if (
+            self.opt.dino_local_conv_change_mixer_enable
+            and not self.opt.dino_local_conv_change_aware_enable
+        ):
+            raise ValueError(
+                "--dino_local_conv_change_mixer_enable requires --dino_local_conv_change_aware_enable to be enabled."
+            )
+        if (
+            self.opt.dino_local_conv_change_mixer_kernel_size <= 0
+            or self.opt.dino_local_conv_change_mixer_kernel_size % 2 == 0
+        ):
+            raise ValueError(
+                "--dino_local_conv_change_mixer_kernel_size must be a positive odd integer."
+            )
+        if self.opt.dino_local_conv_change_mixer_residual_scale < 0:
+            raise ValueError(
+                "--dino_local_conv_change_mixer_residual_scale must be >= 0."
+            )
         if self.opt.dino_local_conv_rf_enable and not self.opt.dino_local_conv_enable:
             raise ValueError("--dino_local_conv_rf_enable requires --dino_local_conv_enable to be enabled.")
         if self.opt.dino_local_conv_rf_num_branches <= 0:
