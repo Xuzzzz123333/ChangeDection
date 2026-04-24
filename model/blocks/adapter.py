@@ -310,6 +310,15 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         self.residual_scale = nn.Parameter(
             torch.full((1, 1, 1, 1), float(change_residual_scale))
         )
+        self._init_change_aware_parameters()
+
+    def _init_change_aware_parameters(self):
+        # Keep the gate conservatively closed at startup so the pretrained
+        # backbone is only perturbed after the branch learns meaningful cues.
+        nn.init.constant_(self.spatial_gate[0].bias, -2.0)
+        # Zero-init the signed delta residual so the paired adapter starts
+        # exactly equivalent to the frozen pretrained DINO block.
+        nn.init.zeros_(self.delta_branch[-1].weight)
 
     def rf_state(self):
         state = {}
@@ -406,7 +415,7 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         spatial_gate = self.spatial_gate(relation)
         channel_gate = self.channel_gate(relation)
         local_gate = spatial_gate * channel_gate
-        delta_map = spatial_gate * self.delta_branch(relation)
+        delta_map = spatial_gate * channel_gate * self.delta_branch(relation)
 
         update1 = self.residual_scale * (
             local_gate * local1 * self.gamma_self.view(1, -1, 1, 1)
