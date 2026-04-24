@@ -108,6 +108,35 @@ class Options:
             help="initial residual scale for the DINO local convolution branch; 0 keeps the pretrained backbone unchanged at startup",
         )
         self.parser.add_argument(
+            "--dino_local_conv_change_aware_enable",
+            action="store_true",
+            help="upgrade the DINO internal local branch into a bi-temporal change-aware paired adapter with shared gating and signed change residuals",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_change_hidden_ratio",
+            type=float,
+            default=0.5,
+            help="hidden expansion ratio used by the change-aware relation encoder inside the DINO local branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_change_norm_groups",
+            type=int,
+            default=8,
+            help="group count used by change-aware normalization inside the DINO local branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_change_residual_scale",
+            type=float,
+            default=0.05,
+            help="initial global residual scale for the change-aware DINO local branch",
+        )
+        self.parser.add_argument(
+            "--dino_local_conv_change_delta_scale",
+            type=float,
+            default=0.05,
+            help="initial signed delta residual scale for the change-aware DINO local branch",
+        )
+        self.parser.add_argument(
             "--dino_local_conv_rf_enable",
             action="store_true",
             help="replace the DINO local-conv branch depthwise convolution with RF-Next receptive-field search",
@@ -788,6 +817,18 @@ class Options:
             raise ValueError("--dino_local_conv_blocks must use non-negative integers.")
         if self.opt.dino_local_conv_kernel_size <= 0 or self.opt.dino_local_conv_kernel_size % 2 == 0:
             raise ValueError("--dino_local_conv_kernel_size must be a positive odd integer.")
+        if self.opt.dino_local_conv_change_aware_enable and not self.opt.dino_local_conv_enable:
+            raise ValueError(
+                "--dino_local_conv_change_aware_enable requires --dino_local_conv_enable to be enabled."
+            )
+        if self.opt.dino_local_conv_change_hidden_ratio <= 0:
+            raise ValueError("--dino_local_conv_change_hidden_ratio must be > 0.")
+        if self.opt.dino_local_conv_change_norm_groups <= 0:
+            raise ValueError("--dino_local_conv_change_norm_groups must be > 0.")
+        if self.opt.dino_local_conv_change_residual_scale < 0:
+            raise ValueError("--dino_local_conv_change_residual_scale must be >= 0.")
+        if self.opt.dino_local_conv_change_delta_scale < 0:
+            raise ValueError("--dino_local_conv_change_delta_scale must be >= 0.")
         if self.opt.dino_local_conv_rf_enable and not self.opt.dino_local_conv_enable:
             raise ValueError("--dino_local_conv_rf_enable requires --dino_local_conv_enable to be enabled.")
         if self.opt.dino_local_conv_rf_num_branches <= 0:

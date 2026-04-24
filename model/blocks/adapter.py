@@ -25,6 +25,13 @@ MODEL_TO_NUM_LAYERS = {
 }
 
 
+def _resolve_group_count(channels: int, preferred_groups: int) -> int:
+    groups = max(1, min(preferred_groups, channels))
+    while channels % groups != 0 and groups > 1:
+        groups -= 1
+    return groups
+
+
 class DINOConvTokenBranch(nn.Module):
     def __init__(
         self,
@@ -100,18 +107,30 @@ class DINOConvTokenBranch(nn.Module):
         width = num_patches // height
         return height, width
 
-    def forward(self, patch_tokens: torch.Tensor):
+    @classmethod
+    def tokens_to_map(cls, patch_tokens: torch.Tensor):
         batch_size, num_patches, channels = patch_tokens.shape
-        height, width = self.infer_spatial_shape(num_patches)
+        height, width = cls.infer_spatial_shape(num_patches)
         if height * width != num_patches:
             raise ValueError(
                 f"Cannot infer a valid spatial shape from {num_patches} patch tokens."
             )
-        feat = patch_tokens.transpose(1, 2).reshape(batch_size, channels, height, width)
+        return patch_tokens.transpose(1, 2).reshape(batch_size, channels, height, width)
+
+    @staticmethod
+    def map_to_tokens(feat: torch.Tensor):
+        return feat.flatten(2).transpose(1, 2)
+
+    def forward_map(self, feat: torch.Tensor):
         feat = self.depthwise(feat)
         feat = self.act(feat)
         feat = self.pointwise(feat)
-        return feat.flatten(2).transpose(1, 2)
+        return feat
+
+    def forward(self, patch_tokens: torch.Tensor):
+        feat = self.tokens_to_map(patch_tokens)
+        feat = self.forward_map(feat)
+        return self.map_to_tokens(feat)
 
 
 class DINOBlockLocalConvAdapter(nn.Module):
@@ -184,6 +203,236 @@ class DINOBlockLocalConvAdapter(nn.Module):
         raise TypeError(f"Unsupported DINO block output type: {type(out)!r}")
 
 
+class DINOBlockChangeAwareLocalAdapter(nn.Module):
+    def __init__(
+        self,
+        block: nn.Module,
+        dim: int,
+        num_prefix_tokens: int,
+        kernel_size: int = 3,
+        init_scale: float = 0.0,
+        rf_enable: bool = False,
+        rf_mode: str = "rfsearch",
+        rf_num_branches: int = 3,
+        rf_expand_rate: float = 0.5,
+        rf_min_dilation: int = 1,
+        rf_max_dilation=None,
+        rf_search_interval: int = 100,
+        rf_max_search_step: int = 8,
+        rf_init_weight: float = 0.01,
+        change_hidden_ratio: float = 0.5,
+        change_norm_groups: int = 8,
+        change_residual_scale: float = 0.05,
+        change_delta_scale: float = 0.05,
+    ):
+        super().__init__()
+        self.block = block
+        self.num_prefix_tokens = int(max(0, num_prefix_tokens))
+        self.norm = nn.LayerNorm(dim)
+        self.local_branch = DINOConvTokenBranch(
+            dim=dim,
+            kernel_size=kernel_size,
+            rf_enable=rf_enable,
+            rf_mode=rf_mode,
+            rf_num_branches=rf_num_branches,
+            rf_expand_rate=rf_expand_rate,
+            rf_min_dilation=rf_min_dilation,
+            rf_max_dilation=rf_max_dilation,
+            rf_search_interval=rf_search_interval,
+            rf_max_search_step=rf_max_search_step,
+            rf_init_weight=rf_init_weight,
+        )
+        hidden_dim = max(1, int(round(dim * change_hidden_ratio)))
+        hidden_groups = _resolve_group_count(hidden_dim, change_norm_groups)
+        self.relation_proj = nn.Sequential(
+            nn.Conv2d(dim * 4, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(hidden_groups, hidden_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.change_rf_enable = bool(rf_enable)
+        if self.change_rf_enable:
+            self.change_context = RFConv2d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=kernel_size,
+                padding=0,
+                dilation=1,
+                groups=hidden_dim,
+                bias=False,
+                num_branches=rf_num_branches,
+                expand_rate=rf_expand_rate,
+                min_dilation=rf_min_dilation,
+                max_dilation=rf_max_dilation,
+                init_weight=rf_init_weight,
+                search_interval=rf_search_interval,
+                max_search_step=rf_max_search_step,
+                rf_mode=rf_mode,
+            )
+        else:
+            padding = kernel_size // 2
+            self.change_context = nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=kernel_size,
+                padding=padding,
+                groups=hidden_dim,
+                bias=False,
+            )
+        self.change_context_norm = nn.GroupNorm(hidden_groups, hidden_dim)
+        self.change_context_act = nn.SiLU(inplace=True)
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(hidden_dim, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.delta_branch = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(hidden_groups, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=3,
+                padding=1,
+                groups=hidden_dim,
+                bias=False,
+            ),
+            nn.GroupNorm(hidden_groups, hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=False),
+        )
+        self.gamma_self = nn.Parameter(torch.full((dim,), float(init_scale)))
+        self.gamma_delta = nn.Parameter(torch.full((dim,), float(change_delta_scale)))
+        self.residual_scale = nn.Parameter(
+            torch.full((1, 1, 1, 1), float(change_residual_scale))
+        )
+
+    def rf_state(self):
+        state = {}
+        local_state = self.local_branch.rf_state()
+        if local_state:
+            state["local_branch"] = local_state
+        if self.change_rf_enable:
+            state["change_context"] = self.change_context.rf_state()
+        return state
+
+    def configure_rf_search(self, **kwargs):
+        summary = {}
+        local_summary = self.local_branch.configure_rf_search(**kwargs)
+        if local_summary is not None:
+            summary["local_branch"] = local_summary
+        if self.change_rf_enable:
+            change_summary = self.change_context.configure_search_schedule(**kwargs)
+            if change_summary is not None:
+                summary["change_context"] = change_summary
+        return summary or None
+
+    def merge_rf_branches_(self):
+        summary = {}
+        local_summary = self.local_branch.merge_rf_branches_()
+        if local_summary is not None:
+            summary["local_branch"] = local_summary
+        if self.change_rf_enable:
+            change_summary = self.change_context.merge_branches_()
+            if change_summary is not None:
+                summary["change_context"] = change_summary
+        return summary or None
+
+    def _split_tensor(self, x: torch.Tensor):
+        if x.ndim != 3 or x.shape[1] <= self.num_prefix_tokens:
+            return None
+        normed = self.norm(x)
+        prefix_tokens = x[:, : self.num_prefix_tokens]
+        patch_tokens = x[:, self.num_prefix_tokens :]
+        normed_patch_map = DINOConvTokenBranch.tokens_to_map(
+            normed[:, self.num_prefix_tokens :]
+        )
+        return prefix_tokens, patch_tokens, normed_patch_map
+
+    def _compose_output(
+        self,
+        prefix_tokens: torch.Tensor,
+        patch_tokens: torch.Tensor,
+        update_map: torch.Tensor,
+    ):
+        patch_tokens = patch_tokens + DINOConvTokenBranch.map_to_tokens(update_map)
+        if self.num_prefix_tokens > 0:
+            return torch.cat([prefix_tokens, patch_tokens], dim=1)
+        return patch_tokens
+
+    def _apply_change_context(self, relation: torch.Tensor):
+        relation = self.change_context(relation)
+        relation = self.change_context_norm(relation)
+        relation = self.change_context_act(relation)
+        return relation
+
+    def _forward_tensor(self, x: torch.Tensor):
+        split = self._split_tensor(x)
+        if split is None:
+            return x
+        prefix_tokens, patch_tokens, normed_patch_map = split
+        local_update = self.local_branch.forward_map(normed_patch_map)
+        update_map = self.residual_scale * local_update * self.gamma_self.view(
+            1, -1, 1, 1
+        )
+        return self._compose_output(prefix_tokens, patch_tokens, update_map)
+
+    def _forward_pair(self, x1: torch.Tensor, x2: torch.Tensor):
+        split1 = self._split_tensor(x1)
+        split2 = self._split_tensor(x2)
+        if split1 is None or split2 is None:
+            return x1, x2
+        prefix1, patch1, normed_map1 = split1
+        prefix2, patch2, normed_map2 = split2
+        local1 = self.local_branch.forward_map(normed_map1)
+        local2 = self.local_branch.forward_map(normed_map2)
+
+        relation = torch.cat(
+            [
+                normed_map1,
+                normed_map2,
+                torch.abs(normed_map1 - normed_map2),
+                normed_map1 * normed_map2,
+            ],
+            dim=1,
+        )
+        relation = self.relation_proj(relation)
+        relation = self._apply_change_context(relation)
+
+        spatial_gate = self.spatial_gate(relation)
+        channel_gate = self.channel_gate(relation)
+        local_gate = spatial_gate * channel_gate
+        delta_map = spatial_gate * self.delta_branch(relation)
+
+        update1 = self.residual_scale * (
+            local_gate * local1 * self.gamma_self.view(1, -1, 1, 1)
+            + delta_map * self.gamma_delta.view(1, -1, 1, 1)
+        )
+        update2 = self.residual_scale * (
+            local_gate * local2 * self.gamma_self.view(1, -1, 1, 1)
+            - delta_map * self.gamma_delta.view(1, -1, 1, 1)
+        )
+        return (
+            self._compose_output(prefix1, patch1, update1),
+            self._compose_output(prefix2, patch2, update2),
+        )
+
+    def forward(self, x_or_x_list, rope_or_rope_list=None):
+        out = self.block(x_or_x_list, rope_or_rope_list)
+        if isinstance(out, torch.Tensor):
+            return self._forward_tensor(out)
+        if isinstance(out, list):
+            if len(out) == 2 and all(isinstance(x, torch.Tensor) for x in out):
+                out1, out2 = self._forward_pair(out[0], out[1])
+                return [out1, out2]
+            return [self._forward_tensor(x) for x in out]
+        raise TypeError(f"Unsupported DINO block output type: {type(out)!r}")
+
+
 class DINOV3Wrapper(nn.Module):
     def __init__(
         self,
@@ -227,6 +476,11 @@ class DINOV3Wrapper(nn.Module):
         local_conv_blocks=(5, 11, 17, 23),
         local_conv_kernel_size=3,
         local_conv_init_scale=0.0,
+        local_conv_change_aware_enable=False,
+        local_conv_change_hidden_ratio=0.5,
+        local_conv_change_norm_groups=8,
+        local_conv_change_residual_scale=0.05,
+        local_conv_change_delta_scale=0.05,
         local_conv_rf_enable=False,
         local_conv_rf_mode="rfsearch",
         local_conv_rf_num_branches=3,
@@ -289,6 +543,13 @@ class DINOV3Wrapper(nn.Module):
         self.local_conv_blocks = tuple(sorted(set(int(index) for index in local_conv_blocks)))
         self.local_conv_kernel_size = int(local_conv_kernel_size)
         self.local_conv_init_scale = float(local_conv_init_scale)
+        self.local_conv_change_aware_enable = bool(
+            local_conv_change_aware_enable and self.local_conv_enable
+        )
+        self.local_conv_change_hidden_ratio = float(local_conv_change_hidden_ratio)
+        self.local_conv_change_norm_groups = int(max(1, local_conv_change_norm_groups))
+        self.local_conv_change_residual_scale = float(local_conv_change_residual_scale)
+        self.local_conv_change_delta_scale = float(local_conv_change_delta_scale)
         self.local_conv_rf_enable = bool(local_conv_rf_enable and self.local_conv_enable)
         self.local_conv_rf_mode = local_conv_rf_mode
         self.local_conv_rf_num_branches = int(max(1, local_conv_rf_num_branches))
@@ -519,7 +780,10 @@ class DINOV3Wrapper(nn.Module):
 
         for block_index in valid_indices:
             block = blocks[block_index]
-            if isinstance(block, DINOBlockLocalConvAdapter):
+            if isinstance(
+                block,
+                (DINOBlockLocalConvAdapter, DINOBlockChangeAwareLocalAdapter),
+            ):
                 continue
             rf_max_dilation = None
             if self.local_conv_rf_max_dilations is not None:
@@ -531,7 +795,22 @@ class DINOV3Wrapper(nn.Module):
                     except ValueError:
                         block_pos = 0
                     rf_max_dilation = self.local_conv_rf_max_dilations[block_pos]
-            blocks[block_index] = DINOBlockLocalConvAdapter(
+            adapter_cls = (
+                DINOBlockChangeAwareLocalAdapter
+                if self.local_conv_change_aware_enable
+                else DINOBlockLocalConvAdapter
+            )
+            adapter_kwargs = {}
+            if self.local_conv_change_aware_enable:
+                adapter_kwargs.update(
+                    {
+                        "change_hidden_ratio": self.local_conv_change_hidden_ratio,
+                        "change_norm_groups": self.local_conv_change_norm_groups,
+                        "change_residual_scale": self.local_conv_change_residual_scale,
+                        "change_delta_scale": self.local_conv_change_delta_scale,
+                    }
+                )
+            blocks[block_index] = adapter_cls(
                 block=block,
                 dim=dim,
                 num_prefix_tokens=num_prefix_tokens,
@@ -546,6 +825,7 @@ class DINOV3Wrapper(nn.Module):
                 rf_search_interval=self.local_conv_rf_search_interval,
                 rf_max_search_step=self.local_conv_rf_max_search_step,
                 rf_init_weight=self.local_conv_rf_init_weight,
+                **adapter_kwargs,
             ).to(self.device)
 
     def _iter_local_conv_rf_blocks(self):
@@ -558,9 +838,72 @@ class DINOV3Wrapper(nn.Module):
             (f"block{block_index}", blocks[block_index])
             for block_index in self.local_conv_blocks
             if block_index < len(blocks)
-            and isinstance(blocks[block_index], DINOBlockLocalConvAdapter)
+            and hasattr(blocks[block_index], "rf_state")
             and blocks[block_index].rf_state()
         ]
+
+    def _resize_input(self, x: torch.Tensor):
+        scale_factor = 2 / (512 / x.shape[-1])
+        x = F.interpolate(
+            x, size=(512, 512), mode="bilinear", align_corners=True, antialias=True
+        )
+        return x, scale_factor
+
+    def _norm_intermediate_tokens(self, out: torch.Tensor):
+        if self.model.untie_cls_and_patch_norms:
+            x_norm_cls_reg = self.model.cls_norm(
+                out[:, : self.model.n_storage_tokens + 1]
+            )
+            x_norm_patch = self.model.norm(out[:, self.model.n_storage_tokens + 1 :])
+            return torch.cat((x_norm_cls_reg, x_norm_patch), dim=1)
+        return self.model.norm(out)
+
+    def _tokens_to_feature_map(self, out: torch.Tensor, input_shape):
+        batch_size, _, height, width = input_shape
+        out = out[:, self.model.n_storage_tokens + 1 :]
+        return out.reshape(
+            batch_size,
+            height // self.patch_size,
+            width // self.patch_size,
+            -1,
+        ).permute(0, 3, 1, 2).contiguous()
+
+    def _get_intermediate_layers_pair(self, x1: torch.Tensor, x2: torch.Tensor, n):
+        x_list = []
+        hw_list = []
+        for x in (x1, x2):
+            tokens, hw_tuple = self.model.prepare_tokens_with_masks(x)
+            x_list.append(tokens)
+            hw_list.append(hw_tuple)
+
+        outputs = []
+        total_block_len = len(self.model.blocks)
+        blocks_to_take = (
+            range(total_block_len - n, total_block_len) if isinstance(n, int) else n
+        )
+        blocks_to_take = list(blocks_to_take)
+        blocks_to_take_set = set(blocks_to_take)
+        for block_index, blk in enumerate(self.model.blocks):
+            if self.model.rope_embed is not None:
+                rope_sincos = [
+                    self.model.rope_embed(H=height, W=width)
+                    for height, width in hw_list
+                ]
+            else:
+                rope_sincos = [None, None]
+            x_list = blk(x_list, rope_sincos)
+            if block_index in blocks_to_take_set:
+                outputs.append(
+                    (
+                        self._norm_intermediate_tokens(x_list[0]),
+                        self._norm_intermediate_tokens(x_list[1]),
+                    )
+                )
+        if len(outputs) != len(blocks_to_take):
+            raise AssertionError(
+                f"only {len(outputs)} / {len(blocks_to_take)} blocks found"
+            )
+        return outputs
 
     def local_conv_rf_states(self):
         return [
@@ -1511,10 +1854,7 @@ class DINOV3Wrapper(nn.Module):
         return summary
 
     def forward(self, x):
-        scale_factor = 2 / (512 / x.shape[-1])
-        x = F.interpolate(
-            x, size=(512, 512), mode="bilinear", align_corners=True, antialias=True
-        )
+        x, scale_factor = self._resize_input(x)
 
         use_grad = self.training and (self.use_lora or self.local_conv_enable)
 
@@ -1532,6 +1872,38 @@ class DINOV3Wrapper(nn.Module):
                     )
                 )
         return feats_
+
+    def forward_pair(self, x1: torch.Tensor, x2: torch.Tensor):
+        x1, scale_factor = self._resize_input(x1)
+        x2, _ = self._resize_input(x2)
+        use_grad = self.training and (self.use_lora or self.local_conv_enable)
+
+        with torch.set_grad_enabled(use_grad):
+            token_pairs = self._get_intermediate_layers_pair(
+                x1,
+                x2,
+                self.extract_ids,
+            )
+            feats1 = []
+            feats2 = []
+            for tokens1, tokens2 in token_pairs:
+                feat1 = self._tokens_to_feature_map(tokens1, x1.shape)
+                feat2 = self._tokens_to_feature_map(tokens2, x2.shape)
+                feats1.append(
+                    F.interpolate(
+                        feat1,
+                        scale_factor=scale_factor,
+                        mode="bilinear",
+                    )
+                )
+                feats2.append(
+                    F.interpolate(
+                        feat2,
+                        scale_factor=scale_factor,
+                        mode="bilinear",
+                    )
+                )
+        return feats1, feats2
 
 
 class SepAdapterBlock(nn.Module):

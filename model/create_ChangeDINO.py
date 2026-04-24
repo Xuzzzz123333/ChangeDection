@@ -50,6 +50,11 @@ class Model(nn.Module):
             dino_local_conv_blocks=opt.dino_local_conv_blocks,
             dino_local_conv_kernel_size=opt.dino_local_conv_kernel_size,
             dino_local_conv_init_scale=opt.dino_local_conv_init_scale,
+            dino_local_conv_change_aware_enable=opt.dino_local_conv_change_aware_enable,
+            dino_local_conv_change_hidden_ratio=opt.dino_local_conv_change_hidden_ratio,
+            dino_local_conv_change_norm_groups=opt.dino_local_conv_change_norm_groups,
+            dino_local_conv_change_residual_scale=opt.dino_local_conv_change_residual_scale,
+            dino_local_conv_change_delta_scale=opt.dino_local_conv_change_delta_scale,
             dino_local_conv_rf_enable=opt.dino_local_conv_rf_enable,
             dino_local_conv_rf_mode=opt.dino_local_conv_rf_mode,
             dino_local_conv_rf_num_branches=opt.dino_local_conv_rf_num_branches,
@@ -346,6 +351,32 @@ class Model(nn.Module):
             if states:
                 print(f"{prefix} DINO local-conv RF states:")
                 for state in states:
+                    nested_branch_keys = [
+                        key
+                        for key in ("local_branch", "change_context")
+                        if isinstance(state.get(key), dict)
+                    ]
+                    if nested_branch_keys:
+                        print(f"  {state.get('name')}:")
+                        for branch_key in nested_branch_keys:
+                            branch_state = state.get(branch_key, {})
+                            rates = ", ".join(
+                                f"({rate[0]},{rate[1]})"
+                                for rate in branch_state.get("rates", [])
+                            )
+                            weights = ", ".join(
+                                f"{weight:.3f}"
+                                for weight in branch_state.get("weights", [])
+                            )
+                            print(
+                                f"    {branch_key}: mode={branch_state.get('mode')} "
+                                f"dilation={branch_state.get('dilation')} kernel={branch_state.get('kernel_size')} "
+                                f"rates=[{rates}] weights=[{weights}] merged={branch_state.get('merged', False)} "
+                                f"search_step={branch_state.get('search_step', 0)} "
+                                f"interval={branch_state.get('search_interval')} "
+                                f"window=[{branch_state.get('start_step')},{branch_state.get('stop_step')}]"
+                            )
+                        continue
                     rates = ", ".join(
                         f"({rate[0]},{rate[1]})" for rate in state.get("rates", [])
                     )

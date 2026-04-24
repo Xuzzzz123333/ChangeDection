@@ -162,6 +162,21 @@ class Encoder(nn.Module):
             local_conv_blocks=kwargs.get("dino_local_conv_blocks", [5, 11, 17, 23]),
             local_conv_kernel_size=kwargs.get("dino_local_conv_kernel_size", 3),
             local_conv_init_scale=kwargs.get("dino_local_conv_init_scale", 0.0),
+            local_conv_change_aware_enable=kwargs.get(
+                "dino_local_conv_change_aware_enable", False
+            ),
+            local_conv_change_hidden_ratio=kwargs.get(
+                "dino_local_conv_change_hidden_ratio", 0.5
+            ),
+            local_conv_change_norm_groups=kwargs.get(
+                "dino_local_conv_change_norm_groups", 8
+            ),
+            local_conv_change_residual_scale=kwargs.get(
+                "dino_local_conv_change_residual_scale", 0.05
+            ),
+            local_conv_change_delta_scale=kwargs.get(
+                "dino_local_conv_change_delta_scale", 0.05
+            ),
             local_conv_rf_enable=kwargs.get("dino_local_conv_rf_enable", False),
             local_conv_rf_mode=kwargs.get("dino_local_conv_rf_mode", "rfsearch"),
             local_conv_rf_num_branches=kwargs.get("dino_local_conv_rf_num_branches", 3),
@@ -258,6 +273,14 @@ class Encoder(nn.Module):
 
     def forward_dense_layers(self, x):
         return self.dino(x)
+
+    def forward_dense_pair(self, x1, x2):
+        if (
+            hasattr(self.dino, "forward_pair")
+            and getattr(self.dino, "local_conv_change_aware_enable", False)
+        ):
+            return self.dino.forward_pair(x1, x2)
+        return self.dino(x1), self.dino(x2)
 
     def adapt_dense(self, dense_feats):
         return self.dense_adp(dense_feats)
@@ -587,8 +610,7 @@ class ChangeModel(nn.Module):
         if self.pairlocal_enable:
             local1, local2 = self.pairlocal(local1, local2)
 
-        dense_layers1 = self.encoder.forward_dense_layers(x1)
-        dense_layers2 = self.encoder.forward_dense_layers(x2)
+        dense_layers1, dense_layers2 = self.encoder.forward_dense_pair(x1, x2)
         if self.temporal_exchange is not None:
             dense_layers1, dense_layers2 = self.temporal_exchange(
                 dense_layers1,
