@@ -16,6 +16,8 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.scaling = alpha / r if r > 0 else 0.0
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
 
         for p in self.base_layer.parameters():
             p.requires_grad = False
@@ -23,8 +25,20 @@ class LoRALinear(nn.Module):
         self.lora_A = None
         self.lora_B = None
         if r > 0:
-            self.lora_A = nn.Linear(self.in_features, r, bias=False)
-            self.lora_B = nn.Linear(self.r, self.out_features, bias=False)
+            self.lora_A = nn.Linear(
+                self.in_features,
+                r,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+            self.lora_B = nn.Linear(
+                self.r,
+                self.out_features,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
 
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
@@ -48,6 +62,8 @@ class DoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.scaling = alpha / r if r > 0 else 0.0
         self.eps = float(eps)
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
 
         for p in self.base_layer.parameters():
             p.requires_grad = False
@@ -56,14 +72,26 @@ class DoRALinear(nn.Module):
         self.lora_B = None
         self.dora_magnitude = None
         if self.r > 0:
-            self.lora_A = nn.Linear(self.in_features, self.r, bias=False)
-            self.lora_B = nn.Linear(self.r, self.out_features, bias=False)
+            self.lora_A = nn.Linear(
+                self.in_features,
+                self.r,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+            self.lora_B = nn.Linear(
+                self.r,
+                self.out_features,
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
 
             with torch.no_grad():
                 init_magnitude = base_layer.weight.detach().float().norm(dim=1)
-            self.dora_magnitude = nn.Parameter(init_magnitude)
+            self.dora_magnitude = nn.Parameter(init_magnitude.to(device=device))
 
     def _reshape_scale(self, ref_tensor, scale):
         shape = [1] * (ref_tensor.dim() - 1) + [scale.numel()]
@@ -123,35 +151,76 @@ class SearchableLoRALinear(nn.Module):
         self.grad_weight = float(grad_weight)
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         self.scaling = self.alpha_over_r
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
 
         for p in self.base_layer.parameters():
             p.requires_grad = False
 
-        self.lora_A = nn.Linear(self.in_features, self.r_max, bias=False)
-        self.lora_B = nn.Linear(self.r_max, self.out_features, bias=False)
+        self.lora_A = nn.Linear(
+            self.in_features,
+            self.r_max,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.lora_B = nn.Linear(
+            self.r_max,
+            self.out_features,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
 
-        self.register_buffer("rank_mask", torch.ones(self.r_max, dtype=torch.float32))
-        self.register_buffer("active_rank", torch.tensor(self.r_max, dtype=torch.int64))
-        self.register_buffer("importance_ema", torch.zeros(self.r_max, dtype=torch.float32))
-        self.register_buffer("grad_a_ema", torch.zeros(self.r_max, dtype=torch.float32))
-        self.register_buffer("grad_b_ema", torch.zeros(self.r_max, dtype=torch.float32))
-        self.register_buffer("importance_ema_ready", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("grad_a_ema_ready", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("grad_b_ema_ready", torch.tensor(False, dtype=torch.bool))
         self.register_buffer(
-            "rank_center", torch.tensor(float(self.r_max), dtype=torch.float32)
+            "rank_mask", torch.ones(self.r_max, dtype=torch.float32, device=device)
         )
-        self.register_buffer("probe_score", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("probe_block_score", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer(
-            "probe_module_residual", torch.tensor(0.0, dtype=torch.float32)
+            "active_rank", torch.tensor(self.r_max, dtype=torch.int64, device=device)
         )
-        self.register_buffer("probe_rank_prior", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("probe_selected", torch.tensor(True, dtype=torch.bool))
         self.register_buffer(
-            "counterfactual_confirm", torch.zeros(self.r_max, dtype=torch.int64)
+            "importance_ema", torch.zeros(self.r_max, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "grad_a_ema", torch.zeros(self.r_max, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "grad_b_ema", torch.zeros(self.r_max, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "importance_ema_ready", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "grad_a_ema_ready", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "grad_b_ema_ready", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "rank_center",
+            torch.tensor(float(self.r_max), dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "probe_score", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "probe_block_score", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "probe_module_residual",
+            torch.tensor(0.0, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "probe_rank_prior", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "probe_selected", torch.tensor(True, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "counterfactual_confirm",
+            torch.zeros(self.r_max, dtype=torch.int64, device=device),
         )
 
         self.lora_A.weight.register_hook(self._make_grad_hook("a"))
@@ -366,28 +435,57 @@ class SpectralSearchableLoRALinear(nn.Module):
             )
         )
 
-        self.register_buffer("rank_mask", torch.ones(self.r_max, dtype=torch.float32))
-        self.register_buffer("active_rank", torch.tensor(self.r_max, dtype=torch.int64))
-        self.register_buffer("importance_ema", torch.zeros(self.r_max, dtype=torch.float32))
-        self.register_buffer("scale_grad_ema", torch.zeros(self.r_max, dtype=torch.float32))
-        self.register_buffer("uncertainty_ema", torch.zeros(self.r_max, dtype=torch.float32))
-        self.register_buffer("importance_ema_ready", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("scale_grad_ema_ready", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("uncertainty_ema_ready", torch.tensor(False, dtype=torch.bool))
         self.register_buffer(
-            "rank_center", torch.tensor(float(self.r_max), dtype=torch.float32)
+            "rank_mask", torch.ones(self.r_max, dtype=torch.float32, device=device)
         )
-        self.register_buffer("probe_score", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("probe_block_score", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer(
-            "probe_module_residual", torch.tensor(0.0, dtype=torch.float32)
+            "active_rank", torch.tensor(self.r_max, dtype=torch.int64, device=device)
         )
-        self.register_buffer("probe_rank_prior", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("probe_selected", torch.tensor(True, dtype=torch.bool))
         self.register_buffer(
-            "counterfactual_confirm", torch.zeros(self.r_max, dtype=torch.int64)
+            "importance_ema", torch.zeros(self.r_max, dtype=torch.float32, device=device)
         )
-        self.register_buffer("init_equiv_error", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer(
+            "scale_grad_ema", torch.zeros(self.r_max, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "uncertainty_ema", torch.zeros(self.r_max, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "importance_ema_ready", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "scale_grad_ema_ready", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "uncertainty_ema_ready", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "rank_center",
+            torch.tensor(float(self.r_max), dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "probe_score", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "probe_block_score", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "probe_module_residual",
+            torch.tensor(0.0, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "probe_rank_prior", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "probe_selected", torch.tensor(True, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "counterfactual_confirm",
+            torch.zeros(self.r_max, dtype=torch.int64, device=device),
+        )
+        self.register_buffer(
+            "init_equiv_error", torch.tensor(0.0, dtype=torch.float32, device=device)
+        )
 
         self.spectral_scale.register_hook(self._scale_grad_hook)
         self._compute_init_equiv_error()
