@@ -623,6 +623,18 @@ class Options:
             help="merge searched decoder RF branches into a single equivalent convolution after loading checkpoints for evaluation",
         )
         self.parser.add_argument(
+            "--decoder_pred_guided_enable",
+            action="store_true",
+            help="feed coarse decoder predictions back into the next top-down fusion gate for change-aware refinement",
+        )
+        self.parser.add_argument(
+            "--decoder_pred_guided_mode",
+            type=str,
+            default="prob_uncertainty_boundary",
+            choices=["prob", "prob_uncertainty", "prob_uncertainty_boundary"],
+            help="decoder guidance cues injected into top-down fusion: coarse probability only, probability+uncertainty, or probability+uncertainty+boundary",
+        )
+        self.parser.add_argument(
             "--dino_temporal_exchange_enable",
             action="store_true",
             help="enable cross-temporal exchange on raw DINO features before dense adaptation",
@@ -998,6 +1010,14 @@ class Options:
             raise ValueError("--decoder_rf_search_epochs must be >= 0.")
         if self.opt.decoder_rf_log_interval < 0:
             raise ValueError("--decoder_rf_log_interval must be >= 0.")
+        if self.opt.decoder_pred_guided_mode not in {
+            "prob",
+            "prob_uncertainty",
+            "prob_uncertainty_boundary",
+        }:
+            raise ValueError(
+                "--decoder_pred_guided_mode must be one of prob, prob_uncertainty, or prob_uncertainty_boundary."
+            )
         if not (0.0 <= self.opt.dino_temporal_exchange_thresh <= 1.0):
             raise ValueError("--dino_temporal_exchange_thresh must be in [0, 1].")
         if self.opt.dino_temporal_exchange_p <= 0:

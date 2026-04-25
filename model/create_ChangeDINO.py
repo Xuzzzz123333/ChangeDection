@@ -121,6 +121,8 @@ class Model(nn.Module):
             decoder_rf_search_interval=opt.decoder_rf_search_interval,
             decoder_rf_max_search_step=opt.decoder_rf_max_search_step,
             decoder_rf_init_weight=opt.decoder_rf_init_weight,
+            decoder_pred_guided_enable=opt.decoder_pred_guided_enable,
+            decoder_pred_guided_mode=opt.decoder_pred_guided_mode,
             dino_temporal_exchange_enable=opt.dino_temporal_exchange_enable,
             dino_temporal_exchange_mode=opt.dino_temporal_exchange_mode,
             dino_temporal_exchange_thresh=opt.dino_temporal_exchange_thresh,

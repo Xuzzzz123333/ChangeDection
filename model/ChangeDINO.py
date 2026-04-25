@@ -371,6 +371,93 @@ class FuseGated(nn.Module):
         return self.mix(fused)
 
 
+class PredGuidedFuseGated(FuseGated):
+    def __init__(
+        self,
+        dim,
+        guidance_mode="prob_uncertainty_boundary",
+        detach_guidance=True,
+        rf_enable=False,
+        rf_mode="rfsearch",
+        rf_num_branches=3,
+        rf_expand_rate=0.5,
+        rf_min_dilation=1,
+        rf_max_dilation=None,
+        rf_search_interval=100,
+        rf_max_search_step=8,
+        rf_init_weight=0.01,
+    ):
+        super().__init__(
+            dim,
+            rf_enable=rf_enable,
+            rf_mode=rf_mode,
+            rf_num_branches=rf_num_branches,
+            rf_expand_rate=rf_expand_rate,
+            rf_min_dilation=rf_min_dilation,
+            rf_max_dilation=rf_max_dilation,
+            rf_search_interval=rf_search_interval,
+            rf_max_search_step=rf_max_search_step,
+            rf_init_weight=rf_init_weight,
+        )
+        self.guidance_mode = guidance_mode
+        self.detach_guidance = bool(detach_guidance)
+        self.use_uncertainty = guidance_mode in (
+            "prob_uncertainty",
+            "prob_uncertainty_boundary",
+        )
+        self.use_boundary = guidance_mode == "prob_uncertainty_boundary"
+        guidance_channels = 1 + int(self.use_uncertainty) + int(self.use_boundary)
+        self.gate = nn.Sequential(
+            nn.Conv2d(2 * dim + guidance_channels, dim, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        laplacian = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("boundary_kernel", laplacian)
+
+    def _build_guidance(self, high_logit, target_size):
+        high_logit = F.interpolate(
+            high_logit,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        if self.detach_guidance:
+            high_logit = high_logit.detach()
+        change_prob = torch.softmax(high_logit, dim=1)[:, 1:2]
+        cues = [change_prob]
+        if self.use_uncertainty:
+            cues.append(4.0 * change_prob * (1.0 - change_prob))
+        if self.use_boundary:
+            boundary = F.conv2d(
+                change_prob,
+                self.boundary_kernel.to(
+                    device=change_prob.device,
+                    dtype=change_prob.dtype,
+                ),
+                padding=1,
+            ).abs()
+            cues.append(boundary)
+        return torch.cat(cues, dim=1)
+
+    def forward(self, x1, x2, high_logit=None):
+        x1 = F.interpolate(x1, size=x2.shape[-2:], mode="bilinear", align_corners=False)
+        if high_logit is None:
+            guidance = x2.new_zeros(
+                x2.shape[0],
+                1 + int(self.use_uncertainty) + int(self.use_boundary),
+                x2.shape[2],
+                x2.shape[3],
+            )
+        else:
+            guidance = self._build_guidance(high_logit, x2.shape[-2:])
+        g = self.gate(torch.cat([x1, x2, guidance], dim=1))
+        fused = x2 + g * x1
+        return self.mix(fused)
+
+
 class Detector(nn.Module):
     def __init__(
         self,
@@ -381,6 +468,11 @@ class Detector(nn.Module):
         super().__init__()
         self.acpc_enable = kwargs.get("acpc_enable", False)
         self.decoder_rf_enable = kwargs.get("decoder_rf_enable", False)
+        self.decoder_pred_guided_enable = kwargs.get("decoder_pred_guided_enable", False)
+        self.decoder_pred_guided_mode = kwargs.get(
+            "decoder_pred_guided_mode",
+            "prob_uncertainty_boundary",
+        )
         self.change_prior = None
         if self.acpc_enable:
             self.change_prior = AdaptiveChangePriorPyramid(
@@ -395,41 +487,38 @@ class Detector(nn.Module):
         decoder_rf_max_dilations = kwargs.get("decoder_rf_max_dilations", None)
         if decoder_rf_max_dilations is None:
             decoder_rf_max_dilations = [None, None, None]
-        self.p5_to_p4 = FuseGated(
-            fpn_channels,
+        fuse_cls = PredGuidedFuseGated if self.decoder_pred_guided_enable else FuseGated
+        fuse_kwargs = dict(
             rf_enable=self.decoder_rf_enable,
             rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
             rf_num_branches=kwargs.get("decoder_rf_num_branches", 3),
             rf_expand_rate=kwargs.get("decoder_rf_expand_rate", 0.5),
             rf_min_dilation=kwargs.get("decoder_rf_min_dilation", 1),
+            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
+            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
+            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+        )
+        if self.decoder_pred_guided_enable:
+            fuse_kwargs.update(
+                {
+                    "guidance_mode": self.decoder_pred_guided_mode,
+                    "detach_guidance": True,
+                }
+            )
+        self.p5_to_p4 = fuse_cls(
+            fpn_channels,
             rf_max_dilation=decoder_rf_max_dilations[0],
-            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
-            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
-            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+            **fuse_kwargs,
         )
-        self.p4_to_p3 = FuseGated(
+        self.p4_to_p3 = fuse_cls(
             fpn_channels,
-            rf_enable=self.decoder_rf_enable,
-            rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
-            rf_num_branches=kwargs.get("decoder_rf_num_branches", 3),
-            rf_expand_rate=kwargs.get("decoder_rf_expand_rate", 0.5),
-            rf_min_dilation=kwargs.get("decoder_rf_min_dilation", 1),
             rf_max_dilation=decoder_rf_max_dilations[1],
-            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
-            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
-            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+            **fuse_kwargs,
         )
-        self.p3_to_p2 = FuseGated(
+        self.p3_to_p2 = fuse_cls(
             fpn_channels,
-            rf_enable=self.decoder_rf_enable,
-            rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
-            rf_num_branches=kwargs.get("decoder_rf_num_branches", 3),
-            rf_expand_rate=kwargs.get("decoder_rf_expand_rate", 0.5),
-            rf_min_dilation=kwargs.get("decoder_rf_min_dilation", 1),
             rf_max_dilation=decoder_rf_max_dilations[2],
-            rf_search_interval=kwargs.get("decoder_rf_search_interval", 100),
-            rf_max_search_step=kwargs.get("decoder_rf_max_search_step", 8),
-            rf_init_weight=kwargs.get("decoder_rf_init_weight", 0.01),
+            **fuse_kwargs,
         )
 
         self.tb5 = nn.Sequential(
@@ -546,13 +635,22 @@ class Detector(nn.Module):
 
         fea_p5 = self.tb5(diff_p5)
         pred_p5 = self.p5_head(fea_p5)
-        fea_p4 = self.p5_to_p4(fea_p5, diff_p4)
+        if self.decoder_pred_guided_enable:
+            fea_p4 = self.p5_to_p4(fea_p5, diff_p4, pred_p5)
+        else:
+            fea_p4 = self.p5_to_p4(fea_p5, diff_p4)
         fea_p4 = self.tb4(fea_p4)
         pred_p4 = self.p4_head(fea_p4)
-        fea_p3 = self.p4_to_p3(fea_p4, diff_p3)
+        if self.decoder_pred_guided_enable:
+            fea_p3 = self.p4_to_p3(fea_p4, diff_p3, pred_p4)
+        else:
+            fea_p3 = self.p4_to_p3(fea_p4, diff_p3)
         fea_p3 = self.tb3(fea_p3)
         pred_p3 = self.p3_head(fea_p3)
-        fea_p2 = self.p3_to_p2(fea_p3, diff_p2)
+        if self.decoder_pred_guided_enable:
+            fea_p2 = self.p3_to_p2(fea_p3, diff_p2, pred_p3)
+        else:
+            fea_p2 = self.p3_to_p2(fea_p3, diff_p2)
         fea_p2 = self.tb2(fea_p2)
         pred_p2 = self.p2_head(fea_p2)
 
