@@ -291,6 +291,9 @@ class Encoder(nn.Module):
             return self.dino.forward_pair(x1, x2)
         return self.dino(x1), self.dino(x2)
 
+    def get_last_cgla_priors(self):
+        return getattr(self.dino, "last_cgla_priors", [])
+
     def adapt_dense(self, dense_feats):
         return self.dense_adp(dense_feats)
 
@@ -369,6 +372,76 @@ class FuseGated(nn.Module):
         g = self.gate(torch.cat([x1, x2], dim=1))
         fused = x2 + g * x1
         return self.mix(fused)
+
+
+def _resolve_cgla_prior_components(mode: str):
+    mode_to_components = {
+        "spatial": ("spatial",),
+        "delta": ("delta",),
+        "local": ("local",),
+        "spatial_delta": ("spatial", "delta"),
+        "spatial_local": ("spatial", "local"),
+        "delta_local": ("delta", "local"),
+        "spatial_local_delta": ("spatial", "local", "delta"),
+    }
+    if mode not in mode_to_components:
+        raise ValueError(f"Unsupported CGLA prior mode: {mode}")
+    return mode_to_components[mode]
+
+
+class _CGLAPriorGuidanceMixin:
+    def _init_cgla_prior_guidance(
+        self,
+        dim,
+        prior_mode="spatial",
+        prior_train_mode="detach",
+        prior_scale_init=1.0,
+    ):
+        self.cgla_prior_mode = prior_mode
+        self.cgla_prior_train_mode = prior_train_mode
+        self.cgla_prior_detach = prior_train_mode == "detach"
+        self.cgla_prior_components = _resolve_cgla_prior_components(prior_mode)
+        self.prior_gate = nn.Conv2d(
+            len(self.cgla_prior_components), dim, kernel_size=1, bias=False
+        )
+        self.prior_scale = nn.Parameter(
+            torch.full((1, 1, 1, 1), float(prior_scale_init))
+        )
+        nn.init.zeros_(self.prior_gate.weight)
+
+    def _build_cgla_prior_guidance(self, cgla_prior, target_size, ref_tensor):
+        channels = len(self.cgla_prior_components)
+        if cgla_prior is None:
+            return ref_tensor.new_zeros(
+                ref_tensor.shape[0],
+                channels,
+                target_size[0],
+                target_size[1],
+            )
+
+        cues = []
+        for name in self.cgla_prior_components:
+            cue = cgla_prior.get(name)
+            if cue is None:
+                cue = ref_tensor.new_zeros(
+                    ref_tensor.shape[0],
+                    1,
+                    target_size[0],
+                    target_size[1],
+                )
+            else:
+                if self.cgla_prior_detach:
+                    cue = cue.detach()
+                cue = cue.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+                if cue.shape[-2:] != target_size:
+                    cue = F.interpolate(
+                        cue,
+                        size=target_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+            cues.append(cue)
+        return torch.cat(cues, dim=1)
 
 
 class PredGuidedFuseGated(FuseGated):
@@ -458,6 +531,111 @@ class PredGuidedFuseGated(FuseGated):
         return self.mix(fused)
 
 
+class CGLAPriorFuseGated(FuseGated, _CGLAPriorGuidanceMixin):
+    def __init__(
+        self,
+        dim,
+        prior_mode="spatial",
+        prior_train_mode="detach",
+        prior_scale_init=1.0,
+        rf_enable=False,
+        rf_mode="rfsearch",
+        rf_num_branches=3,
+        rf_expand_rate=0.5,
+        rf_min_dilation=1,
+        rf_max_dilation=None,
+        rf_search_interval=100,
+        rf_max_search_step=8,
+        rf_init_weight=0.01,
+    ):
+        super().__init__(
+            dim,
+            rf_enable=rf_enable,
+            rf_mode=rf_mode,
+            rf_num_branches=rf_num_branches,
+            rf_expand_rate=rf_expand_rate,
+            rf_min_dilation=rf_min_dilation,
+            rf_max_dilation=rf_max_dilation,
+            rf_search_interval=rf_search_interval,
+            rf_max_search_step=rf_max_search_step,
+            rf_init_weight=rf_init_weight,
+        )
+        self._init_cgla_prior_guidance(
+            dim=dim,
+            prior_mode=prior_mode,
+            prior_train_mode=prior_train_mode,
+            prior_scale_init=prior_scale_init,
+        )
+
+    def forward(self, x1, x2, cgla_prior=None):
+        x1 = F.interpolate(x1, size=x2.shape[-2:], mode="bilinear", align_corners=False)
+        prior = self._build_cgla_prior_guidance(cgla_prior, x2.shape[-2:], x2)
+        gate_logits = self.gate[0](torch.cat([x1, x2], dim=1))
+        gate_logits = gate_logits + self.prior_scale * self.prior_gate(prior)
+        g = torch.sigmoid(gate_logits)
+        fused = x2 + g * x1
+        return self.mix(fused)
+
+
+class DualGuidedFuseGated(PredGuidedFuseGated, _CGLAPriorGuidanceMixin):
+    def __init__(
+        self,
+        dim,
+        guidance_mode="prob_uncertainty_boundary",
+        detach_guidance=True,
+        prior_mode="spatial",
+        prior_train_mode="detach",
+        prior_scale_init=1.0,
+        rf_enable=False,
+        rf_mode="rfsearch",
+        rf_num_branches=3,
+        rf_expand_rate=0.5,
+        rf_min_dilation=1,
+        rf_max_dilation=None,
+        rf_search_interval=100,
+        rf_max_search_step=8,
+        rf_init_weight=0.01,
+    ):
+        super().__init__(
+            dim,
+            guidance_mode=guidance_mode,
+            detach_guidance=detach_guidance,
+            rf_enable=rf_enable,
+            rf_mode=rf_mode,
+            rf_num_branches=rf_num_branches,
+            rf_expand_rate=rf_expand_rate,
+            rf_min_dilation=rf_min_dilation,
+            rf_max_dilation=rf_max_dilation,
+            rf_search_interval=rf_search_interval,
+            rf_max_search_step=rf_max_search_step,
+            rf_init_weight=rf_init_weight,
+        )
+        self._init_cgla_prior_guidance(
+            dim=dim,
+            prior_mode=prior_mode,
+            prior_train_mode=prior_train_mode,
+            prior_scale_init=prior_scale_init,
+        )
+
+    def forward(self, x1, x2, high_logit=None, cgla_prior=None):
+        x1 = F.interpolate(x1, size=x2.shape[-2:], mode="bilinear", align_corners=False)
+        if high_logit is None:
+            pred_guidance = x2.new_zeros(
+                x2.shape[0],
+                1 + int(self.use_uncertainty) + int(self.use_boundary),
+                x2.shape[2],
+                x2.shape[3],
+            )
+        else:
+            pred_guidance = self._build_guidance(high_logit, x2.shape[-2:])
+        prior_guidance = self._build_cgla_prior_guidance(cgla_prior, x2.shape[-2:], x2)
+        gate_logits = self.gate[0](torch.cat([x1, x2, pred_guidance], dim=1))
+        gate_logits = gate_logits + self.prior_scale * self.prior_gate(prior_guidance)
+        g = torch.sigmoid(gate_logits)
+        fused = x2 + g * x1
+        return self.mix(fused)
+
+
 class Detector(nn.Module):
     def __init__(
         self,
@@ -473,6 +651,25 @@ class Detector(nn.Module):
             "decoder_pred_guided_mode",
             "prob_uncertainty_boundary",
         )
+        self.decoder_cgla_prior_enable = kwargs.get(
+            "decoder_cgla_prior_enable", False
+        )
+        self.decoder_cgla_prior_mode = kwargs.get(
+            "decoder_cgla_prior_mode",
+            "spatial",
+        )
+        self.decoder_cgla_prior_source = kwargs.get(
+            "decoder_cgla_prior_source",
+            "aligned",
+        )
+        self.decoder_cgla_prior_train_mode = kwargs.get(
+            "decoder_cgla_prior_train_mode",
+            "detach",
+        )
+        self.decoder_cgla_prior_scale_init = kwargs.get(
+            "decoder_cgla_prior_scale_init",
+            1.0,
+        )
         self.change_prior = None
         if self.acpc_enable:
             self.change_prior = AdaptiveChangePriorPyramid(
@@ -487,7 +684,14 @@ class Detector(nn.Module):
         decoder_rf_max_dilations = kwargs.get("decoder_rf_max_dilations", None)
         if decoder_rf_max_dilations is None:
             decoder_rf_max_dilations = [None, None, None]
-        fuse_cls = PredGuidedFuseGated if self.decoder_pred_guided_enable else FuseGated
+        if self.decoder_pred_guided_enable and self.decoder_cgla_prior_enable:
+            fuse_cls = DualGuidedFuseGated
+        elif self.decoder_pred_guided_enable:
+            fuse_cls = PredGuidedFuseGated
+        elif self.decoder_cgla_prior_enable:
+            fuse_cls = CGLAPriorFuseGated
+        else:
+            fuse_cls = FuseGated
         fuse_kwargs = dict(
             rf_enable=self.decoder_rf_enable,
             rf_mode=kwargs.get("decoder_rf_mode", "rfsearch"),
@@ -503,6 +707,14 @@ class Detector(nn.Module):
                 {
                     "guidance_mode": self.decoder_pred_guided_mode,
                     "detach_guidance": True,
+                }
+            )
+        if self.decoder_cgla_prior_enable:
+            fuse_kwargs.update(
+                {
+                    "prior_mode": self.decoder_cgla_prior_mode,
+                    "prior_train_mode": self.decoder_cgla_prior_train_mode,
+                    "prior_scale_init": self.decoder_cgla_prior_scale_init,
                 }
             )
         self.p5_to_p4 = fuse_cls(
@@ -629,26 +841,98 @@ class Detector(nn.Module):
 
         return tuple(torch.abs(feat1 - feat2) for feat1, feat2 in zip(x1s, x2s))
 
-    def forward(self, x1s, x2s, size=(256, 256)):
+    @staticmethod
+    def _aggregate_cgla_prior_entries(entries):
+        if not entries:
+            return None
+        aggregated = {}
+        for key in ("spatial", "local", "delta"):
+            cues = [entry[key] for entry in entries if key in entry and entry[key] is not None]
+            if not cues:
+                continue
+            if len(cues) == 1:
+                aggregated[key] = cues[0]
+            else:
+                aggregated[key] = torch.stack(cues, dim=0).mean(dim=0)
+        return aggregated or None
+
+    def _select_decoder_cgla_priors(self, cgla_priors):
+        if not self.decoder_cgla_prior_enable or not cgla_priors:
+            return {"p2": None, "p3": None, "p4": None, "p5": None}
+
+        entries = sorted(cgla_priors, key=lambda item: item.get("block_index", -1))
+        stage_names = ("p2", "p3", "p4", "p5")
+        if self.decoder_cgla_prior_source == "last":
+            deepest = entries[-1]
+            return {stage: deepest for stage in stage_names}
+        if self.decoder_cgla_prior_source == "mean":
+            averaged = self._aggregate_cgla_prior_entries(entries)
+            return {stage: averaged for stage in stage_names}
+
+        aligned = {stage: None for stage in stage_names}
+        if len(entries) >= len(stage_names):
+            selected = entries[-len(stage_names) :]
+            for stage, entry in zip(stage_names, selected):
+                aligned[stage] = entry
+        else:
+            selected = entries
+            target_stages = stage_names[-len(selected) :]
+            for stage, entry in zip(target_stages, selected):
+                aligned[stage] = entry
+            fill_entry = selected[0]
+            for stage in stage_names:
+                if aligned[stage] is None:
+                    aligned[stage] = fill_entry
+        return aligned
+
+    def forward(self, x1s, x2s, size=(256, 256), cgla_priors=None):
         ### Extract backbone features
         diff_p2, diff_p3, diff_p4, diff_p5 = self._build_change_priors(x1s, x2s)
+        decoder_cgla_priors = self._select_decoder_cgla_priors(cgla_priors)
 
         fea_p5 = self.tb5(diff_p5)
         pred_p5 = self.p5_head(fea_p5)
-        if self.decoder_pred_guided_enable:
+        if self.decoder_pred_guided_enable and self.decoder_cgla_prior_enable:
+            fea_p4 = self.p5_to_p4(
+                fea_p5,
+                diff_p4,
+                pred_p5,
+                decoder_cgla_priors["p5"],
+            )
+        elif self.decoder_pred_guided_enable:
             fea_p4 = self.p5_to_p4(fea_p5, diff_p4, pred_p5)
+        elif self.decoder_cgla_prior_enable:
+            fea_p4 = self.p5_to_p4(fea_p5, diff_p4, decoder_cgla_priors["p5"])
         else:
             fea_p4 = self.p5_to_p4(fea_p5, diff_p4)
         fea_p4 = self.tb4(fea_p4)
         pred_p4 = self.p4_head(fea_p4)
-        if self.decoder_pred_guided_enable:
+        if self.decoder_pred_guided_enable and self.decoder_cgla_prior_enable:
+            fea_p3 = self.p4_to_p3(
+                fea_p4,
+                diff_p3,
+                pred_p4,
+                decoder_cgla_priors["p4"],
+            )
+        elif self.decoder_pred_guided_enable:
             fea_p3 = self.p4_to_p3(fea_p4, diff_p3, pred_p4)
+        elif self.decoder_cgla_prior_enable:
+            fea_p3 = self.p4_to_p3(fea_p4, diff_p3, decoder_cgla_priors["p4"])
         else:
             fea_p3 = self.p4_to_p3(fea_p4, diff_p3)
         fea_p3 = self.tb3(fea_p3)
         pred_p3 = self.p3_head(fea_p3)
-        if self.decoder_pred_guided_enable:
+        if self.decoder_pred_guided_enable and self.decoder_cgla_prior_enable:
+            fea_p2 = self.p3_to_p2(
+                fea_p3,
+                diff_p2,
+                pred_p3,
+                decoder_cgla_priors["p3"],
+            )
+        elif self.decoder_pred_guided_enable:
             fea_p2 = self.p3_to_p2(fea_p3, diff_p2, pred_p3)
+        elif self.decoder_cgla_prior_enable:
+            fea_p2 = self.p3_to_p2(fea_p3, diff_p2, decoder_cgla_priors["p3"])
         else:
             fea_p2 = self.p3_to_p2(fea_p3, diff_p2)
         fea_p2 = self.tb2(fea_p2)
@@ -718,6 +1002,7 @@ class ChangeModel(nn.Module):
             local1, local2 = self.pairlocal(local1, local2)
 
         dense_layers1, dense_layers2 = self.encoder.forward_dense_pair(x1, x2)
+        cgla_priors = self.encoder.get_last_cgla_priors()
         if self.temporal_exchange is not None:
             dense_layers1, dense_layers2 = self.temporal_exchange(
                 dense_layers1,
@@ -727,21 +1012,31 @@ class ChangeModel(nn.Module):
         dense2 = self.encoder.adapt_dense(dense_layers2)
         fea1 = self.encoder.fuse_pyramid(local1, dense1)
         fea2 = self.encoder.fuse_pyramid(local2, dense2)
-        return fea1, fea2
+        return fea1, fea2, cgla_priors
 
     @torch.inference_mode()
     def _forward(self, x1, x2):
         # for inference
-        fea1, fea2 = self._encode_pair(x1, x2)
-        pred, _, _, _ = self.detector(fea1, fea2, x1.shape[-2:])
+        fea1, fea2, cgla_priors = self._encode_pair(x1, x2)
+        pred, _, _, _ = self.detector(
+            fea1,
+            fea2,
+            x1.shape[-2:],
+            cgla_priors=cgla_priors,
+        )
         pred = self.refiner(pred)
         return pred
 
     def forward(self, x1, x2):
         # for training
         ## change detection
-        fea1, fea2 = self._encode_pair(x1, x2)
+        fea1, fea2, cgla_priors = self._encode_pair(x1, x2)
 
-        preds = self.detector(fea1, fea2, x1.shape[-2:])
+        preds = self.detector(
+            fea1,
+            fea2,
+            x1.shape[-2:],
+            cgla_priors=cgla_priors,
+        )
         final_pred = self.refiner(preds[0])
         return final_pred, preds  # pred, pred_p2, pred_p3, pred_p4, pred_p5

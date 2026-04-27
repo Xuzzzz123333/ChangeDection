@@ -371,6 +371,7 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         self.residual_scale = nn.Parameter(
             torch.full((1, 1, 1, 1), float(change_residual_scale))
         )
+        self.last_change_prior = None
         self._init_change_aware_parameters()
 
     def _init_change_aware_parameters(self):
@@ -443,6 +444,7 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         return relation
 
     def _forward_tensor(self, x: torch.Tensor):
+        self.last_change_prior = None
         split = self._split_tensor(x)
         if split is None:
             return x
@@ -457,6 +459,7 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         split1 = self._split_tensor(x1)
         split2 = self._split_tensor(x2)
         if split1 is None or split2 is None:
+            self.last_change_prior = None
             return x1, x2
         prefix1, patch1, normed_map1 = split1
         prefix2, patch2, normed_map2 = split2
@@ -479,6 +482,11 @@ class DINOBlockChangeAwareLocalAdapter(nn.Module):
         channel_gate = self.channel_gate(relation)
         local_gate = spatial_gate * channel_gate
         delta_map = spatial_gate * channel_gate * self.delta_branch(relation)
+        self.last_change_prior = {
+            "spatial": spatial_gate,
+            "local": local_gate.abs().mean(dim=1, keepdim=True),
+            "delta": delta_map.abs().mean(dim=1, keepdim=True),
+        }
 
         update1 = self.residual_scale * (
             local_gate * local1 * self.gamma_self.view(1, -1, 1, 1)
@@ -641,6 +649,7 @@ class DINOV3Wrapper(nn.Module):
         self.local_conv_rf_search_interval = int(max(1, local_conv_rf_search_interval))
         self.local_conv_rf_max_search_step = int(max(0, local_conv_rf_max_search_step))
         self.local_conv_rf_init_weight = float(local_conv_rf_init_weight)
+        self.last_cgla_priors = []
         self.lora_rf_probe_ready = False
         self.lora_rf_selected_blocks = tuple()
         self.lora_rf_probe_epoch = -1
@@ -926,6 +935,28 @@ class DINOV3Wrapper(nn.Module):
             and hasattr(blocks[block_index], "rf_state")
             and blocks[block_index].rf_state()
         ]
+
+    def _collect_cgla_priors(self):
+        if not self.local_conv_change_aware_enable:
+            self.last_cgla_priors = []
+            return []
+        blocks = getattr(self.model, "blocks", None)
+        if blocks is None:
+            self.last_cgla_priors = []
+            return []
+        priors = []
+        for block_index in self.local_conv_blocks:
+            if block_index >= len(blocks):
+                continue
+            block = blocks[block_index]
+            if not isinstance(block, DINOBlockChangeAwareLocalAdapter):
+                continue
+            prior = getattr(block, "last_change_prior", None)
+            if prior is None:
+                continue
+            priors.append({"block_index": int(block_index), **prior})
+        self.last_cgla_priors = priors
+        return priors
 
     def _resize_input(self, x: torch.Tensor):
         scale_factor = 2 / (512 / x.shape[-1])
@@ -1940,6 +1971,7 @@ class DINOV3Wrapper(nn.Module):
 
     def forward(self, x):
         x, scale_factor = self._resize_input(x)
+        self.last_cgla_priors = []
 
         use_grad = self.training and (self.use_lora or self.local_conv_enable)
 
@@ -1961,6 +1993,7 @@ class DINOV3Wrapper(nn.Module):
     def forward_pair(self, x1: torch.Tensor, x2: torch.Tensor):
         x1, scale_factor = self._resize_input(x1)
         x2, _ = self._resize_input(x2)
+        self.last_cgla_priors = []
         use_grad = self.training and (self.use_lora or self.local_conv_enable)
 
         with torch.set_grad_enabled(use_grad):
@@ -1988,6 +2021,7 @@ class DINOV3Wrapper(nn.Module):
                         mode="bilinear",
                     )
                 )
+            self._collect_cgla_priors()
         return feats1, feats2
 
 

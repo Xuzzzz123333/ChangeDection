@@ -635,6 +635,46 @@ class Options:
             help="decoder guidance cues injected into top-down fusion: coarse probability only, probability+uncertainty, or probability+uncertainty+boundary",
         )
         self.parser.add_argument(
+            "--decoder_cgla_prior_enable",
+            action="store_true",
+            help="inject CGLA change-aware responses from the paired DINO encoder into decoder fusion gates",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_prior_mode",
+            type=str,
+            default="spatial",
+            choices=[
+                "spatial",
+                "delta",
+                "local",
+                "spatial_delta",
+                "spatial_local",
+                "delta_local",
+                "spatial_local_delta",
+            ],
+            help="which CGLA response maps are used as decoder priors",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_prior_source",
+            type=str,
+            default="aligned",
+            choices=["aligned", "last", "mean"],
+            help="map CGLA priors to decoder stages by depth alignment, deepest-only reuse, or mean aggregation",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_prior_train_mode",
+            type=str,
+            default="detach",
+            choices=["detach", "joint"],
+            help="detach CGLA priors before decoder fusion for stability, or keep them joint for end-to-end guidance",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_prior_scale_init",
+            type=float,
+            default=1.0,
+            help="initial scale applied to the zero-initialized CGLA prior gate branch",
+        )
+        self.parser.add_argument(
             "--dino_temporal_exchange_enable",
             action="store_true",
             help="enable cross-temporal exchange on raw DINO features before dense adaptation",
@@ -1018,6 +1058,35 @@ class Options:
             raise ValueError(
                 "--decoder_pred_guided_mode must be one of prob, prob_uncertainty, or prob_uncertainty_boundary."
             )
+        if (
+            self.opt.decoder_cgla_prior_enable
+            and not self.opt.dino_local_conv_change_aware_enable
+        ):
+            raise ValueError(
+                "--decoder_cgla_prior_enable requires --dino_local_conv_change_aware_enable to be enabled."
+            )
+        if self.opt.decoder_cgla_prior_mode not in {
+            "spatial",
+            "delta",
+            "local",
+            "spatial_delta",
+            "spatial_local",
+            "delta_local",
+            "spatial_local_delta",
+        }:
+            raise ValueError(
+                "--decoder_cgla_prior_mode must be one of spatial, delta, local, spatial_delta, spatial_local, delta_local, or spatial_local_delta."
+            )
+        if self.opt.decoder_cgla_prior_source not in {"aligned", "last", "mean"}:
+            raise ValueError(
+                "--decoder_cgla_prior_source must be one of aligned, last, or mean."
+            )
+        if self.opt.decoder_cgla_prior_train_mode not in {"detach", "joint"}:
+            raise ValueError(
+                "--decoder_cgla_prior_train_mode must be one of detach or joint."
+            )
+        if self.opt.decoder_cgla_prior_scale_init < 0:
+            raise ValueError("--decoder_cgla_prior_scale_init must be >= 0.")
         if not (0.0 <= self.opt.dino_temporal_exchange_thresh <= 1.0):
             raise ValueError("--dino_temporal_exchange_thresh must be in [0, 1].")
         if self.opt.dino_temporal_exchange_p <= 0:
