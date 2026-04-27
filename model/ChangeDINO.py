@@ -897,12 +897,12 @@ class Detector(nn.Module):
                 fea_p5,
                 diff_p4,
                 pred_p5,
-                decoder_cgla_priors["p5"],
+                decoder_cgla_priors["p4"],
             )
         elif self.decoder_pred_guided_enable:
             fea_p4 = self.p5_to_p4(fea_p5, diff_p4, pred_p5)
         elif self.decoder_cgla_prior_enable:
-            fea_p4 = self.p5_to_p4(fea_p5, diff_p4, decoder_cgla_priors["p5"])
+            fea_p4 = self.p5_to_p4(fea_p5, diff_p4, decoder_cgla_priors["p4"])
         else:
             fea_p4 = self.p5_to_p4(fea_p5, diff_p4)
         fea_p4 = self.tb4(fea_p4)
@@ -912,12 +912,12 @@ class Detector(nn.Module):
                 fea_p4,
                 diff_p3,
                 pred_p4,
-                decoder_cgla_priors["p4"],
+                decoder_cgla_priors["p3"],
             )
         elif self.decoder_pred_guided_enable:
             fea_p3 = self.p4_to_p3(fea_p4, diff_p3, pred_p4)
         elif self.decoder_cgla_prior_enable:
-            fea_p3 = self.p4_to_p3(fea_p4, diff_p3, decoder_cgla_priors["p4"])
+            fea_p3 = self.p4_to_p3(fea_p4, diff_p3, decoder_cgla_priors["p3"])
         else:
             fea_p3 = self.p4_to_p3(fea_p4, diff_p3)
         fea_p3 = self.tb3(fea_p3)
@@ -927,12 +927,12 @@ class Detector(nn.Module):
                 fea_p3,
                 diff_p2,
                 pred_p3,
-                decoder_cgla_priors["p3"],
+                decoder_cgla_priors["p2"],
             )
         elif self.decoder_pred_guided_enable:
             fea_p2 = self.p3_to_p2(fea_p3, diff_p2, pred_p3)
         elif self.decoder_cgla_prior_enable:
-            fea_p2 = self.p3_to_p2(fea_p3, diff_p2, decoder_cgla_priors["p3"])
+            fea_p2 = self.p3_to_p2(fea_p3, diff_p2, decoder_cgla_priors["p2"])
         else:
             fea_p2 = self.p3_to_p2(fea_p3, diff_p2)
         fea_p2 = self.tb2(fea_p2)
