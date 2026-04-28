@@ -2030,14 +2030,14 @@ class SepAdapterBlock(nn.Module):
         super().__init__()
         self.reduce = nn.Sequential(
             nn.Conv2d(in_dim, r, kernel_size=1, bias=False),
-            nn.BatchNorm2d(r),
+            nn.GroupNorm(_resolve_group_count(r, 8), r),
             act(inplace=True),
         )
         self.dw = nn.Sequential(
             nn.Conv2d(
                 r, r, kernel_size=3, padding=1, groups=r, bias=False
             ),
-            nn.BatchNorm2d(r),
+            nn.GroupNorm(_resolve_group_count(r, 8), r),
             act(inplace=True),
         )
         self.proj = nn.Conv2d(r, out_dim, kernel_size=1, bias=True)

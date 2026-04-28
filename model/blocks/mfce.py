@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .norms import group_norm
 
 
 def _to_2tuple(value):
@@ -70,7 +71,7 @@ class ConvBnAct(nn.Module):
         padding = kernel_size // 2
         self.block = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, kernel_size, padding=padding, bias=False),
-            nn.BatchNorm2d(out_dim),
+            group_norm(out_dim),
             act(inplace=True),
         )
 
@@ -485,10 +486,10 @@ class DepthwiseSeparableConv(nn.Module):
                 groups=in_dim,
                 bias=False,
             ),
-            nn.BatchNorm2d(in_dim),
+            group_norm(in_dim),
             act(inplace=True),
             nn.Conv2d(in_dim, out_dim, 1, bias=False),
-            nn.BatchNorm2d(out_dim),
+            group_norm(out_dim),
             act(inplace=True),
         )
 
@@ -533,10 +534,10 @@ class RFDepthwiseSeparableConv(nn.Module):
             max_search_step=rf_max_search_step,
             rf_mode=rf_mode,
         )
-        self.depth_bn = nn.BatchNorm2d(in_dim)
+        self.depth_bn = group_norm(in_dim)
         self.depth_act = act(inplace=True)
         self.pointwise = nn.Conv2d(in_dim, out_dim, 1, bias=False)
-        self.point_bn = nn.BatchNorm2d(out_dim)
+        self.point_bn = group_norm(out_dim)
         self.point_act = act(inplace=True)
 
     def rf_state(self):

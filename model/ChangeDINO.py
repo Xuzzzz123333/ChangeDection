@@ -9,6 +9,7 @@ from .blocks.adapter import DINOV3Wrapper, DenseAdapterLite
 from .blocks.change_prior import AdaptiveChangePriorPyramid
 from .blocks.diffatts import TransformerBlock
 from .blocks.mfce import MFCEPyramidAdapter, RFConv2d, TemporalFeatureExchange
+from .blocks.norms import group_norm
 from .blocks.pair_local import PairLocalPyramid
 from .blocks.refine import LearnableSoftMorph
 from .backbone.mobilenetv2 import mobilenet_v2
@@ -111,7 +112,7 @@ class RFConvBnAct(nn.Module):
             max_search_step=rf_max_search_step,
             rf_mode=rf_mode,
         )
-        self.bn = nn.BatchNorm2d(dim)
+        self.bn = group_norm(dim)
         self.act = act(inplace=True)
 
     def rf_state(self):
@@ -348,7 +349,7 @@ class FuseGated(nn.Module):
         else:
             self.mix = nn.Sequential(
                 nn.Conv2d(dim, dim, 3, padding=1, bias=False),
-                nn.BatchNorm2d(dim),
+                group_norm(dim),
                 nn.SiLU(inplace=True),
             )
 

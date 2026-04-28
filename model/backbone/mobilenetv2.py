@@ -1,5 +1,6 @@
 import torch.nn as nn
 from torch.hub import load_state_dict_from_url
+from ..blocks.norms import group_norm
 
 model_urls = {
     "mobilenet_v2": "https://download.pytorch.org/models/mobilenet_v2-b0353104.pth",
@@ -24,7 +25,7 @@ class ConvBNReLU(nn.Sequential):
                 dilation=dilation,
                 bias=False,
             ),
-            nn.BatchNorm2d(out_planes),
+            group_norm(out_planes),
             nn.ReLU6(inplace=True),
         )
 
@@ -54,7 +55,7 @@ class InvertedResidual(nn.Module):
                 ),
                 # pw-linear
                 nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
-                nn.BatchNorm2d(oup),
+                group_norm(oup),
             ]
         )
         self.conv = nn.Sequential(*layers)
@@ -121,7 +122,7 @@ class MobileNetV2(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, nn.GroupNorm):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
