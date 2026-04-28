@@ -105,6 +105,8 @@ class Trainval(object):
                 )
                 f.write(
                     "# time,epoch,train_loss,train_focal,train_dice,train_rf_div,lr,"
+                    "soft_gate_budget_lambda,soft_gate_budget_loss,"
+                    "soft_gate_effective_rank_total,soft_gate_expected_rank_ratio_mean,"
                 )
                 f.write("val_metrics(json),spectral_metrics(json)\n")
 
@@ -347,6 +349,10 @@ class Trainval(object):
             f"{train_stats.get('dice', float('nan')):.6f},"
             f"{train_stats.get('rf_diversity', float('nan')):.6f},"
             f"{train_stats.get('lr', float('nan')):.8f},"
+            f"{train_stats.get('soft_gate_budget_lambda', 0.0):.6f},"
+            f"{train_stats.get('soft_gate_budget_loss', 0.0):.6f},"
+            f"{train_stats.get('soft_gate_effective_rank_total', 0.0):.6f},"
+            f"{train_stats.get('soft_gate_expected_rank_ratio_mean', 0.0):.6f},"
             + json.dumps(val_scores, ensure_ascii=False)
             + ","
             + json.dumps(spectral_metrics, ensure_ascii=False)
@@ -422,7 +428,7 @@ class Trainval(object):
             last_lr = self.optimizer.param_groups[0]["lr"]
 
             if self.opt.is_main_process:
-                tbar.set_description(
+                desc = (
                     "Loss: %.3f, Focal: %.3f, Dice: %.3f, RFDiv: %.3f, LR: %.6f"
                     % (
                         _loss / (i + 1),
@@ -432,6 +438,29 @@ class Trainval(object):
                         last_lr,
                     )
                 )
+                if getattr(self.opt, "dino_lora_soft_gate", False):
+                    soft_gate_aux = getattr(self.model, "last_aux_losses", {})
+                    desc += (
+                        ", SGRank: %.2f, SGRatio: %.3f, SGLambda: %.3f"
+                        % (
+                            float(
+                                soft_gate_aux.get(
+                                    "soft_gate_effective_rank_total", 0.0
+                                )
+                            ),
+                            float(
+                                soft_gate_aux.get(
+                                    "soft_gate_expected_rank_ratio_mean", 0.0
+                                )
+                            ),
+                            float(
+                                soft_gate_aux.get(
+                                    "soft_gate_budget_lambda", 0.0
+                                )
+                            ),
+                        )
+                    )
+                tbar.set_description(desc)
 
             if i == num_batches - 1:
                 self._plot_cd_result(
@@ -446,12 +475,25 @@ class Trainval(object):
             self.device,
         )
         denom = reduced[4].item()
+        soft_gate_aux = getattr(self.model, "last_aux_losses", {})
         return {
             "loss": float(reduced[0].item() / denom),
             "focal": float(reduced[1].item() / denom),
             "dice": float(reduced[2].item() / denom),
             "rf_diversity": float(reduced[3].item() / denom),
             "lr": last_lr,
+            "soft_gate_budget_lambda": float(
+                soft_gate_aux.get("soft_gate_budget_lambda", 0.0)
+            ),
+            "soft_gate_budget_loss": float(
+                soft_gate_aux.get("soft_gate_budget_loss", 0.0)
+            ),
+            "soft_gate_effective_rank_total": float(
+                soft_gate_aux.get("soft_gate_effective_rank_total", 0.0)
+            ),
+            "soft_gate_expected_rank_ratio_mean": float(
+                soft_gate_aux.get("soft_gate_expected_rank_ratio_mean", 0.0)
+            ),
         }
 
     def val(self, epoch):
