@@ -10,6 +10,7 @@ from .lora import (
     DoRALinear,
     LoRALinear,
     SearchableLoRALinear,
+    SoftGateLoRALinear,
     SpectralSearchableLoRALinear,
 )
 
@@ -549,6 +550,9 @@ class DINOV3Wrapper(nn.Module):
         lora_search_counterfactual_delta=0.0,
         lora_search_counterfactual_patience=1,
         lora_search_spectral=False,
+        lora_soft_gate=False,
+        lora_soft_gate_init=2.0,
+        lora_soft_gate_temperature=1.0,
         lora_spectral_prior_power=0.5,
         lora_spectral_uncertainty_weight=0.5,
         lora_spectral_init_scale=0.0,
@@ -578,12 +582,15 @@ class DINOV3Wrapper(nn.Module):
         self.device = device
         self.use_dora = bool(use_dora)
         self.use_lora = bool(use_lora or self.use_dora)
-        self.lora_search = self.use_lora and lora_search
+        self.lora_soft_gate = bool(self.use_lora and lora_soft_gate)
+        self.lora_search = self.use_lora and lora_search and not self.lora_soft_gate
         self.lora_r = int(lora_r)
         self.lora_r_target = (
             self.lora_r if lora_r_target is None else int(max(0, lora_r_target))
         )
         self.lora_alpha_over_r = float(lora_alpha_over_r)
+        self.lora_soft_gate_init = float(lora_soft_gate_init)
+        self.lora_soft_gate_temperature = float(max(1e-6, lora_soft_gate_temperature))
         self.lora_search_warmup_epochs = int(max(0, lora_search_warmup_epochs))
         self.lora_search_interval = int(max(1, lora_search_interval))
         self.lora_search_ema_decay = float(lora_search_ema_decay)
@@ -692,8 +699,11 @@ class DINOV3Wrapper(nn.Module):
                 alpha=lora_alpha,
                 dropout=lora_dropout,
                 search=self.lora_search,
+                soft_gate=self.lora_soft_gate,
                 use_dora=self.use_dora,
                 alpha_over_r=self.lora_alpha_over_r,
+                soft_gate_init=self.lora_soft_gate_init,
+                soft_gate_temperature=self.lora_soft_gate_temperature,
                 score_ema_decay=self.lora_search_ema_decay,
                 grad_weight=self.lora_search_grad_weight,
                 num_layers=self.n_layers,
@@ -770,8 +780,11 @@ class DINOV3Wrapper(nn.Module):
         alpha=16,
         dropout=0.05,
         search=False,
+        soft_gate=False,
         use_dora=False,
         alpha_over_r=1.0,
+        soft_gate_init=2.0,
+        soft_gate_temperature=1.0,
         score_ema_decay=0.9,
         grad_weight=0.5,
         num_layers=24,
@@ -784,7 +797,26 @@ class DINOV3Wrapper(nn.Module):
         for name, child in list(module.named_children()):
             full_name = f"{prefix}.{name}" if prefix else name
             if isinstance(child, nn.Linear) and DINOV3Wrapper.should_apply_lora(full_name):
-                if search:
+                if soft_gate:
+                    setattr(
+                        module,
+                        name,
+                        SoftGateLoRALinear(
+                            child,
+                            r=r,
+                            alpha_over_r=alpha_over_r,
+                            dropout=dropout,
+                            module_name=full_name,
+                            group_name=DINOV3Wrapper.get_lora_group_name(
+                                full_name,
+                                num_layers,
+                                depth_buckets,
+                            ),
+                            gate_init=soft_gate_init,
+                            gate_temperature=soft_gate_temperature,
+                        ),
+                    )
+                elif search:
                     if use_dora:
                         raise ValueError("Searchable DoRA is not supported yet.")
                     searchable_cls = (
@@ -841,8 +873,11 @@ class DINOV3Wrapper(nn.Module):
                     alpha=alpha,
                     dropout=dropout,
                     search=search,
+                    soft_gate=soft_gate,
                     use_dora=use_dora,
                     alpha_over_r=alpha_over_r,
+                    soft_gate_init=soft_gate_init,
+                    soft_gate_temperature=soft_gate_temperature,
                     score_ema_decay=score_ema_decay,
                     grad_weight=grad_weight,
                     num_layers=num_layers,
@@ -1497,6 +1532,85 @@ class DINOV3Wrapper(nn.Module):
                 (SearchableLoRALinear, SpectralSearchableLoRALinear),
             ):
                 yield module
+
+    def iter_soft_gate_lora_layers(self):
+        for module in self.model.modules():
+            if isinstance(module, SoftGateLoRALinear):
+                yield module
+
+    def soft_gate_budget_loss(self, target_ratio=0.5, mode="relu"):
+        layers = list(self.iter_soft_gate_lora_layers())
+        if not layers:
+            return None
+        losses = [layer.budget_loss(target_ratio=target_ratio, mode=mode) for layer in layers]
+        return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def soft_gate_debug_state(self):
+        layers = list(self.iter_soft_gate_lora_layers())
+        if not layers:
+            return {
+                "layer_count": 0,
+                "effective_rank_total": 0.0,
+                "effective_rank_mean": 0.0,
+                "gate_mean_mean": 0.0,
+                "gate_min": 0.0,
+                "gate_max": 0.0,
+                "expected_rank_ratio_mean": 0.0,
+                "hardened_count": 0,
+            }
+
+        records = [layer.debug_state() for layer in layers]
+        return {
+            "layer_count": len(records),
+            "effective_rank_total": float(
+                sum(record["effective_rank"] for record in records)
+            ),
+            "effective_rank_mean": float(
+                sum(record["effective_rank"] for record in records) / len(records)
+            ),
+            "gate_mean_mean": float(
+                sum(record["gate_mean"] for record in records) / len(records)
+            ),
+            "gate_min": float(min(record["gate_min"] for record in records)),
+            "gate_max": float(max(record["gate_max"] for record in records)),
+            "expected_rank_ratio_mean": float(
+                sum(record["expected_rank_ratio"] for record in records) / len(records)
+            ),
+            "hardened_count": int(
+                sum(1 for record in records if record["hardened"])
+            ),
+        }
+
+    @torch.no_grad()
+    def harden_soft_gate_lora(self, target_rank=None, threshold=None):
+        layers = list(self.iter_soft_gate_lora_layers())
+        if not layers:
+            return self.soft_gate_debug_state()
+
+        if target_rank is not None:
+            for layer in layers:
+                layer.harden_by_topk(target_rank)
+            summary = self.soft_gate_debug_state()
+            summary.update(
+                {
+                    "harden_mode": "topk",
+                    "target_rank": int(target_rank),
+                }
+            )
+            return summary
+
+        harden_threshold = 0.5 if threshold is None else float(threshold)
+        for layer in layers:
+            layer.harden_by_threshold(harden_threshold)
+        summary = self.soft_gate_debug_state()
+        summary.update(
+            {
+                "harden_mode": "threshold",
+                "threshold": harden_threshold,
+            }
+        )
+        return summary
 
     @staticmethod
     def _normalize_group_scores(score_chunks, mode: str):

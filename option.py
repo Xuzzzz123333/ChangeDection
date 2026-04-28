@@ -247,6 +247,54 @@ class Options:
             help="enable importance-based rank search on top of DINO LoRA",
         )
         self.parser.add_argument(
+            "--dino_lora_soft_gate",
+            action="store_true",
+            help="optimize continuous soft LoRA gates instead of score-then-hard-prune rank search",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_init",
+            type=float,
+            default=2.0,
+            help="initial gate logit used by SoftGate LoRA",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_temperature",
+            type=float,
+            default=1.0,
+            help="sigmoid temperature used by SoftGate LoRA gates",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_target_ratio",
+            type=float,
+            default=0.5,
+            help="target average rank ratio used by the SoftGate LoRA budget regularizer",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_budget_weight",
+            type=float,
+            default=0.0,
+            help="maximum weight applied to the SoftGate LoRA budget regularizer",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_budget_warmup_epochs",
+            type=int,
+            default=10,
+            help="number of warmup epochs before enabling the SoftGate LoRA budget regularizer",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_budget_ramp_epochs",
+            type=int,
+            default=10,
+            help="number of epochs used to ramp the SoftGate LoRA budget weight to its maximum value",
+        )
+        self.parser.add_argument(
+            "--dino_lora_soft_gate_budget_mode",
+            type=str,
+            default="relu",
+            choices=["relu", "l1", "mse"],
+            help="penalty used by the SoftGate LoRA budget regularizer",
+        )
+        self.parser.add_argument(
             "--dino_lora_r_target",
             type=int,
             default=4,
@@ -930,10 +978,34 @@ class Options:
             raise ValueError("--dino_lora_r must be > 0 when LoRA or DoRA is enabled.")
         if self.opt.dino_lora_search and not self.opt.dino_lora:
             raise ValueError("--dino_lora_search requires --dino_lora to be enabled.")
+        if self.opt.dino_lora_soft_gate and not self.opt.dino_lora:
+            raise ValueError("--dino_lora_soft_gate requires --dino_lora to be enabled.")
         if self.opt.dino_dora and self.opt.dino_lora_search:
             raise ValueError("--dino_dora currently supports only fixed-rank baselines, not rank search.")
+        if self.opt.dino_lora_soft_gate and self.opt.dino_lora_search:
+            raise ValueError(
+                "--dino_lora_soft_gate cannot be combined with --dino_lora_search."
+            )
+        if self.opt.dino_lora_soft_gate and self.opt.dino_dora:
+            raise ValueError(
+                "--dino_lora_soft_gate cannot be combined with --dino_dora."
+            )
         if self.opt.dino_lora_search and self.opt.dino_lora_r <= 0:
             raise ValueError("--dino_lora_r must be > 0 when --dino_lora_search is enabled.")
+        if not (0.0 < self.opt.dino_lora_soft_gate_target_ratio <= 1.0):
+            raise ValueError("--dino_lora_soft_gate_target_ratio must be in (0, 1].")
+        if self.opt.dino_lora_soft_gate_budget_weight < 0:
+            raise ValueError("--dino_lora_soft_gate_budget_weight must be >= 0.")
+        if self.opt.dino_lora_soft_gate_budget_warmup_epochs < 0:
+            raise ValueError(
+                "--dino_lora_soft_gate_budget_warmup_epochs must be >= 0."
+            )
+        if self.opt.dino_lora_soft_gate_budget_ramp_epochs < 1:
+            raise ValueError(
+                "--dino_lora_soft_gate_budget_ramp_epochs must be >= 1."
+            )
+        if self.opt.dino_lora_soft_gate_temperature <= 0:
+            raise ValueError("--dino_lora_soft_gate_temperature must be > 0.")
         if self.opt.dino_lora_r_target < 0:
             raise ValueError("--dino_lora_r_target must be >= 0.")
         if self.opt.dino_lora_alpha_over_r < 0:

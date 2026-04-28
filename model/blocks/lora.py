@@ -49,6 +49,161 @@ class LoRALinear(nn.Module):
         return self.base_layer(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
 
 
+class SoftGateLoRALinear(nn.Module):
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        r=8,
+        alpha_over_r=1.0,
+        dropout=0.05,
+        module_name="",
+        group_name="other",
+        gate_init=2.0,
+        gate_temperature=1.0,
+    ):
+        super().__init__()
+        assert isinstance(
+            base_layer, nn.Linear
+        ), "SoftGate LoRA can only be applied to nn.Linear layers."
+        if r <= 0:
+            raise ValueError("SoftGateLoRALinear expects a positive max rank.")
+        if gate_temperature <= 0:
+            raise ValueError("SoftGateLoRALinear expects a positive temperature.")
+
+        self.base_layer = base_layer
+        self.r_max = int(r)
+        self.r = self.r_max
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        self.alpha_over_r = float(alpha_over_r)
+        self.module_name = module_name
+        self.group_name = group_name
+        self.gate_temperature = float(gate_temperature)
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        self.scaling = self.alpha_over_r
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
+
+        for p in self.base_layer.parameters():
+            p.requires_grad = False
+
+        self.lora_A = nn.Linear(
+            self.in_features,
+            self.r_max,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        self.lora_B = nn.Linear(
+            self.r_max,
+            self.out_features,
+            bias=False,
+            device=device,
+            dtype=dtype,
+        )
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+        self.gate_logits = nn.Parameter(
+            torch.full(
+                (self.r_max,),
+                float(gate_init),
+                device=device,
+                dtype=torch.float32,
+            )
+        )
+        self.register_buffer(
+            "hard_mask", torch.ones(self.r_max, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "hardened", torch.tensor(False, dtype=torch.bool, device=device)
+        )
+        self.register_buffer(
+            "active_rank", torch.tensor(self.r_max, dtype=torch.int64, device=device)
+        )
+
+    def gate_values(self, detach=True):
+        gates = torch.sigmoid(self.gate_logits / self.gate_temperature)
+        effective = gates * self.hard_mask
+        return effective.detach() if detach else effective
+
+    def effective_rank(self):
+        return self.gate_values(detach=False).sum()
+
+    def expected_rank_ratio(self):
+        return self.gate_values(detach=False).mean()
+
+    def budget_loss(self, target_ratio=0.5, mode="relu"):
+        ratio = self.expected_rank_ratio()
+        target_ratio = float(target_ratio)
+        if mode == "relu":
+            return torch.relu(ratio - target_ratio)
+        if mode == "l1":
+            return ratio
+        if mode == "mse":
+            return (ratio - target_ratio) ** 2
+        raise ValueError(f"Unsupported soft-gate budget mode: {mode!r}")
+
+    @torch.no_grad()
+    def debug_state(self):
+        gates = self.gate_values(detach=True)
+        return {
+            "module_name": self.module_name,
+            "group_name": self.group_name,
+            "gate_mean": float(gates.mean().item()),
+            "gate_min": float(gates.min().item()),
+            "gate_max": float(gates.max().item()),
+            "effective_rank": float(gates.sum().item()),
+            "expected_rank_ratio": float(gates.mean().item()),
+            "active_rank": int(self.active_rank.item()),
+            "hardened": bool(self.hardened.item()),
+        }
+
+    @torch.no_grad()
+    def harden_by_topk(self, target_rank):
+        target_rank = int(max(0, min(int(target_rank), self.r_max)))
+        if target_rank <= 0:
+            mask = torch.zeros_like(self.hard_mask)
+        elif target_rank >= self.r_max:
+            mask = torch.ones_like(self.hard_mask)
+        else:
+            gates = self.gate_values(detach=True)
+            keep_idx = gates.topk(target_rank, largest=True, sorted=False).indices
+            mask = torch.zeros_like(gates)
+            mask[keep_idx] = 1.0
+        self.hard_mask.copy_(mask)
+        self.active_rank.fill_(int(mask.gt(0).sum().item()))
+        self.hardened.fill_(True)
+        return self.debug_state()
+
+    @torch.no_grad()
+    def harden_by_threshold(self, threshold=0.5, min_rank=1):
+        threshold = float(threshold)
+        min_rank = int(max(0, min(int(min_rank), self.r_max)))
+        gates = self.gate_values(detach=True)
+        mask = gates.gt(threshold).to(dtype=self.hard_mask.dtype)
+        if min_rank > 0 and int(mask.gt(0).sum().item()) < min_rank:
+            keep_idx = gates.topk(min_rank, largest=True, sorted=False).indices
+            mask.zero_()
+            mask[keep_idx] = 1.0
+        self.hard_mask.copy_(mask)
+        self.active_rank.fill_(int(mask.gt(0).sum().item()))
+        self.hardened.fill_(True)
+        return self.debug_state()
+
+    def forward(self, x):
+        base = self.base_layer(x)
+        if int(self.active_rank.item()) <= 0:
+            return base
+
+        hidden = self.lora_A(self.dropout(x))
+        effective_gate = self.gate_values(detach=False).to(dtype=hidden.dtype)
+        gate_shape = [1] * (hidden.dim() - 1) + [self.r_max]
+        hidden = hidden * effective_gate.view(*gate_shape)
+        update = self.lora_B(hidden) * self.scaling
+        return base + update
+
+
 class DoRALinear(nn.Module):
     def __init__(self, base_layer: nn.Linear, r=4, alpha=16, dropout=0.05, eps=1e-6):
         super().__init__()

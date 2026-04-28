@@ -36,6 +36,7 @@ class Model(nn.Module):
         self.last_aux_losses = {}
         self.last_spectral_probe_stats = {}
         self.last_spectral_search_stats = {}
+        self.current_epoch = 0
 
         self.model = get_model(
             backbone_name=opt.backbone,
@@ -73,6 +74,9 @@ class Model(nn.Module):
             dino_lora_alpha=opt.dino_lora_alpha,
             dino_lora_dropout=opt.dino_lora_dropout,
             dino_lora_search=opt.dino_lora_search,
+            dino_lora_soft_gate=opt.dino_lora_soft_gate,
+            dino_lora_soft_gate_init=opt.dino_lora_soft_gate_init,
+            dino_lora_soft_gate_temperature=opt.dino_lora_soft_gate_temperature,
             dino_lora_r_target=opt.dino_lora_r_target,
             dino_lora_alpha_over_r=opt.dino_lora_alpha_over_r,
             dino_lora_search_warmup_epochs=opt.dino_lora_search_warmup_epochs,
@@ -246,14 +250,25 @@ class Model(nn.Module):
             lora_trainable = [
                 (name, numel)
                 for name, numel in trainable
-                if ".lora_" in name or ".dora_" in name or ".spectral_" in name
+                if ".lora_" in name
+                or ".dora_" in name
+                or ".spectral_" in name
+                or ".gate_logits" in name
             ]
             print(f"trainable DINO tensors: {len(dino_trainable)}")
             print(f"trainable DINO parameters total: {sum(numel for _, numel in dino_trainable)}")
-            adapter_label = "DoRA" if getattr(self.opt, "dino_dora", False) else (
-                "SpectralLoRA"
-                if getattr(self.opt, "dino_lora_search_spectral", False)
-                else "LoRA"
+            adapter_label = (
+                "DoRA"
+                if getattr(self.opt, "dino_dora", False)
+                else (
+                    "SoftGateLoRA"
+                    if getattr(self.opt, "dino_lora_soft_gate", False)
+                    else (
+                        "SpectralLoRA"
+                        if getattr(self.opt, "dino_lora_search_spectral", False)
+                        else "LoRA"
+                    )
+                )
             )
             print(f"trainable {adapter_label} tensors: {len(lora_trainable)}")
             print(f"trainable {adapter_label} parameters total: {sum(numel for _, numel in lora_trainable)}")
@@ -291,6 +306,23 @@ class Model(nn.Module):
             for layer in dino.iter_searchable_lora_layers()
             if hasattr(layer, "spectral_scale") and hasattr(layer, "debug_state")
         ]
+
+    def _collect_soft_gate_debug_state(self):
+        network = self._unwrap_model(self.model)
+        dino = getattr(getattr(network, "encoder", None), "dino", None)
+        if dino is None or not hasattr(dino, "soft_gate_debug_state"):
+            return None
+        return dino.soft_gate_debug_state()
+
+    def _soft_gate_budget_lambda(self, epoch):
+        if not getattr(self.opt, "dino_lora_soft_gate", False):
+            return 0.0
+        warmup_epochs = int(getattr(self.opt, "dino_lora_soft_gate_budget_warmup_epochs", 0))
+        ramp_epochs = int(max(1, getattr(self.opt, "dino_lora_soft_gate_budget_ramp_epochs", 1)))
+        if epoch < warmup_epochs:
+            return 0.0
+        progress = min((epoch - warmup_epochs) / max(1, ramp_epochs), 1.0)
+        return float(getattr(self.opt, "dino_lora_soft_gate_budget_weight", 0.0)) * progress
 
     def _summarize_spectral_search_layers(self):
         layers = self._collect_spectral_search_layers()
@@ -808,6 +840,7 @@ class Model(nn.Module):
                 torch.distributed.broadcast(layer.counterfactual_confirm, src=0)
 
     def update_lora_rank_search_with_val(self, epoch, val_batches=None, probe_batches=None):
+        self.current_epoch = int(epoch)
         if not getattr(self.opt, "dino_lora_search", False):
             return None
 
@@ -928,6 +961,33 @@ class Model(nn.Module):
         if rf_diversity is not None:
             self.last_aux_losses["rf_diversity"] = float(rf_diversity.detach().item())
             dice = dice + self.opt.mfce_rf_diversity_weight * rf_diversity
+
+        if getattr(self.opt, "dino_lora_soft_gate", False):
+            network = self._unwrap_model(self.model)
+            dino = getattr(getattr(network, "encoder", None), "dino", None)
+            budget_loss = None
+            if dino is not None and hasattr(dino, "soft_gate_budget_loss"):
+                budget_loss = dino.soft_gate_budget_loss(
+                    target_ratio=self.opt.dino_lora_soft_gate_target_ratio,
+                    mode=self.opt.dino_lora_soft_gate_budget_mode,
+                )
+            budget_lambda = self._soft_gate_budget_lambda(self.current_epoch)
+            soft_gate_state = self._collect_soft_gate_debug_state() or {}
+            self.last_aux_losses["soft_gate_budget_lambda"] = float(budget_lambda)
+            self.last_aux_losses["soft_gate_effective_rank_total"] = float(
+                soft_gate_state.get("effective_rank_total", 0.0)
+            )
+            self.last_aux_losses["soft_gate_expected_rank_ratio_mean"] = float(
+                soft_gate_state.get("expected_rank_ratio_mean", 0.0)
+            )
+            if budget_loss is not None:
+                self.last_aux_losses["soft_gate_budget_loss"] = float(
+                    budget_loss.detach().item()
+                )
+                if budget_lambda > 0:
+                    dice = dice + budget_lambda * budget_loss
+            else:
+                self.last_aux_losses["soft_gate_budget_loss"] = 0.0
 
         return final_pred, focal, dice
 

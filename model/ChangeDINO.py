@@ -202,6 +202,11 @@ class Encoder(nn.Module):
             lora_alpha=kwargs.get("dino_lora_alpha", 16),
             lora_dropout=kwargs.get("dino_lora_dropout", 0.05),
             lora_search=kwargs.get("dino_lora_search", False),
+            lora_soft_gate=kwargs.get("dino_lora_soft_gate", False),
+            lora_soft_gate_init=kwargs.get("dino_lora_soft_gate_init", 2.0),
+            lora_soft_gate_temperature=kwargs.get(
+                "dino_lora_soft_gate_temperature", 1.0
+            ),
             lora_r_target=kwargs.get("dino_lora_r_target", 4),
             lora_alpha_over_r=kwargs.get("dino_lora_alpha_over_r", 1.0),
             lora_search_warmup_epochs=kwargs.get("dino_lora_search_warmup_epochs", 5),
