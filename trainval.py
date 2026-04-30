@@ -120,6 +120,7 @@ class Trainval(object):
                     "cgla_temporal_reg_lambda,cgla_temporal_reg_loss,"
                     "cgla_temporal_reg_layers,cgla_temporal_reg_response_mean,"
                     "cgla_temporal_reg_change_loss,cgla_temporal_reg_unchange_loss,"
+                    "cgla_temporal_reg_mask_mean,cgla_temporal_reg_mask_nonzero_ratio,"
                 )
                 f.write("val_metrics(json),spectral_metrics(json)\n")
 
@@ -548,6 +549,8 @@ class Trainval(object):
             f"{train_stats.get('cgla_temporal_reg_response_mean', 0.0):.6f},"
             f"{train_stats.get('cgla_temporal_reg_change_loss', 0.0):.6f},"
             f"{train_stats.get('cgla_temporal_reg_unchange_loss', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_mask_mean', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_mask_nonzero_ratio', 0.0):.6f},"
             + json.dumps(val_scores, ensure_ascii=False)
             + ","
             + json.dumps(spectral_metrics, ensure_ascii=False)
@@ -719,6 +722,12 @@ class Trainval(object):
             ),
             "cgla_temporal_reg_unchange_loss": float(
                 soft_gate_aux.get("cgla_temporal_reg_unchange_loss", 0.0)
+            ),
+            "cgla_temporal_reg_mask_mean": float(
+                soft_gate_aux.get("cgla_temporal_reg_mask_mean", 0.0)
+            ),
+            "cgla_temporal_reg_mask_nonzero_ratio": float(
+                soft_gate_aux.get("cgla_temporal_reg_mask_nonzero_ratio", 0.0)
             ),
         }
 

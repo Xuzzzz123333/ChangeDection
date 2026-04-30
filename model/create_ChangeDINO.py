@@ -346,12 +346,26 @@ class Model(nn.Module):
         progress = min((epoch - warmup_epochs) / max(1, ramp_epochs), 1.0)
         return float(getattr(self.opt, "cgla_temporal_reg_weight", 0.0)) * progress
 
+    def _resize_change_mask_for_cgla_reg(self, target, target_size):
+        mode = getattr(self.opt, "cgla_temporal_reg_mask_downsample", "area")
+        if mode == "nearest":
+            return F.interpolate(target, size=target_size, mode="nearest").clamp(0.0, 1.0)
+        if mode == "area":
+            return F.interpolate(target, size=target_size, mode="area").clamp(0.0, 1.0)
+        if mode == "occupancy":
+            return F.adaptive_max_pool2d(target, output_size=target_size).clamp(0.0, 1.0)
+        raise ValueError(
+            f"Unsupported --cgla_temporal_reg_mask_downsample: {mode}"
+        )
+
     def _cgla_temporal_regularization(self, target):
         debug = {
             "cgla_temporal_reg_layers": 0.0,
             "cgla_temporal_reg_response_mean": 0.0,
             "cgla_temporal_reg_change_loss": 0.0,
             "cgla_temporal_reg_unchange_loss": 0.0,
+            "cgla_temporal_reg_mask_mean": 0.0,
+            "cgla_temporal_reg_mask_nonzero_ratio": 0.0,
         }
         if not getattr(self.opt, "cgla_temporal_reg_enable", False):
             return None, debug
@@ -376,6 +390,8 @@ class Model(nn.Module):
         response_means = []
         change_losses = []
         unchange_losses = []
+        mask_means = []
+        mask_nonzero_ratios = []
 
         target = target.float().unsqueeze(1)
         for prior in priors:
@@ -385,10 +401,9 @@ class Model(nn.Module):
             if detach_response:
                 response = response.detach()
             response = response.float().abs()
-            mask = F.interpolate(
+            mask = self._resize_change_mask_for_cgla_reg(
                 target,
-                size=response.shape[-2:],
-                mode="nearest",
+                target_size=response.shape[-2:],
             )
             change_mask = mask
             unchange_mask = 1.0 - mask
@@ -408,6 +423,8 @@ class Model(nn.Module):
             response_means.append(response.mean())
             change_losses.append(change_loss)
             unchange_losses.append(unchange_loss)
+            mask_means.append(mask.mean())
+            mask_nonzero_ratios.append(mask.gt(0).float().mean())
 
         if not layer_losses:
             return None, debug
@@ -423,6 +440,12 @@ class Model(nn.Module):
             ),
             "cgla_temporal_reg_unchange_loss": float(
                 torch.stack(unchange_losses).mean().detach().item()
+            ),
+            "cgla_temporal_reg_mask_mean": float(
+                torch.stack(mask_means).mean().detach().item()
+            ),
+            "cgla_temporal_reg_mask_nonzero_ratio": float(
+                torch.stack(mask_nonzero_ratios).mean().detach().item()
             ),
         }
         return reg_loss, debug
@@ -1107,6 +1130,12 @@ class Model(nn.Module):
             )
             self.last_aux_losses["cgla_temporal_reg_unchange_loss"] = float(
                 reg_debug.get("cgla_temporal_reg_unchange_loss", 0.0)
+            )
+            self.last_aux_losses["cgla_temporal_reg_mask_mean"] = float(
+                reg_debug.get("cgla_temporal_reg_mask_mean", 0.0)
+            )
+            self.last_aux_losses["cgla_temporal_reg_mask_nonzero_ratio"] = float(
+                reg_debug.get("cgla_temporal_reg_mask_nonzero_ratio", 0.0)
             )
             if reg_loss is not None:
                 self.last_aux_losses["cgla_temporal_reg_loss"] = float(

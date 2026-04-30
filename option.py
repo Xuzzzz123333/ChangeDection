@@ -831,6 +831,13 @@ class Options:
             help="which cached CGLA response map is used by temporal regularization",
         )
         self.parser.add_argument(
+            "--cgla_temporal_reg_mask_downsample",
+            type=str,
+            default="area",
+            choices=["nearest", "area", "occupancy"],
+            help="how the high-resolution change mask is downsampled to CGLA response resolution",
+        )
+        self.parser.add_argument(
             "--cgla_temporal_reg_weight",
             type=float,
             default=0.0,
