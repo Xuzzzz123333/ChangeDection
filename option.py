@@ -73,6 +73,73 @@ class Options:
             default=256,
             help="input size used by the custom_patch data mode",
         )
+        self.parser.add_argument(
+            "--data_aug_v2_enable",
+            action="store_true",
+            help="use the experimental v2 augmentation pipeline for original-mode training",
+        )
+        self.parser.add_argument(
+            "--temporal_swap_enable",
+            action="store_true",
+            help="allow 50% temporal swapping in the v2 original-mode augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--asym_color_jitter_enable",
+            action="store_true",
+            help="use independently sampled color jitter on the two temporal images in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--asym_color_jitter_prob",
+            type=float,
+            default=0.5,
+            help="probability of applying asymmetric color jitter in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--asym_brightness",
+            type=float,
+            default=0.2,
+            help="brightness strength used by asymmetric color jitter in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--asym_contrast",
+            type=float,
+            default=0.2,
+            help="contrast strength used by asymmetric color jitter in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--asym_saturation",
+            type=float,
+            default=0.2,
+            help="saturation strength used by asymmetric color jitter in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--asym_hue",
+            type=float,
+            default=0.05,
+            help="hue strength used by asymmetric color jitter in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--change_aware_crop_enable",
+            action="store_true",
+            help="enable change-aware crop sampling in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--change_aware_crop_prob",
+            type=float,
+            default=0.5,
+            help="probability of using a change-aware crop in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--change_aware_crop_min_ratio",
+            type=float,
+            default=0.005,
+            help="minimum foreground change ratio required before attempting a change-aware crop in the v2 augmentation pipeline",
+        )
+        self.parser.add_argument(
+            "--strict_pair_check",
+            action="store_true",
+            help="validate original-mode A/B/label pairing and filename stems at dataset initialization",
+        )
         self.parser.add_argument("--num_epochs", type=int, default=100)
         self.parser.add_argument("--num_workers", type=int, default=4, help="#threads for loading data")
         self.parser.add_argument("--lr", type=float, default=5e-4)
@@ -926,6 +993,22 @@ class Options:
             )
         if self.opt.vis_interval < 0:
             raise ValueError("--vis_interval must be >= 0.")
+        if self.opt.image_size <= 0:
+            raise ValueError("--image_size must be > 0.")
+        if not (0.0 <= self.opt.asym_color_jitter_prob <= 1.0):
+            raise ValueError("--asym_color_jitter_prob must be in [0, 1].")
+        if self.opt.asym_brightness < 0:
+            raise ValueError("--asym_brightness must be >= 0.")
+        if self.opt.asym_contrast < 0:
+            raise ValueError("--asym_contrast must be >= 0.")
+        if self.opt.asym_saturation < 0:
+            raise ValueError("--asym_saturation must be >= 0.")
+        if not (0.0 <= self.opt.asym_hue <= 0.5):
+            raise ValueError("--asym_hue must be in [0, 0.5].")
+        if not (0.0 <= self.opt.change_aware_crop_prob <= 1.0):
+            raise ValueError("--change_aware_crop_prob must be in [0, 1].")
+        if not (0.0 <= self.opt.change_aware_crop_min_ratio <= 1.0):
+            raise ValueError("--change_aware_crop_min_ratio must be in [0, 1].")
         if self.opt.dino_lora and self.opt.dino_dora:
             raise ValueError("--dino_lora and --dino_dora are mutually exclusive.")
         if not self.opt.dino_local_conv_blocks:

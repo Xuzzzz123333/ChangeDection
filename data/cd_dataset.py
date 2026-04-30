@@ -1,4 +1,3 @@
-from .transform import Transforms
 import numpy as np
 import os
 import sys
@@ -9,6 +8,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 import torchvision.transforms.functional as TF
+from .transform import Transforms
 
 
 def make_dataset(dir):
@@ -73,6 +73,7 @@ class Load_Dataset(Dataset):
         self.eval_size = (256, 256)
         self.normalize_mean = (0.430, 0.411, 0.296)
         self.normalize_std = (0.213, 0.156, 0.143)
+        self.data_aug_v2_enable = bool(getattr(opt, "data_aug_v2_enable", False))
 
         if self.data_mode == "custom_patch":
             dataset_root = resolve_custom_dataset_root(opt)
@@ -103,12 +104,21 @@ class Load_Dataset(Dataset):
         self.dir_label = os.path.join(opt.dataroot, opt.dataset, opt.phase, "label")
         self.label_paths, _ = sorted(make_dataset(self.dir_label))
 
+        if getattr(opt, "strict_pair_check", False):
+            self._strict_pair_check()
+
         self.dataset_size = len(self.t1_paths)
 
         self.normalize = transforms.Compose(
             [transforms.Normalize(self.normalize_mean, self.normalize_std)]
         )
-        self.transform = transforms.Compose([Transforms()])
+        if self.data_aug_v2_enable:
+            from .transform_v2 import TransformsV2
+
+            self.transform = transforms.Compose([TransformsV2(opt)])
+            self._log_data_aug_v2_config()
+        else:
+            self.transform = transforms.Compose([Transforms()])
 
     def _image_to_tensor(self, img):
         arr = np.array(img, copy=True)
@@ -120,6 +130,66 @@ class Load_Dataset(Dataset):
 
     def __len__(self):
         return self.dataset_size
+
+    def _strict_pair_check(self):
+        len_a = len(self.t1_paths)
+        len_b = len(self.t2_paths)
+        len_label = len(self.label_paths)
+        if len_a != len_b or len_a != len_label:
+            raise ValueError(
+                "strict_pair_check failed: dataset counts do not match. "
+                f"A={len_a}, B={len_b}, label={len_label}"
+            )
+
+        mismatches = []
+        for t1_path, t2_path, label_path in zip(
+            self.t1_paths, self.t2_paths, self.label_paths
+        ):
+            stem_a = os.path.splitext(os.path.basename(t1_path))[0]
+            stem_b = os.path.splitext(os.path.basename(t2_path))[0]
+            stem_label = os.path.splitext(os.path.basename(label_path))[0]
+            if not (stem_a == stem_b == stem_label):
+                mismatches.append((stem_a, stem_b, stem_label))
+                if len(mismatches) >= 5:
+                    break
+
+        if mismatches:
+            mismatch_preview = "; ".join(
+                f"A={stem_a}, B={stem_b}, label={stem_label}"
+                for stem_a, stem_b, stem_label in mismatches
+            )
+            raise ValueError(
+                "strict_pair_check failed: found mismatched sample stems. "
+                f"Examples: {mismatch_preview}"
+            )
+
+    def _log_data_aug_v2_config(self):
+        if (
+            self.data_mode == "original"
+            and self.opt.phase == "train"
+            and getattr(self.opt, "is_main_process", False)
+        ):
+            print("[data_aug_v2]")
+            print(f"image_size = {int(self.opt.image_size)}")
+            print(
+                f"temporal_swap_enable = {bool(getattr(self.opt, 'temporal_swap_enable', False))}"
+            )
+            print(
+                f"asym_color_jitter_enable = {bool(getattr(self.opt, 'asym_color_jitter_enable', False))}"
+            )
+            print(
+                f"change_aware_crop_enable = {bool(getattr(self.opt, 'change_aware_crop_enable', False))}"
+            )
+            print(
+                f"change_aware_crop_prob = {float(getattr(self.opt, 'change_aware_crop_prob', 0.5))}"
+            )
+            print(
+                "change_aware_crop_min_ratio = "
+                f"{float(getattr(self.opt, 'change_aware_crop_min_ratio', 0.005))}"
+            )
+            print(
+                f"strict_pair_check = {bool(getattr(self.opt, 'strict_pair_check', False))}"
+            )
 
     def __getitem__(self, index):
         if self.data_mode == "custom_patch":
@@ -133,14 +203,24 @@ class Load_Dataset(Dataset):
 
         t1_path = self.t1_paths[index]
         fname = self.fnames[index]
-        img1 = Image.open(t1_path)
+        if self.data_aug_v2_enable:
+            img1 = Image.open(t1_path).convert("RGB")
+        else:
+            img1 = Image.open(t1_path)
 
         t2_path = self.t2_paths[index]
-        img2 = Image.open(t2_path)
+        if self.data_aug_v2_enable:
+            img2 = Image.open(t2_path).convert("RGB")
+        else:
+            img2 = Image.open(t2_path)
 
         label_path = self.label_paths[index]
-        label = np.array(Image.open(label_path)) / 255
-        label[label > 0] = 1
+        if self.data_aug_v2_enable:
+            label = np.array(Image.open(label_path).convert("L"))
+            label = (label > 0).astype(np.uint8)
+        else:
+            label = np.array(Image.open(label_path)) / 255
+            label[label > 0] = 1
         cd_label = Image.fromarray(label)
 
         if self.opt.phase == "train":
