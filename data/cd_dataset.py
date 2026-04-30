@@ -12,15 +12,17 @@ from .transform import Transforms
 
 
 def make_dataset(dir):
-    img_paths = []
-    names = []
+    items = []
     assert os.path.isdir(dir), "%s is not a valid directory" % dir
 
     for root, _, fnames in sorted(os.walk(dir)):
         for fname in fnames:
             path = os.path.join(root, fname)
-            img_paths.append(path)
-            names.append(fname)
+            items.append((fname, path))
+
+    items = sorted(items, key=lambda x: os.path.splitext(x[0])[0])
+    names = [fname for fname, _ in items]
+    img_paths = [path for _, path in items]
 
     return img_paths, names
 
@@ -70,7 +72,7 @@ class Load_Dataset(Dataset):
         super(Load_Dataset, self).__init__()
         self.opt = opt
         self.data_mode = getattr(opt, "data_mode", "original")
-        self.eval_size = (256, 256)
+        self.eval_size = (int(opt.image_size), int(opt.image_size))
         self.normalize_mean = (0.430, 0.411, 0.296)
         self.normalize_std = (0.213, 0.156, 0.143)
         self.data_aug_v2_enable = bool(getattr(opt, "data_aug_v2_enable", False))
@@ -96,13 +98,13 @@ class Load_Dataset(Dataset):
             return
 
         self.dir1 = os.path.join(opt.dataroot, opt.dataset, opt.phase, "A")
-        self.t1_paths, self.fnames = sorted(make_dataset(self.dir1))
+        self.t1_paths, self.fnames = make_dataset(self.dir1)
 
         self.dir2 = os.path.join(opt.dataroot, opt.dataset, opt.phase, "B")
-        self.t2_paths, _ = sorted(make_dataset(self.dir2))
+        self.t2_paths, self.t2_fnames = make_dataset(self.dir2)
 
         self.dir_label = os.path.join(opt.dataroot, opt.dataset, opt.phase, "label")
-        self.label_paths, _ = sorted(make_dataset(self.dir_label))
+        self.label_paths, self.label_fnames = make_dataset(self.dir_label)
 
         if getattr(opt, "strict_pair_check", False):
             self._strict_pair_check()
@@ -142,12 +144,12 @@ class Load_Dataset(Dataset):
             )
 
         mismatches = []
-        for t1_path, t2_path, label_path in zip(
-            self.t1_paths, self.t2_paths, self.label_paths
+        for fname_a, fname_b, fname_label in zip(
+            self.fnames, self.t2_fnames, self.label_fnames
         ):
-            stem_a = os.path.splitext(os.path.basename(t1_path))[0]
-            stem_b = os.path.splitext(os.path.basename(t2_path))[0]
-            stem_label = os.path.splitext(os.path.basename(label_path))[0]
+            stem_a = os.path.splitext(fname_a)[0]
+            stem_b = os.path.splitext(fname_b)[0]
+            stem_label = os.path.splitext(fname_label)[0]
             if not (stem_a == stem_b == stem_label):
                 mismatches.append((stem_a, stem_b, stem_label))
                 if len(mismatches) >= 5:
