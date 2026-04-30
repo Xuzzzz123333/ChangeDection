@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import shutil
 from contextlib import nullcontext
 from datetime import datetime
 
@@ -93,8 +94,17 @@ class Trainval(object):
         self.alpha = 0.5
 
         self.log_path = os.path.join(self.model.save_dir, "record.txt")
+        self.checkpoint_index_path = os.path.join(
+            self.model.save_dir, "checkpoint_index.json"
+        )
+        self.best_metrics_path = os.path.join(
+            self.model.save_dir, "best_metrics.json"
+        )
         self.vis_path = os.path.join(self.model.save_dir, opt.vis_path)
         os.makedirs(self.vis_path, exist_ok=True)
+        self.topk_checkpoints = []
+        self.best_metric_records = {}
+        self.last_checkpoints = []
 
         if self.opt.is_main_process and not os.path.exists(self.log_path):
             with open(self.log_path, "a", encoding="utf-8") as f:
@@ -107,6 +117,9 @@ class Trainval(object):
                     "# time,epoch,train_loss,train_focal,train_dice,train_rf_div,lr,"
                     "soft_gate_budget_lambda,soft_gate_budget_loss,"
                     "soft_gate_effective_rank_total,soft_gate_expected_rank_ratio_mean,"
+                    "cgla_temporal_reg_lambda,cgla_temporal_reg_loss,"
+                    "cgla_temporal_reg_layers,cgla_temporal_reg_response_mean,"
+                    "cgla_temporal_reg_change_loss,cgla_temporal_reg_unchange_loss,"
                 )
                 f.write("val_metrics(json),spectral_metrics(json)\n")
 
@@ -330,6 +343,182 @@ class Trainval(object):
         self.optimizer = self.model.optimizer
         self.schedular = self.model.schedular
 
+    @staticmethod
+    def _safe_metric(scores, key):
+        try:
+            value = float(scores.get(key, float("-inf")))
+        except (TypeError, ValueError, AttributeError):
+            return float("-inf")
+        return value if math.isfinite(value) else float("-inf")
+
+    @staticmethod
+    def _normalize_scores(scores):
+        normalized = {}
+        for key, value in scores.items():
+            try:
+                normalized[key] = float(value)
+            except (TypeError, ValueError):
+                normalized[key] = value
+        return normalized
+
+    @staticmethod
+    def _sanitize_metric_name(metric_name):
+        return "".join(ch if ch.isalnum() else "_" for ch in metric_name)
+
+    def _format_checkpoint_name(self, metric_name, epoch, scores):
+        metric_tag = self._sanitize_metric_name(metric_name)
+        epoch_width = max(3, len(str(max(1, int(self.opt.num_epochs)))))
+        parts = [f"best_{metric_tag}", f"epoch{int(epoch):0{epoch_width}d}"]
+        summary_keys = []
+        for key in (metric_name, "iou_1", "F1_1", "miou"):
+            if key in scores and key not in summary_keys:
+                summary_keys.append(key)
+        for key in summary_keys:
+            value = self._safe_metric(scores, key)
+            if math.isfinite(value):
+                parts.append(f"{self._sanitize_metric_name(key)}_{value:.4f}")
+        return "_".join(parts) + ".pth"
+
+    def _save_checkpoint_path(self, path, epoch, scores, extra=None):
+        normalized_scores = self._normalize_scores(scores)
+        self.model.save_checkpoint(
+            path,
+            epoch=int(epoch),
+            scores=normalized_scores,
+            extra=extra,
+        )
+        metric_name = (extra or {}).get("metric_name", "metric")
+        metric_value = float((extra or {}).get("metric_value", float("nan")))
+        print(
+            f"Saved checkpoint: {path}, metric_name={metric_name}, "
+            f"metric_value={metric_value:.6f}, epoch={int(epoch)}"
+        )
+
+    def _write_checkpoint_index(self):
+        if not self.opt.is_main_process:
+            return
+        payload = {
+            "save_top_k": int(self.opt.save_top_k),
+            "save_top_k_metric": self.opt.save_top_k_metric,
+            "topk_checkpoints": self.topk_checkpoints,
+            "best_metric_records": self.best_metric_records,
+            "last_checkpoints": self.last_checkpoints,
+        }
+        with open(self.checkpoint_index_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        if self.opt.save_multi_best:
+            with open(self.best_metrics_path, "w", encoding="utf-8") as f:
+                json.dump(self.best_metric_records, f, ensure_ascii=False, indent=2)
+
+    def _update_topk_checkpoints(self, epoch, val_scores):
+        metric_name = self.opt.save_top_k_metric
+        metric_value = self._safe_metric(val_scores, metric_name)
+        if not math.isfinite(metric_value):
+            return
+
+        top_k = int(self.opt.save_top_k)
+        if len(self.topk_checkpoints) >= top_k:
+            worst_metric = min(item["metric"] for item in self.topk_checkpoints)
+            if metric_value <= worst_metric:
+                return
+
+        ckpt_path = os.path.join(
+            self.model.save_dir,
+            self._format_checkpoint_name(metric_name, epoch, val_scores),
+        )
+        extra = {
+            "kind": "topk",
+            "metric_name": metric_name,
+            "metric_value": metric_value,
+        }
+        self._save_checkpoint_path(ckpt_path, epoch, val_scores, extra=extra)
+        record = {
+            "epoch": int(epoch),
+            "metric": float(metric_value),
+            "path": ckpt_path,
+            "scores": self._normalize_scores(val_scores),
+        }
+        self.topk_checkpoints.append(record)
+        self.topk_checkpoints.sort(
+            key=lambda item: (item["metric"], item["epoch"]),
+            reverse=True,
+        )
+
+        while len(self.topk_checkpoints) > top_k:
+            removed = self.topk_checkpoints.pop(-1)
+            removed_path = removed.get("path")
+            if removed_path and os.path.exists(removed_path):
+                os.remove(removed_path)
+
+        if not self.topk_checkpoints:
+            return
+
+        best_record = self.topk_checkpoints[0]
+        metric_alias = os.path.join(
+            self.model.save_dir,
+            f"best_{self._sanitize_metric_name(metric_name)}.pth",
+        )
+        legacy_alias = os.path.join(
+            self.model.save_dir,
+            f"{self.opt.name}_{self.opt.backbone}_best.pth",
+        )
+        for alias_path in (metric_alias, legacy_alias):
+            if best_record["path"] != alias_path:
+                shutil.copyfile(best_record["path"], alias_path)
+
+    def _update_multi_best_checkpoints(self, epoch, val_scores):
+        for metric_name in self.opt.save_best_metrics:
+            metric_value = self._safe_metric(val_scores, metric_name)
+            if not math.isfinite(metric_value):
+                continue
+            best_record = self.best_metric_records.get(metric_name)
+            if best_record is not None and metric_value <= float(best_record["metric"]):
+                continue
+
+            ckpt_path = os.path.join(
+                self.model.save_dir,
+                f"best_{self._sanitize_metric_name(metric_name)}.pth",
+            )
+            extra = {
+                "kind": "multi_best",
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+            }
+            self._save_checkpoint_path(ckpt_path, epoch, val_scores, extra=extra)
+            self.best_metric_records[metric_name] = {
+                "epoch": int(epoch),
+                "metric": float(metric_value),
+                "path": ckpt_path,
+                "scores": self._normalize_scores(val_scores),
+            }
+
+    def _save_periodic_last(self, epoch, val_scores):
+        interval = int(self.opt.save_last_every)
+        if interval <= 0 or epoch % interval != 0:
+            return
+
+        ckpt_path = os.path.join(self.model.save_dir, f"last_epoch{int(epoch):03d}.pth")
+        extra = {
+            "kind": "last",
+            "metric_name": "epoch",
+            "metric_value": float(epoch),
+        }
+        self._save_checkpoint_path(ckpt_path, epoch, val_scores, extra=extra)
+        self.last_checkpoints.append(
+            {
+                "epoch": int(epoch),
+                "metric": float(epoch),
+                "path": ckpt_path,
+                "scores": self._normalize_scores(val_scores),
+            }
+        )
+        self.last_checkpoints.sort(key=lambda item: item["epoch"], reverse=True)
+        while len(self.last_checkpoints) > 2:
+            removed = self.last_checkpoints.pop(-1)
+            removed_path = removed.get("path")
+            if removed_path and os.path.exists(removed_path):
+                os.remove(removed_path)
+
     def _append_log_line(self, epoch: int, train_stats: dict, val_scores: dict):
         if not self.opt.is_main_process:
             return
@@ -353,6 +542,12 @@ class Trainval(object):
             f"{train_stats.get('soft_gate_budget_loss', 0.0):.6f},"
             f"{train_stats.get('soft_gate_effective_rank_total', 0.0):.6f},"
             f"{train_stats.get('soft_gate_expected_rank_ratio_mean', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_lambda', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_loss', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_layers', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_response_mean', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_change_loss', 0.0):.6f},"
+            f"{train_stats.get('cgla_temporal_reg_unchange_loss', 0.0):.6f},"
             + json.dumps(val_scores, ensure_ascii=False)
             + ","
             + json.dumps(spectral_metrics, ensure_ascii=False)
@@ -460,6 +655,19 @@ class Trainval(object):
                             ),
                         )
                     )
+                if getattr(self.opt, "cgla_temporal_reg_enable", False):
+                    cgla_aux = getattr(self.model, "last_aux_losses", {})
+                    desc += (
+                        ", CGLAReg: %.3f, CGLALambda: %.3f"
+                        % (
+                            float(
+                                cgla_aux.get("cgla_temporal_reg_loss", 0.0)
+                            ),
+                            float(
+                                cgla_aux.get("cgla_temporal_reg_lambda", 0.0)
+                            ),
+                        )
+                    )
                 tbar.set_description(desc)
 
             if i == num_batches - 1:
@@ -493,6 +701,24 @@ class Trainval(object):
             ),
             "soft_gate_expected_rank_ratio_mean": float(
                 soft_gate_aux.get("soft_gate_expected_rank_ratio_mean", 0.0)
+            ),
+            "cgla_temporal_reg_lambda": float(
+                soft_gate_aux.get("cgla_temporal_reg_lambda", 0.0)
+            ),
+            "cgla_temporal_reg_loss": float(
+                soft_gate_aux.get("cgla_temporal_reg_loss", 0.0)
+            ),
+            "cgla_temporal_reg_layers": float(
+                soft_gate_aux.get("cgla_temporal_reg_layers", 0.0)
+            ),
+            "cgla_temporal_reg_response_mean": float(
+                soft_gate_aux.get("cgla_temporal_reg_response_mean", 0.0)
+            ),
+            "cgla_temporal_reg_change_loss": float(
+                soft_gate_aux.get("cgla_temporal_reg_change_loss", 0.0)
+            ),
+            "cgla_temporal_reg_unchange_loss": float(
+                soft_gate_aux.get("cgla_temporal_reg_unchange_loss", 0.0)
             ),
         }
 
@@ -538,9 +764,15 @@ class Trainval(object):
                 message += "%s: %.3f " % (k, v * 100)
             print(message)
 
-        if self.opt.is_main_process and val_scores.get("iou_1", 0.0) >= self.previous_best:
-            self.model.save(self.opt.name, self.opt.backbone)
-            self.previous_best = val_scores["iou_1"]
+        if self.opt.is_main_process:
+            metric_value = self._safe_metric(val_scores, self.opt.save_top_k_metric)
+            if math.isfinite(metric_value) and metric_value >= self.previous_best:
+                self.previous_best = metric_value
+            self._update_topk_checkpoints(epoch, val_scores)
+            if self.opt.save_multi_best:
+                self._update_multi_best_checkpoints(epoch, val_scores)
+            self._save_periodic_last(epoch, val_scores)
+            self._write_checkpoint_index()
 
         return val_scores
 

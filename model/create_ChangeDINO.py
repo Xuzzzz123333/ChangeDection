@@ -314,6 +314,14 @@ class Model(nn.Module):
             return None
         return dino.soft_gate_debug_state()
 
+    def _collect_cgla_priors(self):
+        network = self._unwrap_model(self.model)
+        encoder = getattr(network, "encoder", None)
+        if encoder is None or not hasattr(encoder, "get_last_cgla_priors"):
+            return []
+        priors = encoder.get_last_cgla_priors()
+        return priors if isinstance(priors, list) else []
+
     def _soft_gate_budget_lambda(self, epoch):
         if not getattr(self.opt, "dino_lora_soft_gate", False):
             return 0.0
@@ -323,6 +331,101 @@ class Model(nn.Module):
             return 0.0
         progress = min((epoch - warmup_epochs) / max(1, ramp_epochs), 1.0)
         return float(getattr(self.opt, "dino_lora_soft_gate_budget_weight", 0.0)) * progress
+
+    def _cgla_temporal_reg_lambda(self, epoch):
+        if not getattr(self.opt, "cgla_temporal_reg_enable", False):
+            return 0.0
+        warmup_epochs = int(
+            getattr(self.opt, "cgla_temporal_reg_warmup_epochs", 0)
+        )
+        ramp_epochs = int(
+            max(1, getattr(self.opt, "cgla_temporal_reg_ramp_epochs", 1))
+        )
+        if epoch < warmup_epochs:
+            return 0.0
+        progress = min((epoch - warmup_epochs) / max(1, ramp_epochs), 1.0)
+        return float(getattr(self.opt, "cgla_temporal_reg_weight", 0.0)) * progress
+
+    def _cgla_temporal_regularization(self, target):
+        debug = {
+            "cgla_temporal_reg_layers": 0.0,
+            "cgla_temporal_reg_response_mean": 0.0,
+            "cgla_temporal_reg_change_loss": 0.0,
+            "cgla_temporal_reg_unchange_loss": 0.0,
+        }
+        if not getattr(self.opt, "cgla_temporal_reg_enable", False):
+            return None, debug
+
+        priors = self._collect_cgla_priors()
+        if not priors:
+            return None, debug
+
+        source = getattr(self.opt, "cgla_temporal_reg_source", "delta")
+        margin = float(getattr(self.opt, "cgla_temporal_reg_margin", 0.1))
+        change_weight = float(
+            getattr(self.opt, "cgla_temporal_reg_change_weight", 1.0)
+        )
+        unchange_weight = float(
+            getattr(self.opt, "cgla_temporal_reg_unchange_weight", 1.0)
+        )
+        detach_response = bool(
+            getattr(self.opt, "cgla_temporal_reg_detach_response", False)
+        )
+
+        layer_losses = []
+        response_means = []
+        change_losses = []
+        unchange_losses = []
+
+        target = target.float().unsqueeze(1)
+        for prior in priors:
+            response = prior.get(source)
+            if response is None:
+                continue
+            if detach_response:
+                response = response.detach()
+            response = response.float().abs()
+            mask = F.interpolate(
+                target,
+                size=response.shape[-2:],
+                mode="nearest",
+            )
+            change_mask = mask
+            unchange_mask = 1.0 - mask
+
+            change_count = change_mask.sum().clamp_min(1.0)
+            unchange_count = unchange_mask.sum().clamp_min(1.0)
+
+            unchange_loss = ((response ** 2) * unchange_mask).sum() / unchange_count
+            change_loss = (
+                (F.relu(margin - response) ** 2) * change_mask
+            ).sum() / change_count
+            layer_loss = (
+                change_weight * change_loss + unchange_weight * unchange_loss
+            )
+
+            layer_losses.append(layer_loss)
+            response_means.append(response.mean())
+            change_losses.append(change_loss)
+            unchange_losses.append(unchange_loss)
+
+        if not layer_losses:
+            return None, debug
+
+        reg_loss = torch.stack(layer_losses).mean()
+        debug = {
+            "cgla_temporal_reg_layers": float(len(layer_losses)),
+            "cgla_temporal_reg_response_mean": float(
+                torch.stack(response_means).mean().detach().item()
+            ),
+            "cgla_temporal_reg_change_loss": float(
+                torch.stack(change_losses).mean().detach().item()
+            ),
+            "cgla_temporal_reg_unchange_loss": float(
+                torch.stack(unchange_losses).mean().detach().item()
+            ),
+        }
+        return reg_loss, debug
 
     def _summarize_spectral_search_layers(self):
         layers = self._collect_spectral_search_layers()
@@ -989,6 +1092,31 @@ class Model(nn.Module):
             else:
                 self.last_aux_losses["soft_gate_budget_loss"] = 0.0
 
+        if getattr(self.opt, "cgla_temporal_reg_enable", False):
+            reg_lambda = self._cgla_temporal_reg_lambda(self.current_epoch)
+            reg_loss, reg_debug = self._cgla_temporal_regularization(label)
+            self.last_aux_losses["cgla_temporal_reg_lambda"] = float(reg_lambda)
+            self.last_aux_losses["cgla_temporal_reg_layers"] = float(
+                reg_debug.get("cgla_temporal_reg_layers", 0.0)
+            )
+            self.last_aux_losses["cgla_temporal_reg_response_mean"] = float(
+                reg_debug.get("cgla_temporal_reg_response_mean", 0.0)
+            )
+            self.last_aux_losses["cgla_temporal_reg_change_loss"] = float(
+                reg_debug.get("cgla_temporal_reg_change_loss", 0.0)
+            )
+            self.last_aux_losses["cgla_temporal_reg_unchange_loss"] = float(
+                reg_debug.get("cgla_temporal_reg_unchange_loss", 0.0)
+            )
+            if reg_loss is not None:
+                self.last_aux_losses["cgla_temporal_reg_loss"] = float(
+                    reg_loss.detach().item()
+                )
+                if reg_lambda > 0:
+                    dice = dice + reg_lambda * reg_loss
+            else:
+                self.last_aux_losses["cgla_temporal_reg_loss"] = 0.0
+
         return final_pred, focal, dice
 
     @torch.inference_mode()
@@ -1020,22 +1148,48 @@ class Model(nn.Module):
             self._unwrap_model(network).load_state_dict(checkpoint["network"], strict=False)
             print("load pre-trained")
 
+    def _serializable_opt_dict(self):
+        serializable = {}
+        simple_types = (str, int, float, bool, type(None))
+        for key, value in vars(self.opt).items():
+            if isinstance(value, simple_types):
+                serializable[key] = value
+            elif isinstance(value, (list, tuple)):
+                if all(isinstance(item, simple_types) for item in value):
+                    serializable[key] = list(value)
+            elif isinstance(value, dict):
+                if all(
+                    isinstance(k, str) and isinstance(v, simple_types)
+                    for k, v in value.items()
+                ):
+                    serializable[key] = dict(value)
+        return serializable
+
+    def save_checkpoint(self, path, epoch=None, scores=None, extra=None):
+        state_dict = {
+            key: value.detach().cpu()
+            for key, value in self._unwrap_model(self.model).state_dict().items()
+        }
+        checkpoint = {
+            "network": state_dict,
+            "model_state_dict": state_dict,
+            "optimizer": self.optimizer.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scores": scores,
+            "epoch": epoch,
+            "extra": extra,
+            "opt": self._serializable_opt_dict(),
+        }
+        if self.schedular is not None:
+            checkpoint["scheduler_state_dict"] = self.schedular.state_dict()
+        torch.save(checkpoint, path)
+
     def save_ckpt(self, network, optimizer, model_name, backbone):
         save_filename = "%s_%s_best.pth" % (model_name, backbone)
         save_path = os.path.join(self.save_dir, save_filename)
         if os.path.exists(save_path):
             os.remove(save_path)
-        state_dict = {
-            key: value.detach().cpu()
-            for key, value in self._unwrap_model(network).state_dict().items()
-        }
-        torch.save(
-            {
-                "network": state_dict,
-                "optimizer": optimizer.state_dict(),
-            },
-            save_path,
-        )
+        self.save_checkpoint(save_path)
 
     def save(self, model_name, backbone):
         self.save_ckpt(self.model, self.optimizer, model_name, backbone)

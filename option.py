@@ -29,6 +29,35 @@ class Options:
             default="./checkpoints",
             help="models are saved here",
         )
+        self.parser.add_argument(
+            "--save_top_k",
+            type=int,
+            default=1,
+            help="number of top checkpoints to keep for the selected validation metric",
+        )
+        self.parser.add_argument(
+            "--save_top_k_metric",
+            type=str,
+            default="iou_1",
+            help="validation metric used to rank top-k checkpoints",
+        )
+        self.parser.add_argument(
+            "--save_multi_best",
+            action="store_true",
+            help="save separate best checkpoints for multiple validation metrics",
+        )
+        self.parser.add_argument(
+            "--save_best_metrics",
+            type=str,
+            default="iou_1,F1_1,miou",
+            help="comma-separated validation metrics tracked when save_multi_best is enabled",
+        )
+        self.parser.add_argument(
+            "--save_last_every",
+            type=int,
+            default=0,
+            help="save a periodic last checkpoint every N epochs; 0 disables it",
+        )
         
         self.parser.add_argument(
             "--save_test", action="store_true"
@@ -790,6 +819,59 @@ class Options:
             help="initial scale applied to the zero-initialized CGLA prior gate branch",
         )
         self.parser.add_argument(
+            "--cgla_temporal_reg_enable",
+            action="store_true",
+            help="add a lightweight temporal consistency-discrepancy regularization on CGLA response maps",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_source",
+            type=str,
+            default="delta",
+            choices=["delta", "spatial", "local"],
+            help="which cached CGLA response map is used by temporal regularization",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_weight",
+            type=float,
+            default=0.0,
+            help="maximum weight applied to the CGLA temporal regularization term",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_margin",
+            type=float,
+            default=0.1,
+            help="minimum desired CGLA response on changed regions",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_change_weight",
+            type=float,
+            default=1.0,
+            help="relative weight for the changed-region temporal regularization term",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_unchange_weight",
+            type=float,
+            default=1.0,
+            help="relative weight for the unchanged-region temporal regularization term",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_warmup_epochs",
+            type=int,
+            default=5,
+            help="number of warmup epochs before enabling CGLA temporal regularization",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_ramp_epochs",
+            type=int,
+            default=10,
+            help="number of epochs used to ramp the CGLA temporal regularization weight",
+        )
+        self.parser.add_argument(
+            "--cgla_temporal_reg_detach_response",
+            action="store_true",
+            help="detach cached CGLA responses before computing temporal regularization",
+        )
+        self.parser.add_argument(
             "--dino_temporal_exchange_enable",
             action="store_true",
             help="enable cross-temporal exchange on raw DINO features before dense adaptation",
@@ -982,11 +1064,25 @@ class Options:
         self.opt.world_size = int(os.environ.get("WORLD_SIZE", 1))
         self.opt.distributed = self.opt.world_size > 1
         self.opt.is_main_process = self.opt.rank == 0
+        self.opt.save_top_k_metric = self.opt.save_top_k_metric.strip()
+        self.opt.save_best_metrics = [
+            metric.strip()
+            for metric in self.opt.save_best_metrics.split(",")
+            if metric.strip()
+        ]
 
         if len(self.opt.pairlocal_stage_modes) != 4:
             raise ValueError(
                 "--pairlocal_stage_modes expects exactly 4 values for p2 p3 p4 p5."
             )
+        if self.opt.save_top_k < 1:
+            raise ValueError("--save_top_k must be >= 1.")
+        if not self.opt.save_top_k_metric:
+            raise ValueError("--save_top_k_metric must be non-empty.")
+        if self.opt.save_last_every < 0:
+            raise ValueError("--save_last_every must be >= 0.")
+        if not self.opt.save_best_metrics:
+            raise ValueError("--save_best_metrics must contain at least one metric.")
         if len(self.opt.acpc_stage_modes) != 4:
             raise ValueError(
                 "--acpc_stage_modes expects exactly 4 values for p2 p3 p4 p5."
@@ -1242,6 +1338,28 @@ class Options:
             )
         if self.opt.decoder_cgla_prior_scale_init < 0:
             raise ValueError("--decoder_cgla_prior_scale_init must be >= 0.")
+        if self.opt.cgla_temporal_reg_weight < 0:
+            raise ValueError("--cgla_temporal_reg_weight must be >= 0.")
+        if self.opt.cgla_temporal_reg_margin < 0:
+            raise ValueError("--cgla_temporal_reg_margin must be >= 0.")
+        if self.opt.cgla_temporal_reg_warmup_epochs < 0:
+            raise ValueError("--cgla_temporal_reg_warmup_epochs must be >= 0.")
+        if self.opt.cgla_temporal_reg_ramp_epochs < 1:
+            raise ValueError("--cgla_temporal_reg_ramp_epochs must be >= 1.")
+        if (
+            self.opt.cgla_temporal_reg_enable
+            and not self.opt.dino_local_conv_enable
+        ):
+            raise ValueError(
+                "--cgla_temporal_reg_enable requires --dino_local_conv_enable to be enabled."
+            )
+        if (
+            self.opt.cgla_temporal_reg_enable
+            and not self.opt.dino_local_conv_change_aware_enable
+        ):
+            raise ValueError(
+                "--cgla_temporal_reg_enable requires --dino_local_conv_change_aware_enable to be enabled."
+            )
         if not (0.0 <= self.opt.dino_temporal_exchange_thresh <= 1.0):
             raise ValueError("--dino_temporal_exchange_thresh must be in [0, 1].")
         if self.opt.dino_temporal_exchange_p <= 0:
