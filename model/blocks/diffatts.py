@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import numbers
 from einops import rearrange
 from torch import einsum
-from .norms import group_norm
 
 
 ##########################################################################
@@ -73,9 +72,9 @@ class LayerNorm(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        self.bn1 = group_norm(dim)
+        self.bn1 = nn.BatchNorm2d(dim)
         self.conv1 = nn.Conv2d(dim, hidden_dim, 1)
-        self.bn2 = group_norm(hidden_dim)
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
         self.conv2 = nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=dim)
         self.relu = nn.ReLU6()
         self.conv3 = nn.Conv2d(hidden_dim, dim, 1)

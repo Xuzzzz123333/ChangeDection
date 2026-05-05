@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from mmcv.ops import ModulatedDeformConv2dPack, modulated_deform_conv2d
-from .norms import group_norm
 
 
 class GenerateGamma(nn.Module):
@@ -74,10 +73,10 @@ class FPN(nn.Module):
         self.p5 = DCNv2(in_channels=in_channels[3], out_channels=out_channels,
                         kernel_size=3, padding=1, deform_groups=deform_groups)
 
-        self.p5_bn = group_norm(out_channels, affine=True)
-        self.p4_bn = group_norm(out_channels, affine=False)
-        self.p3_bn = group_norm(out_channels, affine=False)
-        self.p2_bn = group_norm(out_channels, affine=False)
+        self.p5_bn = nn.BatchNorm2d(out_channels, affine=True)
+        self.p4_bn = nn.BatchNorm2d(out_channels, affine=False)
+        self.p3_bn = nn.BatchNorm2d(out_channels, affine=False)
+        self.p2_bn = nn.BatchNorm2d(out_channels, affine=False)
         self.activation = nn.ReLU(True)
 
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -127,7 +126,7 @@ class ConvBnRelu(nn.Module):
         super(ConvBnRelu, self).__init__()
         self.block = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
                                              padding=padding, dilation=dilation, bias=False),
-                                   group_norm(out_channels),
+                                   nn.BatchNorm2d(out_channels),
                                    nn.ReLU(inplace=True))
 
     def forward(self, x):
@@ -142,7 +141,7 @@ class DsBnRelu(nn.Module):
         self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding,
                                    dilation, groups=in_channels, bias=False)
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = group_norm(out_channels)
+        self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(True)
 
     def forward(self, x):
@@ -164,7 +163,7 @@ class PyConv2d(nn.Module):
                                            padding=pyconv_kernel // 2, groups=pyconv_group, bias=bias))
         self.pyconv_levels = nn.Sequential(*pyconv_levels)
         self.to_out = nn.Sequential(nn.Conv2d((out_channels // 2) * len(pyconv_kernels), out_channels, 1, bias=False),
-                                    group_norm(out_channels),
+                                    nn.BatchNorm2d(out_channels),
                                     nn.ReLU(True))
         self.relu = nn.ReLU(True)
 
@@ -218,8 +217,8 @@ class ContextGatedConv2d(nn.Conv2d):
 
             # the context encoding module
             self.ce = nn.Linear(ws * ws, self.num_lat, False)
-            self.ce_bn = group_norm(in_channels)
-            self.ci_bn2 = group_norm(in_channels)
+            self.ce_bn = nn.BatchNorm1d(in_channels)
+            self.ci_bn2 = nn.BatchNorm1d(in_channels)
 
             # activation function is relu
             self.act = nn.ReLU(inplace=True)
@@ -231,7 +230,7 @@ class ContextGatedConv2d(nn.Conv2d):
                 self.g = in_channels
             # the channel interacting module
             self.ci = nn.Linear(self.g, out_channels // (in_channels // self.g), bias=False)
-            self.ci_bn = group_norm(out_channels)
+            self.ci_bn = nn.BatchNorm1d(out_channels)
 
             # the gate decoding module
             self.gd = nn.Linear(self.num_lat, kernel_size * kernel_size, False)
@@ -296,7 +295,7 @@ class DCNv2(ModulatedDeformConv2dPack):
         for pyconv_kernel, pyconv_group in zip(pyconv_kernels, pyconv_groups):
             pyconv_levels.append(nn.Sequential(nn.Conv2d(self.in_channels, out_channels, kernel_size=pyconv_kernel,
                                                          padding=pyconv_kernel // 2, groups=pyconv_group, bias=False),
-                                               group_norm(out_channels),
+                                               nn.BatchNorm2d(out_channels),
                                                nn.ReLU(True)))
         self.pyconv_levels = nn.Sequential(*pyconv_levels)
         self.offset = nn.Conv2d(out_channels * 3, out_channels, 1, bias=True)
