@@ -132,6 +132,14 @@ class Model(nn.Module):
             decoder_cgla_prior_source=opt.decoder_cgla_prior_source,
             decoder_cgla_prior_train_mode=opt.decoder_cgla_prior_train_mode,
             decoder_cgla_prior_scale_init=opt.decoder_cgla_prior_scale_init,
+            decoder_bifpn_enable=opt.decoder_bifpn_enable,
+            decoder_bifpn_repeats=opt.decoder_bifpn_repeats,
+            decoder_bifpn_eps=opt.decoder_bifpn_eps,
+            decoder_cgla_bifpn_enable=opt.decoder_cgla_bifpn_enable,
+            decoder_cgla_bifpn_prior_mode=opt.decoder_cgla_bifpn_prior_mode,
+            decoder_cgla_bifpn_prior_train_mode=opt.decoder_cgla_bifpn_prior_train_mode,
+            decoder_cgla_bifpn_prior_scale_init=opt.decoder_cgla_bifpn_prior_scale_init,
+            decoder_cgla_bifpn_prior_bias_limit=opt.decoder_cgla_bifpn_prior_bias_limit,
             dino_temporal_exchange_enable=opt.dino_temporal_exchange_enable,
             dino_temporal_exchange_mode=opt.dino_temporal_exchange_mode,
             dino_temporal_exchange_thresh=opt.dino_temporal_exchange_thresh,
@@ -159,6 +167,22 @@ class Model(nn.Module):
         )
         self._log_trainable_parameters()
         self._log_spectral_search_state("init")
+        if opt.is_main_process:
+            print("[CGLA-BiFPN]")
+            print(f"decoder_bifpn_enable = {opt.decoder_bifpn_enable}")
+            print(f"decoder_cgla_bifpn_enable = {opt.decoder_cgla_bifpn_enable}")
+            print(f"decoder_bifpn_repeats = {opt.decoder_bifpn_repeats}")
+            print(
+                f"decoder_cgla_bifpn_prior_mode = {opt.decoder_cgla_bifpn_prior_mode}"
+            )
+            print(
+                "decoder_cgla_bifpn_prior_train_mode = "
+                f"{opt.decoder_cgla_bifpn_prior_train_mode}"
+            )
+            print(
+                "decoder_cgla_bifpn_prior_scale_init = "
+                f"{opt.decoder_cgla_bifpn_prior_scale_init}"
+            )
         if opt.load_pretrain:
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
         should_merge_rf = opt.load_pretrain and (
@@ -291,6 +315,12 @@ class Model(nn.Module):
     def _collect_detector(self):
         network = self._unwrap_model(self.model)
         return getattr(network, "detector", None)
+
+    def _collect_detector_debug_state(self):
+        detector = self._collect_detector()
+        if detector is None or not hasattr(detector, "bifpn_debug_state"):
+            return None
+        return detector.bifpn_debug_state()
 
     def _collect_pairlocal(self):
         network = self._unwrap_model(self.model)
@@ -1145,6 +1175,20 @@ class Model(nn.Module):
                     dice = dice + reg_lambda * reg_loss
             else:
                 self.last_aux_losses["cgla_temporal_reg_loss"] = 0.0
+
+        detector_debug = self._collect_detector_debug_state() or {}
+        self.last_aux_losses["decoder_bifpn_enable"] = float(
+            detector_debug.get("decoder_bifpn_enable", 0.0)
+        )
+        self.last_aux_losses["decoder_cgla_bifpn_enable"] = float(
+            detector_debug.get("decoder_cgla_bifpn_enable", 0.0)
+        )
+        self.last_aux_losses["decoder_bifpn_weight_mean"] = float(
+            detector_debug.get("decoder_bifpn_weight_mean", 0.0)
+        )
+        self.last_aux_losses["decoder_cgla_bifpn_prior_scale_mean"] = float(
+            detector_debug.get("decoder_cgla_bifpn_prior_scale_mean", 0.0)
+        )
 
         return final_pred, focal, dice
 

@@ -819,6 +819,62 @@ class Options:
             help="initial scale applied to the zero-initialized CGLA prior gate branch",
         )
         self.parser.add_argument(
+            "--decoder_bifpn_enable",
+            action="store_true",
+            help="replace the default top-down decoder fusion path with a lightweight BiFPN decoder",
+        )
+        self.parser.add_argument(
+            "--decoder_bifpn_repeats",
+            type=int,
+            default=1,
+            help="number of lightweight BiFPN repeats used by the decoder",
+        )
+        self.parser.add_argument(
+            "--decoder_bifpn_eps",
+            type=float,
+            default=1e-4,
+            help="numerical stabilizer used by fast normalized BiFPN fusion",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_bifpn_enable",
+            action="store_true",
+            help="use CGLA priors to weakly modulate BiFPN fusion weights",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_bifpn_prior_mode",
+            type=str,
+            default="delta",
+            choices=[
+                "spatial",
+                "local",
+                "delta",
+                "spatial_delta",
+                "spatial_local",
+                "delta_local",
+                "spatial_local_delta",
+            ],
+            help="which cached CGLA prior components modulate BiFPN fusion weights",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_bifpn_prior_train_mode",
+            type=str,
+            default="detach",
+            choices=["detach", "joint"],
+            help="detach cached CGLA priors before BiFPN fusion, or keep them joint",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_bifpn_prior_scale_init",
+            type=float,
+            default=0.05,
+            help="initial scale applied to the zero-initialized CGLA-guided BiFPN prior branch",
+        )
+        self.parser.add_argument(
+            "--decoder_cgla_bifpn_prior_bias_limit",
+            type=float,
+            default=1.0,
+            help="tanh clipping limit applied to dynamic CGLA-guided BiFPN fusion biases",
+        )
+        self.parser.add_argument(
             "--cgla_temporal_reg_enable",
             action="store_true",
             help="add a lightweight temporal consistency-discrepancy regularization on CGLA response maps",
@@ -1345,6 +1401,40 @@ class Options:
             )
         if self.opt.decoder_cgla_prior_scale_init < 0:
             raise ValueError("--decoder_cgla_prior_scale_init must be >= 0.")
+        if self.opt.decoder_bifpn_repeats < 1:
+            raise ValueError("--decoder_bifpn_repeats must be >= 1.")
+        if self.opt.decoder_bifpn_eps <= 0:
+            raise ValueError("--decoder_bifpn_eps must be > 0.")
+        if self.opt.decoder_cgla_bifpn_prior_scale_init < 0:
+            raise ValueError("--decoder_cgla_bifpn_prior_scale_init must be >= 0.")
+        if self.opt.decoder_cgla_bifpn_prior_bias_limit <= 0:
+            raise ValueError("--decoder_cgla_bifpn_prior_bias_limit must be > 0.")
+        if self.opt.decoder_cgla_bifpn_enable and not self.opt.decoder_bifpn_enable:
+            raise ValueError(
+                "--decoder_cgla_bifpn_enable requires --decoder_bifpn_enable to be enabled."
+            )
+        if self.opt.decoder_bifpn_enable and self.opt.decoder_cgla_prior_enable:
+            raise ValueError(
+                "--decoder_bifpn_enable is currently mutually exclusive with --decoder_cgla_prior_enable."
+            )
+        if self.opt.decoder_bifpn_enable and self.opt.decoder_pred_guided_enable:
+            raise ValueError(
+                "--decoder_bifpn_enable is currently mutually exclusive with --decoder_pred_guided_enable."
+            )
+        if (
+            self.opt.decoder_cgla_bifpn_enable
+            and not self.opt.dino_local_conv_enable
+        ):
+            raise ValueError(
+                "--decoder_cgla_bifpn_enable requires --dino_local_conv_enable to be enabled."
+            )
+        if (
+            self.opt.decoder_cgla_bifpn_enable
+            and not self.opt.dino_local_conv_change_aware_enable
+        ):
+            raise ValueError(
+                "--decoder_cgla_bifpn_enable requires --dino_local_conv_change_aware_enable to be enabled."
+            )
         if self.opt.cgla_temporal_reg_weight < 0:
             raise ValueError("--cgla_temporal_reg_weight must be >= 0.")
         if self.opt.cgla_temporal_reg_margin < 0:

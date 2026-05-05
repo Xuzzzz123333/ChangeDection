@@ -14,6 +14,17 @@ from .blocks.refine import LearnableSoftMorph
 from .backbone.mobilenetv2 import mobilenet_v2
 
 
+def _resolve_group_count(channels: int, preferred_groups: int = 8) -> int:
+    groups = max(1, min(preferred_groups, channels))
+    while channels % groups != 0 and groups > 1:
+        groups -= 1
+    return groups
+
+
+def _group_norm(channels: int, preferred_groups: int = 8) -> nn.GroupNorm:
+    return nn.GroupNorm(_resolve_group_count(channels, preferred_groups), channels)
+
+
 def get_backbone(backbone_name):
     if backbone_name == "mobilenetv2":
         backbone = mobilenet_v2(pretrained=True, progress=True)
@@ -641,6 +652,215 @@ class DualGuidedFuseGated(PredGuidedFuseGated, _CGLAPriorGuidanceMixin):
         return self.mix(fused)
 
 
+class FastWeightedFusion2d(nn.Module):
+    def __init__(self, dim, num_inputs, eps=1e-4, norm_groups=8):
+        super().__init__()
+        if num_inputs < 2:
+            raise ValueError("FastWeightedFusion2d expects at least two input features.")
+        self.dim = int(dim)
+        self.num_inputs = int(num_inputs)
+        self.eps = float(eps)
+        self.raw_weights = nn.Parameter(torch.ones(self.num_inputs, dtype=torch.float32))
+        self.mix = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
+            _group_norm(dim, norm_groups),
+            nn.SiLU(inplace=True),
+        )
+        self.last_weight_mean = 0.0
+
+    def _validate_inputs(self, features):
+        if not isinstance(features, (list, tuple)) or len(features) != self.num_inputs:
+            raise ValueError(
+                f"FastWeightedFusion2d expects {self.num_inputs} features, "
+                f"got {len(features) if isinstance(features, (list, tuple)) else type(features)!r}."
+            )
+        ref_shape = features[0].shape
+        for idx, feat in enumerate(features[1:], start=1):
+            if feat.shape != ref_shape:
+                raise ValueError(
+                    f"All fusion inputs must have identical shapes, got "
+                    f"{ref_shape} and {feat.shape} at index {idx}."
+                )
+
+    def _positive_weights(self):
+        return F.relu(self.raw_weights)
+
+    def forward(self, features, cgla_prior=None):
+        del cgla_prior
+        self._validate_inputs(features)
+        positive_weights = self._positive_weights()
+        weight_sum = positive_weights.sum() + self.eps
+        fused = sum(
+            weight * feature for weight, feature in zip(positive_weights, features)
+        ) / weight_sum
+        self.last_weight_mean = float(positive_weights.detach().mean().item())
+        return self.mix(fused)
+
+
+class CGLAGuidedFastWeightedFusion2d(FastWeightedFusion2d, _CGLAPriorGuidanceMixin):
+    def __init__(
+        self,
+        dim,
+        num_inputs,
+        eps=1e-4,
+        norm_groups=8,
+        prior_mode="delta",
+        prior_train_mode="detach",
+        prior_scale_init=0.05,
+        prior_bias_limit=1.0,
+    ):
+        super().__init__(dim=dim, num_inputs=num_inputs, eps=eps, norm_groups=norm_groups)
+        self.cgla_prior_mode = prior_mode
+        self.cgla_prior_train_mode = prior_train_mode
+        self.cgla_prior_detach = prior_train_mode == "detach"
+        self.cgla_prior_components = _resolve_cgla_prior_components(prior_mode)
+        self.prior_bias_limit = float(prior_bias_limit)
+        self.prior_bias_proj = nn.Conv2d(
+            len(self.cgla_prior_components), num_inputs, kernel_size=1, bias=False
+        )
+        self.prior_scale = nn.Parameter(
+            torch.full((num_inputs,), float(prior_scale_init), dtype=torch.float32)
+        )
+        nn.init.zeros_(self.prior_bias_proj.weight)
+        self.last_prior_scale_mean = float(prior_scale_init)
+
+    def forward(self, features, cgla_prior=None):
+        self._validate_inputs(features)
+        self.last_prior_scale_mean = float(self.prior_scale.detach().mean().item())
+        if cgla_prior is None:
+            return super().forward(features)
+
+        ref_tensor = features[0]
+        target_size = ref_tensor.shape[-2:]
+        prior_guidance = self._build_cgla_prior_guidance(
+            cgla_prior,
+            target_size=target_size,
+            ref_tensor=ref_tensor,
+        )
+        prior_bias = self.prior_bias_proj(prior_guidance)
+        prior_bias = torch.tanh(prior_bias) * self.prior_bias_limit
+
+        base = self.raw_weights.view(1, self.num_inputs, 1, 1).to(
+            device=ref_tensor.device, dtype=ref_tensor.dtype
+        )
+        scale = self.prior_scale.view(1, self.num_inputs, 1, 1).to(
+            device=ref_tensor.device, dtype=ref_tensor.dtype
+        )
+        dynamic_pre = F.relu(base + scale * prior_bias)
+        dynamic = dynamic_pre / (dynamic_pre.sum(dim=1, keepdim=True) + self.eps)
+        stacked = torch.stack(features, dim=1)
+        fused = (dynamic.unsqueeze(2) * stacked).sum(dim=1)
+        self.last_weight_mean = float(dynamic_pre.detach().mean().item())
+        return self.mix(fused)
+
+
+class BiFPNBlock2d(nn.Module):
+    def __init__(
+        self,
+        dim,
+        eps=1e-4,
+        norm_groups=8,
+        cgla_guided=False,
+        prior_mode="delta",
+        prior_train_mode="detach",
+        prior_scale_init=0.05,
+        prior_bias_limit=1.0,
+    ):
+        super().__init__()
+        fuse_cls = (
+            CGLAGuidedFastWeightedFusion2d if cgla_guided else FastWeightedFusion2d
+        )
+        shared_kwargs = {
+            "dim": dim,
+            "eps": eps,
+            "norm_groups": norm_groups,
+        }
+        if cgla_guided:
+            shared_kwargs.update(
+                {
+                    "prior_mode": prior_mode,
+                    "prior_train_mode": prior_train_mode,
+                    "prior_scale_init": prior_scale_init,
+                    "prior_bias_limit": prior_bias_limit,
+                }
+            )
+        self.fuse_td4 = fuse_cls(num_inputs=2, **shared_kwargs)
+        self.fuse_td3 = fuse_cls(num_inputs=2, **shared_kwargs)
+        self.fuse_td2 = fuse_cls(num_inputs=2, **shared_kwargs)
+        self.fuse_bu3 = fuse_cls(num_inputs=3, **shared_kwargs)
+        self.fuse_bu4 = fuse_cls(num_inputs=3, **shared_kwargs)
+        self.fuse_bu5 = fuse_cls(num_inputs=3, **shared_kwargs)
+        self.cgla_guided = bool(cgla_guided)
+
+    @staticmethod
+    def _upsample_to(x, target_size):
+        if x.shape[-2:] == target_size:
+            return x
+        return F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+
+    @classmethod
+    def _downsample_to(cls, x, target_size):
+        down = F.max_pool2d(x, kernel_size=2, stride=2)
+        if down.shape[-2:] != target_size:
+            down = cls._upsample_to(down, target_size)
+        return down
+
+    def forward(self, p2, p3, p4, p5, cgla_priors=None):
+        priors = cgla_priors or {}
+
+        td5 = p5
+        td4 = self.fuse_td4(
+            [p4, self._upsample_to(td5, p4.shape[-2:])],
+            cgla_prior=priors.get("p4"),
+        )
+        td3 = self.fuse_td3(
+            [p3, self._upsample_to(td4, p3.shape[-2:])],
+            cgla_prior=priors.get("p3"),
+        )
+        td2 = self.fuse_td2(
+            [p2, self._upsample_to(td3, p2.shape[-2:])],
+            cgla_prior=priors.get("p2"),
+        )
+
+        out2 = td2
+        out3 = self.fuse_bu3(
+            [p3, td3, self._downsample_to(out2, p3.shape[-2:])],
+            cgla_prior=priors.get("p3"),
+        )
+        out4 = self.fuse_bu4(
+            [p4, td4, self._downsample_to(out3, p4.shape[-2:])],
+            cgla_prior=priors.get("p4"),
+        )
+        out5 = self.fuse_bu5(
+            [p5, td5, self._downsample_to(out4, p5.shape[-2:])],
+            cgla_prior=priors.get("p5"),
+        )
+        return out2, out3, out4, out5
+
+    def debug_state(self):
+        nodes = [
+            self.fuse_td4,
+            self.fuse_td3,
+            self.fuse_td2,
+            self.fuse_bu3,
+            self.fuse_bu4,
+            self.fuse_bu5,
+        ]
+        weight_mean = sum(node.last_weight_mean for node in nodes) / max(1, len(nodes))
+        prior_scale_mean = 0.0
+        guided_nodes = [
+            node for node in nodes if hasattr(node, "last_prior_scale_mean")
+        ]
+        if guided_nodes:
+            prior_scale_mean = sum(
+                node.last_prior_scale_mean for node in guided_nodes
+            ) / len(guided_nodes)
+        return {
+            "decoder_bifpn_weight_mean": float(weight_mean),
+            "decoder_cgla_bifpn_prior_scale_mean": float(prior_scale_mean),
+        }
+
+
 class Detector(nn.Module):
     def __init__(
         self,
@@ -651,6 +871,24 @@ class Detector(nn.Module):
         super().__init__()
         self.acpc_enable = kwargs.get("acpc_enable", False)
         self.decoder_rf_enable = kwargs.get("decoder_rf_enable", False)
+        self.decoder_bifpn_enable = kwargs.get("decoder_bifpn_enable", False)
+        self.decoder_bifpn_repeats = int(kwargs.get("decoder_bifpn_repeats", 1))
+        self.decoder_bifpn_eps = float(kwargs.get("decoder_bifpn_eps", 1e-4))
+        self.decoder_cgla_bifpn_enable = kwargs.get(
+            "decoder_cgla_bifpn_enable", False
+        )
+        self.decoder_cgla_bifpn_prior_mode = kwargs.get(
+            "decoder_cgla_bifpn_prior_mode", "delta"
+        )
+        self.decoder_cgla_bifpn_prior_train_mode = kwargs.get(
+            "decoder_cgla_bifpn_prior_train_mode", "detach"
+        )
+        self.decoder_cgla_bifpn_prior_scale_init = kwargs.get(
+            "decoder_cgla_bifpn_prior_scale_init", 0.05
+        )
+        self.decoder_cgla_bifpn_prior_bias_limit = kwargs.get(
+            "decoder_cgla_bifpn_prior_bias_limit", 1.0
+        )
         self.decoder_pred_guided_enable = kwargs.get("decoder_pred_guided_enable", False)
         self.decoder_pred_guided_mode = kwargs.get(
             "decoder_pred_guided_mode",
@@ -675,6 +913,12 @@ class Detector(nn.Module):
             "decoder_cgla_prior_scale_init",
             1.0,
         )
+        self._last_bifpn_debug = {
+            "decoder_bifpn_enable": float(self.decoder_bifpn_enable),
+            "decoder_cgla_bifpn_enable": float(self.decoder_cgla_bifpn_enable),
+            "decoder_bifpn_weight_mean": 0.0,
+            "decoder_cgla_bifpn_prior_scale_mean": 0.0,
+        }
         self.change_prior = None
         if self.acpc_enable:
             self.change_prior = AdaptiveChangePriorPyramid(
@@ -806,6 +1050,23 @@ class Detector(nn.Module):
         self.p4_head = nn.Conv2d(fpn_channels, 2, 1)
         self.p3_head = nn.Conv2d(fpn_channels, 2, 1)
         self.p2_head = nn.Conv2d(fpn_channels, 2, 1)
+        self.bifpn_blocks = nn.ModuleList()
+        if self.decoder_bifpn_enable:
+            self.bifpn_blocks = nn.ModuleList(
+                [
+                    BiFPNBlock2d(
+                        dim=fpn_channels,
+                        eps=self.decoder_bifpn_eps,
+                        norm_groups=8,
+                        cgla_guided=self.decoder_cgla_bifpn_enable,
+                        prior_mode=self.decoder_cgla_bifpn_prior_mode,
+                        prior_train_mode=self.decoder_cgla_bifpn_prior_train_mode,
+                        prior_scale_init=self.decoder_cgla_bifpn_prior_scale_init,
+                        prior_bias_limit=self.decoder_cgla_bifpn_prior_bias_limit,
+                    )
+                    for _ in range(self.decoder_bifpn_repeats)
+                ]
+            )
 
     def _iter_rf_fuse_modules(self):
         if not self.decoder_rf_enable:
@@ -890,9 +1151,48 @@ class Detector(nn.Module):
                     aligned[stage] = fill_entry
         return aligned
 
-    def forward(self, x1s, x2s, size=(256, 256), cgla_priors=None):
-        ### Extract backbone features
-        diff_p2, diff_p3, diff_p4, diff_p5 = self._build_change_priors(x1s, x2s)
+    def bifpn_debug_state(self):
+        return dict(self._last_bifpn_debug)
+
+    def _select_cgla_prior_for_level(self, cgla_priors, level):
+        if not cgla_priors:
+            return None
+        stage_names = ("p2", "p3", "p4", "p5")
+        if level not in stage_names:
+            raise ValueError(f"Unsupported BiFPN level: {level}")
+        entries = sorted(cgla_priors, key=lambda item: item.get("block_index", -1))
+        aligned = {stage: None for stage in stage_names}
+        if len(entries) >= len(stage_names):
+            selected = entries[-len(stage_names) :]
+            for stage, entry in zip(stage_names, selected):
+                aligned[stage] = entry
+        else:
+            selected = entries
+            target_stages = stage_names[-len(selected) :]
+            for stage, entry in zip(target_stages, selected):
+                aligned[stage] = entry
+            fill_entry = selected[0] if selected else None
+            for stage in stage_names:
+                if aligned[stage] is None:
+                    aligned[stage] = fill_entry
+        return aligned[level]
+
+    @staticmethod
+    def _upsample_predictions(preds, size):
+        return tuple(
+            F.interpolate(pred, size=size, mode="bilinear", align_corners=False)
+            for pred in preds
+        )
+
+    def _forward_default(
+        self,
+        diff_p2,
+        diff_p3,
+        diff_p4,
+        diff_p5,
+        size,
+        cgla_priors=None,
+    ):
         decoder_cgla_priors = self._select_decoder_cgla_priors(cgla_priors)
 
         fea_p5 = self.tb5(diff_p5)
@@ -942,21 +1242,85 @@ class Detector(nn.Module):
             fea_p2 = self.p3_to_p2(fea_p3, diff_p2)
         fea_p2 = self.tb2(fea_p2)
         pred_p2 = self.p2_head(fea_p2)
+        self._last_bifpn_debug = {
+            "decoder_bifpn_enable": float(self.decoder_bifpn_enable),
+            "decoder_cgla_bifpn_enable": float(self.decoder_cgla_bifpn_enable),
+            "decoder_bifpn_weight_mean": 0.0,
+            "decoder_cgla_bifpn_prior_scale_mean": 0.0,
+        }
+        return self._upsample_predictions((pred_p2, pred_p3, pred_p4, pred_p5), size)
 
-        pred_p2 = F.interpolate(
-            pred_p2, size=size, mode="bilinear", align_corners=False
-        )
-        pred_p3 = F.interpolate(
-            pred_p3, size=size, mode="bilinear", align_corners=False
-        )
-        pred_p4 = F.interpolate(
-            pred_p4, size=size, mode="bilinear", align_corners=False
-        )
-        pred_p5 = F.interpolate(
-            pred_p5, size=size, mode="bilinear", align_corners=False
-        )
+    def _forward_bifpn(
+        self,
+        diff_p2,
+        diff_p3,
+        diff_p4,
+        diff_p5,
+        size,
+        cgla_priors=None,
+    ):
+        level_priors = None
+        if self.decoder_cgla_bifpn_enable:
+            level_priors = {
+                "p2": self._select_cgla_prior_for_level(cgla_priors, "p2"),
+                "p3": self._select_cgla_prior_for_level(cgla_priors, "p3"),
+                "p4": self._select_cgla_prior_for_level(cgla_priors, "p4"),
+                "p5": self._select_cgla_prior_for_level(cgla_priors, "p5"),
+            }
 
-        return pred_p2, pred_p3, pred_p4, pred_p5
+        p2, p3, p4, p5 = diff_p2, diff_p3, diff_p4, diff_p5
+        block_states = []
+        for block in self.bifpn_blocks:
+            p2, p3, p4, p5 = block(p2, p3, p4, p5, cgla_priors=level_priors)
+            block_states.append(block.debug_state())
+
+        if block_states:
+            self._last_bifpn_debug = {
+                "decoder_bifpn_enable": float(self.decoder_bifpn_enable),
+                "decoder_cgla_bifpn_enable": float(self.decoder_cgla_bifpn_enable),
+                "decoder_bifpn_weight_mean": float(
+                    sum(state["decoder_bifpn_weight_mean"] for state in block_states)
+                    / len(block_states)
+                ),
+                "decoder_cgla_bifpn_prior_scale_mean": float(
+                    sum(
+                        state["decoder_cgla_bifpn_prior_scale_mean"]
+                        for state in block_states
+                    )
+                    / len(block_states)
+                ),
+            }
+
+        fea_p5 = self.tb5(p5)
+        fea_p4 = self.tb4(p4)
+        fea_p3 = self.tb3(p3)
+        fea_p2 = self.tb2(p2)
+
+        pred_p5 = self.p5_head(fea_p5)
+        pred_p4 = self.p4_head(fea_p4)
+        pred_p3 = self.p3_head(fea_p3)
+        pred_p2 = self.p2_head(fea_p2)
+        return self._upsample_predictions((pred_p2, pred_p3, pred_p4, pred_p5), size)
+
+    def forward(self, x1s, x2s, size=(256, 256), cgla_priors=None):
+        diff_p2, diff_p3, diff_p4, diff_p5 = self._build_change_priors(x1s, x2s)
+        if self.decoder_bifpn_enable:
+            return self._forward_bifpn(
+                diff_p2,
+                diff_p3,
+                diff_p4,
+                diff_p5,
+                size=size,
+                cgla_priors=cgla_priors,
+            )
+        return self._forward_default(
+            diff_p2,
+            diff_p3,
+            diff_p4,
+            diff_p5,
+            size=size,
+            cgla_priors=cgla_priors,
+        )
 
 
 class ChangeModel(nn.Module):
