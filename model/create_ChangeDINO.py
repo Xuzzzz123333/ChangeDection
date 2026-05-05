@@ -135,6 +135,7 @@ class Model(nn.Module):
             decoder_bifpn_enable=opt.decoder_bifpn_enable,
             decoder_bifpn_repeats=opt.decoder_bifpn_repeats,
             decoder_bifpn_eps=opt.decoder_bifpn_eps,
+            decoder_bifpn_order=opt.decoder_bifpn_order,
             decoder_cgla_bifpn_enable=opt.decoder_cgla_bifpn_enable,
             decoder_cgla_bifpn_prior_mode=opt.decoder_cgla_bifpn_prior_mode,
             decoder_cgla_bifpn_prior_train_mode=opt.decoder_cgla_bifpn_prior_train_mode,
@@ -172,6 +173,7 @@ class Model(nn.Module):
             print(f"decoder_bifpn_enable = {opt.decoder_bifpn_enable}")
             print(f"decoder_cgla_bifpn_enable = {opt.decoder_cgla_bifpn_enable}")
             print(f"decoder_bifpn_repeats = {opt.decoder_bifpn_repeats}")
+            print(f"decoder_bifpn_order = {opt.decoder_bifpn_order}")
             print(
                 f"decoder_cgla_bifpn_prior_mode = {opt.decoder_cgla_bifpn_prior_mode}"
             )

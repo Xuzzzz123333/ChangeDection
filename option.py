@@ -836,6 +836,13 @@ class Options:
             help="numerical stabilizer used by fast normalized BiFPN fusion",
         )
         self.parser.add_argument(
+            "--decoder_bifpn_order",
+            type=str,
+            default="refine_first",
+            choices=["fusion_first", "refine_first"],
+            help="whether BiFPN is applied before per-scale decoder refinement or after it",
+        )
+        self.parser.add_argument(
             "--decoder_cgla_bifpn_enable",
             action="store_true",
             help="use CGLA priors to weakly modulate BiFPN fusion weights",

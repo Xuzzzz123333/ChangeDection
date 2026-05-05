@@ -789,7 +789,7 @@ class BiFPNBlock2d(nn.Module):
         self.fuse_td2 = fuse_cls(num_inputs=2, **shared_kwargs)
         self.fuse_bu3 = fuse_cls(num_inputs=3, **shared_kwargs)
         self.fuse_bu4 = fuse_cls(num_inputs=3, **shared_kwargs)
-        self.fuse_bu5 = fuse_cls(num_inputs=3, **shared_kwargs)
+        self.fuse_bu5 = fuse_cls(num_inputs=2, **shared_kwargs)
         self.cgla_guided = bool(cgla_guided)
 
     @staticmethod
@@ -832,7 +832,7 @@ class BiFPNBlock2d(nn.Module):
             cgla_prior=priors.get("p4"),
         )
         out5 = self.fuse_bu5(
-            [p5, td5, self._downsample_to(out4, p5.shape[-2:])],
+            [td5, self._downsample_to(out4, p5.shape[-2:])],
             cgla_prior=priors.get("p5"),
         )
         return out2, out3, out4, out5
@@ -874,6 +874,7 @@ class Detector(nn.Module):
         self.decoder_bifpn_enable = kwargs.get("decoder_bifpn_enable", False)
         self.decoder_bifpn_repeats = int(kwargs.get("decoder_bifpn_repeats", 1))
         self.decoder_bifpn_eps = float(kwargs.get("decoder_bifpn_eps", 1e-4))
+        self.decoder_bifpn_order = kwargs.get("decoder_bifpn_order", "refine_first")
         self.decoder_cgla_bifpn_enable = kwargs.get(
             "decoder_cgla_bifpn_enable", False
         )
@@ -1268,7 +1269,19 @@ class Detector(nn.Module):
                 "p5": self._select_cgla_prior_for_level(cgla_priors, "p5"),
             }
 
-        p2, p3, p4, p5 = diff_p2, diff_p3, diff_p4, diff_p5
+        if self.decoder_bifpn_order == "refine_first":
+            r5 = self.tb5(diff_p5)
+            r4 = self.tb4(diff_p4)
+            r3 = self.tb3(diff_p3)
+            r2 = self.tb2(diff_p2)
+            p2, p3, p4, p5 = r2, r3, r4, r5
+        elif self.decoder_bifpn_order == "fusion_first":
+            p2, p3, p4, p5 = diff_p2, diff_p3, diff_p4, diff_p5
+        else:
+            raise ValueError(
+                f"Unsupported decoder_bifpn_order: {self.decoder_bifpn_order}"
+            )
+
         block_states = []
         for block in self.bifpn_blocks:
             p2, p3, p4, p5 = block(p2, p3, p4, p5, cgla_priors=level_priors)
@@ -1291,15 +1304,21 @@ class Detector(nn.Module):
                 ),
             }
 
-        fea_p5 = self.tb5(p5)
-        fea_p4 = self.tb4(p4)
-        fea_p3 = self.tb3(p3)
-        fea_p2 = self.tb2(p2)
+        if self.decoder_bifpn_order == "fusion_first":
+            fea_p5 = self.tb5(p5)
+            fea_p4 = self.tb4(p4)
+            fea_p3 = self.tb3(p3)
+            fea_p2 = self.tb2(p2)
 
-        pred_p5 = self.p5_head(fea_p5)
-        pred_p4 = self.p4_head(fea_p4)
-        pred_p3 = self.p3_head(fea_p3)
-        pred_p2 = self.p2_head(fea_p2)
+            pred_p5 = self.p5_head(fea_p5)
+            pred_p4 = self.p4_head(fea_p4)
+            pred_p3 = self.p3_head(fea_p3)
+            pred_p2 = self.p2_head(fea_p2)
+        else:
+            pred_p5 = self.p5_head(p5)
+            pred_p4 = self.p4_head(p4)
+            pred_p3 = self.p3_head(p3)
+            pred_p2 = self.p2_head(p2)
         return self._upsample_predictions((pred_p2, pred_p3, pred_p4, pred_p5), size)
 
     def forward(self, x1s, x2s, size=(256, 256), cgla_priors=None):
