@@ -435,6 +435,12 @@ class Options:
             help="manual override for the number of DINO prefix tokens; use -1 to infer cls/register tokens automatically",
         )
         self.parser.add_argument(
+            "--policy_image_size",
+            type=int,
+            default=0,
+            help="optional image size used to initialize dynamic token-policy dimensions; 0 falls back to runtime token-count inference",
+        )
+        self.parser.add_argument(
             "--policy_head_weight",
             type=float,
             default=1.0,
@@ -1329,6 +1335,8 @@ class Options:
             raise ValueError("--policy_token_weight must be >= 0.")
         if self.opt.num_prefix_tokens < -1:
             raise ValueError("--num_prefix_tokens must be >= -1.")
+        if self.opt.policy_image_size < 0:
+            raise ValueError("--policy_image_size must be >= 0.")
         if self.opt.dino_lora and self.opt.dino_dora:
             raise ValueError("--dino_lora and --dino_dora are mutually exclusive.")
         if not self.opt.dino_local_conv_blocks:
@@ -1789,5 +1797,15 @@ class Options:
         for k, v in sorted(args.items()):
             print("%s: %s" % (str(k), str(v)))
         print("-------------- End ----------------")
+        if (
+            self.opt.is_main_process
+            and self.opt.use_dynamic_policy
+            and self.opt.use_block_policy
+            and self.opt.block_policy_mode == "record_only"
+            and self.opt.policy_block_weight > 0
+        ):
+            print(
+                "Warning: record_only block policy is not task-coupled and should not be used as main evidence."
+            )
 
         return self.opt

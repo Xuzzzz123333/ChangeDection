@@ -68,6 +68,8 @@ class Model(nn.Module):
             policy_anneal_epochs=opt.policy_anneal_epochs,
             policy_hidden_dim=opt.policy_hidden_dim,
             num_prefix_tokens=opt.num_prefix_tokens,
+            image_size=opt.image_size,
+            policy_image_size=opt.policy_image_size,
             policy_head_weight=opt.policy_head_weight,
             policy_block_weight=opt.policy_block_weight,
             policy_token_weight=opt.policy_token_weight,
@@ -1226,7 +1228,9 @@ class Model(nn.Module):
             self.last_aux_losses["dynamic_policy_target_compute_ratio"] = float(
                 target_ratio
             )
+            self.last_aux_losses["target_compute_ratio"] = float(target_ratio)
             self.last_aux_losses["dynamic_policy_cost"] = float(policy_cost)
+            self.last_aux_losses["policy_cost"] = float(policy_cost)
             self.last_aux_losses["dynamic_policy_mean_head_keep"] = float(
                 dynamic_state.get("mean_head_keep", 1.0)
             )

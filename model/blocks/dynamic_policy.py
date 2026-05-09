@@ -135,9 +135,9 @@ class PolicyAwareSelfAttention(nn.Module):
         self.num_heads = int(attn.num_heads)
         self.scale = getattr(attn, "scale", None)
         self.qkv = attn.qkv
-        self.attn_drop = attn.attn_drop
+        self.attn_drop = getattr(attn, "attn_drop", nn.Identity())
         self.proj = attn.proj
-        self.proj_drop = attn.proj_drop
+        self.proj_drop = getattr(attn, "proj_drop", nn.Identity())
         self._runtime_head_policy = None
 
     @staticmethod
@@ -184,7 +184,6 @@ class PolicyAwareSelfAttention(nn.Module):
         rope=None,
         head_policy: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert attn_bias is None
         batch_size, num_tokens, _ = qkv.shape
         dim = self.qkv.in_features
 
@@ -193,7 +192,29 @@ class PolicyAwareSelfAttention(nn.Module):
         q, k, v = [tensor.transpose(1, 2) for tensor in (q, k, v)]
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        attn_kwargs = {}
+        if attn_bias is not None:
+            if not torch.is_tensor(attn_bias):
+                raise ValueError(
+                    f"Unsupported attn_bias type at layer {self.layer_index}: "
+                    f"{type(attn_bias)!r}. Expected a Tensor compatible with "
+                    "torch.nn.functional.scaled_dot_product_attention(attn_mask=...)."
+                )
+            attn_kwargs["attn_mask"] = attn_bias
+        dropout_p = float(getattr(self.attn_drop, "p", 0.0)) if self.training else 0.0
+        try:
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                **attn_kwargs,
+            )
+        except (RuntimeError, TypeError) as exc:
+            raise ValueError(
+                f"Failed to apply scaled_dot_product_attention at layer {self.layer_index}. "
+                f"attn_bias type={type(attn_bias)!r}"
+            ) from exc
         x = x.transpose(1, 2)
 
         active_policy = self._runtime_head_policy if head_policy is None else head_policy
@@ -214,6 +235,8 @@ class PolicyAwareSelfAttention(nn.Module):
         return x
 
     def forward_list(self, x_list: List[torch.Tensor], attn_bias=None, rope_list=None) -> List[torch.Tensor]:
+        if rope_list is None:
+            rope_list = [None] * len(x_list)
         assert len(x_list) == len(rope_list)
         x_flat, shapes, num_tokens = cat_keep_shapes(x_list)
         qkv_flat = self.qkv(x_flat)

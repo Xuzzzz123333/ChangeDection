@@ -614,6 +614,8 @@ class DINOV3Wrapper(nn.Module):
         policy_anneal_epochs=5,
         policy_hidden_dim=256,
         num_prefix_tokens=-1,
+        image_size=256,
+        policy_image_size=0,
         policy_head_weight=1.0,
         policy_block_weight=0.0,
         policy_token_weight=0.0,
@@ -722,6 +724,8 @@ class DINOV3Wrapper(nn.Module):
         self.policy_block_weight = float(policy_block_weight)
         self.policy_token_weight = float(policy_token_weight)
         self.num_prefix_tokens_override = int(num_prefix_tokens)
+        self.image_size = int(image_size)
+        self.policy_image_size = int(policy_image_size)
         self.last_cgla_priors = []
         self.last_dynamic_policy_state = None
         self.lora_rf_probe_ready = False
@@ -757,7 +761,11 @@ class DINOV3Wrapper(nn.Module):
             ),
         )
         self.num_heads = int(self._infer_num_heads())
-        self.num_patch_tokens = (512 // self.patch_size) ** 2
+        self.num_patch_tokens = int(
+            self._infer_initial_num_patch_tokens(
+                self.policy_image_size if self.policy_image_size > 0 else self.image_size
+            )
+        )
 
         for p in self.model.parameters():
             p.requires_grad = False
@@ -802,7 +810,7 @@ class DINOV3Wrapper(nn.Module):
                         embed_dim=self.model.embed_dim,
                         hidden_dim=self.policy_hidden_dim,
                         num_heads=self.num_heads,
-                        num_patch_tokens=self.num_patch_tokens,
+                        num_patch_tokens=max(1, self.num_patch_tokens),
                         use_head_policy=self.use_head_policy,
                         use_block_policy=self.use_block_policy,
                         use_token_policy=self.use_token_policy,
@@ -851,6 +859,14 @@ class DINOV3Wrapper(nn.Module):
             f"Cannot infer num_heads from attention module {type(attn).__name__}; "
             f"available attrs: {sorted(dir(attn))[:40]}"
         )
+
+    def _infer_initial_num_patch_tokens(self, image_size: int) -> int:
+        image_size = int(max(1, image_size))
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size, device=self.device)
+            dummy, _ = self._resize_input(dummy)
+            tokens, _ = self.model.prepare_tokens_with_masks(dummy)
+        return int(tokens.shape[1] - self.num_prefix_tokens)
 
     def inject_dynamic_policy(self):
         if not self.use_dynamic_policy:
@@ -1192,6 +1208,18 @@ class DINOV3Wrapper(nn.Module):
         )
         return torch.cat([prefix_tokens, patch_tokens], dim=1)
 
+    def _maybe_update_num_patch_tokens(self, tokens: torch.Tensor):
+        actual_patch_tokens = int(tokens.shape[1] - self.num_prefix_tokens)
+        if actual_patch_tokens <= 0 or actual_patch_tokens == self.num_patch_tokens:
+            return
+        if self.use_token_policy and self.num_patch_tokens > 0:
+            raise ValueError(
+                "Dynamic token policy was initialized with a different patch-token count. "
+                f"expected={self.num_patch_tokens}, actual={actual_patch_tokens}. "
+                "Set --policy_image_size to match the DINO token grid or disable --use_token_policy."
+            )
+        self.num_patch_tokens = actual_patch_tokens
+
     def _apply_block_policy_to_outputs(self, x_prev_list, x_out_list, block_policy):
         if block_policy is None or self.block_policy_mode == "record_only":
             return x_out_list
@@ -1320,6 +1348,7 @@ class DINOV3Wrapper(nn.Module):
         hw_list = []
         for x in (x1, x2):
             tokens, hw_tuple = self.model.prepare_tokens_with_masks(x)
+            self._maybe_update_num_patch_tokens(tokens)
             x_list.append(tokens)
             hw_list.append(hw_tuple)
 

@@ -118,6 +118,8 @@ class DynamicPolicyUsageMeter:
             token_keep = token_keep.detach().float().cpu().numpy()
             if batch_size == 0:
                 batch_size = int(token_keep.shape[0])
+            if token_keep.ndim >= 3:
+                self.num_patch_tokens = int(token_keep.shape[-1])
             self.token_sum += float(token_keep.sum())
             if self.token_example is None and token_keep.shape[0] > 0:
                 self.token_example = token_keep[0, 0].copy()
