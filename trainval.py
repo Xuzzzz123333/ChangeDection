@@ -507,8 +507,13 @@ class Trainval(object):
             lr=opt.lr * 0.2,
             weight_decay=opt.weight_decay,
         )
+        # Guard against T_max == 0 when num_epochs is tiny (e.g. debug runs
+        # with num_epochs < 10 would otherwise crash with
+        # "ZeroDivisionError: integer division or modulo by zero" on the
+        # next schedular.step(). Keep at least one annealing step.
+        rescheduler_t_max = max(1, int(opt.num_epochs * 0.1))
         self.model.schedular = optim.lr_scheduler.CosineAnnealingLR(
-            self.model.optimizer, int(opt.num_epochs * 0.1), eta_min=1e-7
+            self.model.optimizer, rescheduler_t_max, eta_min=1e-7
         )
         self.optimizer = self.model.optimizer
         self.schedular = self.model.schedular
