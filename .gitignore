@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Training artifacts (keep these machine-local, never push)
+checkpoints/
+logs/
+results/
+*.pth
+*.pt
+*.ckpt
+*.bin
+
+# DINOv3 pretrained weights (downloaded separately per README)
+dinov3/weights/*
+!dinov3/weights/readme.md
+
+# Misc
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.ipynb_checkpoints/
+
+# Backup of the original Windows-worktree .git pointer; do not publish
+.git.orig_winworktree
