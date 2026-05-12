@@ -407,8 +407,22 @@ class Options:
         self.parser.add_argument(
             "--policy_budget_weight",
             type=float,
-            default=0.01,
-            help="maximum weight applied to the dynamic policy budget regularizer",
+            default=0.2,
+            help="maximum weight applied to the dynamic policy budget regularizer "
+                 "(raised from the previous 0.01 default after verifying that "
+                 "the lower-bound budget loss is too weak at 0.01 to hold actual "
+                 "keep ratio near target on SYSU-CD)",
+        )
+        self.parser.add_argument(
+            "--policy_budget_loss_type",
+            type=str,
+            default="lower_bound",
+            choices=["l1", "mse", "lower_bound"],
+            help="shape of the dynamic policy budget regularizer applied to the "
+                 "effective (post-ramp) policy cost. l1=|cost-target|, "
+                 "mse=(cost-target)^2, lower_bound=relu(target-cost)^2 (only "
+                 "penalizes when actual keep drops below target; recommended "
+                 "default for preventing gate collapse)",
         )
         self.parser.add_argument(
             "--policy_warmup_epochs",

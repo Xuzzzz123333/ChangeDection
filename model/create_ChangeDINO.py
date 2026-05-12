@@ -67,6 +67,7 @@ class Model(nn.Module):
             policy_warmup_epochs=opt.policy_warmup_epochs,
             policy_anneal_epochs=opt.policy_anneal_epochs,
             policy_force_keep_during_warmup=opt.policy_force_keep_during_warmup,
+            policy_budget_loss_type=opt.policy_budget_loss_type,
             policy_hidden_dim=opt.policy_hidden_dim,
             num_prefix_tokens=opt.num_prefix_tokens,
             image_size=opt.image_size,
@@ -225,6 +226,7 @@ class Model(nn.Module):
                 print(f"head_topk_ratio = {opt.head_topk_ratio}")
                 print(f"target_compute_ratio = {opt.target_compute_ratio}")
                 print(f"policy_budget_weight = {opt.policy_budget_weight}")
+                print(f"policy_budget_loss_type = {opt.policy_budget_loss_type}")
                 print(f"policy_warmup_epochs = {opt.policy_warmup_epochs}")
                 print(f"policy_anneal_epochs = {opt.policy_anneal_epochs}")
                 print(
@@ -1227,30 +1229,56 @@ class Model(nn.Module):
             budget_loss = None
             target_ratio = self._dynamic_policy_target_ratio(self.current_epoch)
             budget_lambda = self._dynamic_policy_budget_lambda(self.current_epoch)
+            loss_type = str(
+                getattr(self.opt, "policy_budget_loss_type", "lower_bound")
+            )
             if dino is not None and hasattr(dino, "dynamic_policy_budget_loss"):
                 budget_loss = dino.dynamic_policy_budget_loss(
                     target_ratio=target_ratio,
                     head_weight=self.opt.policy_head_weight,
                     block_weight=self.opt.policy_block_weight,
                     token_weight=self.opt.policy_token_weight,
+                    loss_type=loss_type,
                 )
-            policy_cost = (
-                float(self.opt.policy_head_weight)
-                * float(dynamic_state.get("mean_head_keep", 1.0))
-                + float(self.opt.policy_block_weight)
-                * float(dynamic_state.get("mean_block_keep", 1.0))
-                + float(self.opt.policy_token_weight)
-                * float(dynamic_state.get("mean_token_keep", 1.0))
+            head_w = float(self.opt.policy_head_weight)
+            block_w = float(self.opt.policy_block_weight)
+            token_w = float(self.opt.policy_token_weight)
+            # effective cost (what the budget loss actually regularizes)
+            policy_cost_effective = (
+                head_w * float(dynamic_state.get("effective_mean_head_keep", 1.0))
+                + block_w * float(dynamic_state.get("effective_mean_block_keep", 1.0))
+                + token_w * float(dynamic_state.get("effective_mean_token_keep", 1.0))
             )
+            # raw cost (learned policy before the ramp mix) -- log only
+            policy_cost_raw = (
+                head_w * float(dynamic_state.get("raw_mean_head_keep", 1.0))
+                + block_w * float(dynamic_state.get("raw_mean_block_keep", 1.0))
+                + token_w * float(dynamic_state.get("raw_mean_token_keep", 1.0))
+            )
+            policy_cost = policy_cost_effective  # backwards-compat alias
             self.last_aux_losses["dynamic_policy_budget_lambda"] = float(budget_lambda)
+            self.last_aux_losses["dynamic_policy_budget_loss_type"] = loss_type
             self.last_aux_losses["dynamic_policy_target_compute_ratio"] = float(
                 target_ratio
             )
             self.last_aux_losses["target_compute_ratio"] = float(target_ratio)
+            self.last_aux_losses["dynamic_policy_ramp"] = float(
+                dynamic_state.get("policy_ramp", 0.0)
+            )
             self.last_aux_losses["dynamic_policy_cost"] = float(policy_cost)
             self.last_aux_losses["policy_cost"] = float(policy_cost)
+            self.last_aux_losses["dynamic_policy_cost_raw"] = float(policy_cost_raw)
+            self.last_aux_losses["dynamic_policy_cost_effective"] = float(
+                policy_cost_effective
+            )
             self.last_aux_losses["dynamic_policy_mean_head_keep"] = float(
                 dynamic_state.get("mean_head_keep", 1.0)
+            )
+            self.last_aux_losses["dynamic_policy_raw_mean_head_keep"] = float(
+                dynamic_state.get("raw_mean_head_keep", 1.0)
+            )
+            self.last_aux_losses["dynamic_policy_effective_mean_head_keep"] = float(
+                dynamic_state.get("effective_mean_head_keep", 1.0)
             )
             self.last_aux_losses["dynamic_policy_head_active_ratio"] = float(
                 dynamic_state.get("hard_head_active_ratio", 1.0)

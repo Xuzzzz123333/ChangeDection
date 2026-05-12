@@ -613,6 +613,7 @@ class DINOV3Wrapper(nn.Module):
         policy_warmup_epochs=3,
         policy_anneal_epochs=5,
         policy_force_keep_during_warmup=True,
+        policy_budget_loss_type="lower_bound",
         policy_hidden_dim=256,
         num_prefix_tokens=-1,
         image_size=256,
@@ -721,6 +722,12 @@ class DINOV3Wrapper(nn.Module):
         self.policy_warmup_epochs = int(max(0, policy_warmup_epochs))
         self.policy_anneal_epochs = int(max(0, policy_anneal_epochs))
         self.policy_force_keep_during_warmup = bool(policy_force_keep_during_warmup)
+        if str(policy_budget_loss_type) not in {"l1", "mse", "lower_bound"}:
+            raise ValueError(
+                "policy_budget_loss_type must be one of {'l1', 'mse', 'lower_bound'}, "
+                f"got {policy_budget_loss_type!r}"
+            )
+        self.policy_budget_loss_type = str(policy_budget_loss_type)
         # tracks the outer training epoch; written by create_ChangeDINO.Model
         # before every forward/inference via _sync_dynamic_policy_epoch.
         self.current_epoch = 0
@@ -1159,6 +1166,29 @@ class DINOV3Wrapper(nn.Module):
             "num_patch_tokens": int(self.num_patch_tokens),
         }
 
+    def _compute_policy_ramp(self) -> float:
+        """Linear activation ramp for the learned dynamic policy.
+
+          0 while current_epoch < policy_warmup_epochs   (warmup / bypass)
+          (k+1)/N while in anneal k-th step              (N = policy_anneal_epochs)
+          1 once anneal has completed
+
+        The ramp k/N schedule is aligned with _dynamic_policy_target_ratio so
+        the (effective) gate, the budget loss and the anneal target all move
+        together.
+        """
+        current_epoch = int(getattr(self, "current_epoch", 0))
+        warmup_epochs = int(self.policy_warmup_epochs)
+        anneal_epochs = int(self.policy_anneal_epochs)
+        if current_epoch < warmup_epochs:
+            return 0.0
+        if anneal_epochs <= 0:
+            return 1.0
+        anneal_index = current_epoch - warmup_epochs
+        if anneal_index < anneal_epochs:
+            return float(anneal_index + 1) / float(anneal_epochs)
+        return 1.0
+
     def dynamic_policy_debug_state(self):
         return self.last_dynamic_policy_state
 
@@ -1168,7 +1198,18 @@ class DINOV3Wrapper(nn.Module):
         head_weight: float | None = None,
         block_weight: float | None = None,
         token_weight: float | None = None,
+        loss_type: str | None = None,
     ):
+        """Compute the dynamic policy budget regularizer on the EFFECTIVE
+        (post-ramp) policy cost. The raw learned policy is intentionally not
+        regularized here; only the gate that actually shapes the forward
+        attention counts toward the budget.
+
+        loss_type controls the penalty shape. Defaults to self.policy_budget_loss_type.
+            * l1         -> |policy_cost - target|
+            * mse        -> (policy_cost - target)^2
+            * lower_bound-> relu(target - policy_cost)^2  (only penalizes cost < target)
+        """
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None:
             return None
@@ -1176,11 +1217,25 @@ class DINOV3Wrapper(nn.Module):
         block_weight = self.policy_block_weight if block_weight is None else float(block_weight)
         token_weight = self.policy_token_weight if token_weight is None else float(token_weight)
         policy_cost = (
-            head_weight * state["mean_head_keep"]
-            + block_weight * state["mean_block_keep"]
-            + token_weight * state["mean_token_keep"]
+            head_weight * state["effective_mean_head_keep"]
+            + block_weight * state["effective_mean_block_keep"]
+            + token_weight * state["effective_mean_token_keep"]
         )
-        return torch.abs(policy_cost - float(target_ratio))
+        loss_type = str(loss_type or self.policy_budget_loss_type)
+        target_tensor = policy_cost.new_tensor(float(target_ratio))
+        diff = policy_cost - target_tensor
+        if loss_type == "l1":
+            return torch.abs(diff)
+        if loss_type == "mse":
+            return diff * diff
+        if loss_type == "lower_bound":
+            # Only penalize when actual keep is BELOW the target lower bound.
+            under = torch.clamp(target_tensor - policy_cost, min=0.0)
+            return under * under
+        raise ValueError(
+            f"Unsupported policy_budget_loss_type: {loss_type!r}; "
+            "expected one of {'l1', 'mse', 'lower_bound'}"
+        )
 
     def _policy_from_logits(self, logits, kind: str):
         if logits is None:
@@ -1239,56 +1294,127 @@ class DINOV3Wrapper(nn.Module):
     def _collect_dynamic_policy_state(
         self,
         head_prob_list,
-        head_keep_list,
+        head_keep_raw_list,
+        head_keep_effective_list,
         block_prob_list,
-        block_keep_list,
+        block_keep_raw_list,
+        block_keep_effective_list,
         token_prob_list,
-        token_keep_list,
+        token_keep_raw_list,
+        token_keep_effective_list,
+        policy_ramp: float,
         device,
     ):
-        head_prob = torch.stack(head_prob_list, dim=1) if head_prob_list else None
-        head_keep = torch.stack(head_keep_list, dim=1) if head_keep_list else None
-        block_prob = torch.stack(block_prob_list, dim=1) if block_prob_list else None
-        block_keep = torch.stack(block_keep_list, dim=1) if block_keep_list else None
-        token_prob = torch.stack(token_prob_list, dim=1) if token_prob_list else None
-        token_keep = torch.stack(token_keep_list, dim=1) if token_keep_list else None
+        """Aggregate per-block policy tensors into the single per-forward
+        state dict that (a) feeds the dynamic_policy_budget_loss computation
+        and (b) is read by the per-epoch usage meter in trainval.py.
 
-        if head_keep is not None:
-            reference = head_keep
-            mean_head_keep = head_keep.mean()
-            hard_head_active_ratio = (head_keep > self.policy_threshold).float().mean()
-            per_layer_head_keep = head_keep.mean(dim=(0, 2))
-            per_layer_head_active = (head_keep > self.policy_threshold).float().mean(dim=(0, 2))
-            head_heatmap = head_keep.mean(dim=0)
-            batch_size = int(head_keep.shape[0])
+        Two parallel histories are now tracked:
+          * raw_*        -> the sampled learned policy before activation ramp
+          * effective_*  -> (1 - ramp) * ones + ramp * raw_*  (what actually
+                             shapes attention and what the budget loss sees)
+
+        For backwards compatibility ``head_keep`` / ``mean_head_keep`` still
+        refer to the effective tensors (what the meter and downstream
+        visualizations want); raw copies are exposed as ``*_raw`` fields.
+        """
+        head_prob = torch.stack(head_prob_list, dim=1) if head_prob_list else None
+        head_keep_raw = (
+            torch.stack(head_keep_raw_list, dim=1) if head_keep_raw_list else None
+        )
+        head_keep_effective = (
+            torch.stack(head_keep_effective_list, dim=1)
+            if head_keep_effective_list
+            else None
+        )
+        block_prob = torch.stack(block_prob_list, dim=1) if block_prob_list else None
+        block_keep_raw = (
+            torch.stack(block_keep_raw_list, dim=1) if block_keep_raw_list else None
+        )
+        block_keep_effective = (
+            torch.stack(block_keep_effective_list, dim=1)
+            if block_keep_effective_list
+            else None
+        )
+        token_prob = torch.stack(token_prob_list, dim=1) if token_prob_list else None
+        token_keep_raw = (
+            torch.stack(token_keep_raw_list, dim=1) if token_keep_raw_list else None
+        )
+        token_keep_effective = (
+            torch.stack(token_keep_effective_list, dim=1)
+            if token_keep_effective_list
+            else None
+        )
+
+        # -- head (effective = what's actually used in forward) --
+        if head_keep_effective is not None:
+            reference = head_keep_effective
+            effective_mean_head_keep = head_keep_effective.mean()
+            hard_head_active_ratio = (
+                head_keep_effective > self.policy_threshold
+            ).float().mean()
+            per_layer_head_keep = head_keep_effective.mean(dim=(0, 2))
+            per_layer_head_active = (
+                head_keep_effective > self.policy_threshold
+            ).float().mean(dim=(0, 2))
+            head_heatmap = head_keep_effective.mean(dim=0)
+            batch_size = int(head_keep_effective.shape[0])
         else:
             reference = None
-            mean_head_keep = torch.ones((), device=device)
+            effective_mean_head_keep = torch.ones((), device=device)
             hard_head_active_ratio = torch.ones((), device=device)
             per_layer_head_keep = torch.ones(self.n_layers, device=device)
             per_layer_head_active = torch.ones(self.n_layers, device=device)
             head_heatmap = torch.ones(self.n_layers, self.num_heads, device=device)
-            batch_size = int(block_keep.shape[0]) if block_keep is not None else 0
+            batch_size = (
+                int(block_keep_effective.shape[0])
+                if block_keep_effective is not None
+                else 0
+            )
 
-        if block_keep is not None:
-            mean_block_keep = block_keep.mean()
-            per_layer_block_keep = block_keep.mean(dim=0).squeeze(-1)
+        raw_mean_head_keep = (
+            head_keep_raw.mean()
+            if head_keep_raw is not None
+            else torch.ones((), device=device)
+        )
+
+        # -- block --
+        if block_keep_effective is not None:
+            effective_mean_block_keep = block_keep_effective.mean()
+            per_layer_block_keep = block_keep_effective.mean(dim=0).squeeze(-1)
             if reference is None:
-                reference = block_keep
+                reference = block_keep_effective
         else:
-            mean_block_keep = torch.ones((), device=device)
+            effective_mean_block_keep = torch.ones((), device=device)
             per_layer_block_keep = torch.ones(self.n_layers, device=device)
 
-        if token_keep is not None:
-            mean_token_keep = token_keep.mean()
-            token_example = token_keep[0, 0] if token_keep.shape[0] > 0 else None
+        raw_mean_block_keep = (
+            block_keep_raw.mean()
+            if block_keep_raw is not None
+            else torch.ones((), device=device)
+        )
+
+        # -- token --
+        if token_keep_effective is not None:
+            effective_mean_token_keep = token_keep_effective.mean()
+            token_example = (
+                token_keep_effective[0, 0]
+                if token_keep_effective.shape[0] > 0
+                else None
+            )
             if reference is None:
-                reference = token_keep
+                reference = token_keep_effective
             if batch_size <= 0:
-                batch_size = int(token_keep.shape[0])
+                batch_size = int(token_keep_effective.shape[0])
         else:
-            mean_token_keep = torch.ones((), device=device)
+            effective_mean_token_keep = torch.ones((), device=device)
             token_example = None
+
+        raw_mean_token_keep = (
+            token_keep_raw.mean()
+            if token_keep_raw is not None
+            else torch.ones((), device=device)
+        )
 
         if reference is None:
             policy_min = torch.ones((), device=device)
@@ -1299,26 +1425,57 @@ class DINOV3Wrapper(nn.Module):
             policy_max = reference.max()
             policy_std = reference.std(unbiased=False)
 
+        # -- policy cost (differentiable, kept as tensors for the budget loss) --
+        head_w = float(self.policy_head_weight)
+        block_w = float(self.policy_block_weight)
+        token_w = float(self.policy_token_weight)
+        policy_cost_effective = (
+            head_w * effective_mean_head_keep
+            + block_w * effective_mean_block_keep
+            + token_w * effective_mean_token_keep
+        )
+        policy_cost_raw = (
+            head_w * raw_mean_head_keep
+            + block_w * raw_mean_block_keep
+            + token_w * raw_mean_token_keep
+        )
+
         self.last_dynamic_policy_state = {
             "batch_size": torch.tensor(float(batch_size), device=device),
             "head_prob": head_prob,
-            "head_keep": head_keep,
+            # Backwards-compat aliases: head_keep / mean_head_keep == effective
+            "head_keep": head_keep_effective,
+            "head_keep_raw": head_keep_raw,
+            "head_keep_effective": head_keep_effective,
             "block_prob": block_prob,
-            "block_keep": block_keep,
+            "block_keep": block_keep_effective,
+            "block_keep_raw": block_keep_raw,
+            "block_keep_effective": block_keep_effective,
             "token_prob": token_prob,
-            "token_keep": token_keep,
-            "mean_head_keep": mean_head_keep,
+            "token_keep": token_keep_effective,
+            "token_keep_raw": token_keep_raw,
+            "token_keep_effective": token_keep_effective,
+            "mean_head_keep": effective_mean_head_keep,
+            "raw_mean_head_keep": raw_mean_head_keep,
+            "effective_mean_head_keep": effective_mean_head_keep,
             "hard_head_active_ratio": hard_head_active_ratio,
             "per_layer_head_keep": per_layer_head_keep,
             "per_layer_head_active_ratio": per_layer_head_active,
             "head_heatmap": head_heatmap,
-            "mean_block_keep": mean_block_keep,
+            "mean_block_keep": effective_mean_block_keep,
+            "raw_mean_block_keep": raw_mean_block_keep,
+            "effective_mean_block_keep": effective_mean_block_keep,
             "per_layer_block_keep": per_layer_block_keep,
-            "mean_token_keep": mean_token_keep,
+            "mean_token_keep": effective_mean_token_keep,
+            "raw_mean_token_keep": raw_mean_token_keep,
+            "effective_mean_token_keep": effective_mean_token_keep,
             "policy_min": policy_min,
             "policy_max": policy_max,
             "policy_std": policy_std,
             "token_example": token_example,
+            "policy_ramp": torch.tensor(float(policy_ramp), device=device),
+            "policy_cost_raw": policy_cost_raw,
+            "policy_cost_effective": policy_cost_effective,
         }
         return self.last_dynamic_policy_state
 
@@ -1359,17 +1516,28 @@ class DINOV3Wrapper(nn.Module):
 
         outputs = []
         head_prob_list = []
-        head_keep_list = []
+        head_keep_raw_list = []
+        head_keep_effective_list = []
         block_prob_list = []
-        block_keep_list = []
+        block_keep_raw_list = []
+        block_keep_effective_list = []
         token_prob_list = []
-        token_keep_list = []
+        token_keep_raw_list = []
+        token_keep_effective_list = []
         total_block_len = len(self.model.blocks)
         blocks_to_take = (
             range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         )
         blocks_to_take = list(blocks_to_take)
         blocks_to_take_set = set(blocks_to_take)
+
+        # Policy activation ramp (scalar, constant across this forward).
+        #   ramp = 0 during warmup            -> effective = ones (bypass)
+        #   ramp \in (0,1] during anneal      -> effective = (1-r)*ones + r*learned
+        #   ramp = 1 after anneal              -> effective = learned
+        # This replaces the previous step change from force_keep=1 to
+        # learned, which let the gate collapse the moment anneal started.
+        policy_ramp = self._compute_policy_ramp() if self.use_dynamic_policy else 0.0
         for block_index, blk in enumerate(self.model.blocks):
             if self.model.rope_embed is not None:
                 rope_sincos = [
@@ -1380,143 +1548,154 @@ class DINOV3Wrapper(nn.Module):
                 rope_sincos = [None, None]
 
             if self.use_dynamic_policy:
-                # ---- warmup bypass ----
-                # During policy_warmup_epochs (and only when
-                # policy_force_keep_during_warmup is True), we must *not* let the
-                # learned policy shape attention at all, otherwise segmentation
-                # loss will silently update the policy net (init bias = logit(0.98)
-                # starts at ones but collapses within one epoch) even though
-                # budget_lambda == 0.
-                #
-                # Bypass semantics:
-                #   * policy_nets[block_index] is NOT called  -> zero gradient,
-                #     the policy net stays at its initialization and provides a
-                #     clean starting point for the anneal stage.
-                #   * set_runtime_head_policy is NOT called    -> attention runs
-                #     exactly like the baseline DINO block (equivalent to
-                #     all-ones head gate, no multiplicative damping).
-                #   * block / token outputs are left untouched.
-                #   * logging meters still receive ones tensors so
-                #     mean_head_keep is reported as 1.0 during warmup.
-                force_keep = bool(
-                    self.policy_force_keep_during_warmup
-                    and int(getattr(self, "current_epoch", 0))
-                    < int(self.policy_warmup_epochs)
+                # When ramp == 0 AND policy_force_keep_during_warmup is True,
+                # skip the policy net entirely to save compute. Otherwise we
+                # call it normally; gradients through raw will be scaled by
+                # ramp in the (1-r)*ones + r*raw mixing below.
+                force_keep_shortcut = bool(
+                    self.policy_force_keep_during_warmup and policy_ramp == 0.0
                 )
                 batch_size = int(x_list[0].shape[0])
                 device = x_list[0].device
                 dtype = x_list[0].dtype
 
-                if force_keep:
-                    head_keep = torch.ones(
-                        batch_size,
-                        self.num_heads,
-                        device=device,
-                        dtype=dtype,
+                if force_keep_shortcut:
+                    raw_head_keep = torch.ones(
+                        batch_size, self.num_heads, device=device, dtype=dtype,
                     )
-                    head_prob = head_keep
-                    block_keep = torch.ones(
-                        batch_size,
-                        1,
-                        device=device,
-                        dtype=dtype,
+                    raw_head_prob = raw_head_keep
+                    raw_block_keep = torch.ones(
+                        batch_size, 1, device=device, dtype=dtype,
                     )
-                    block_prob = block_keep
-                    token_keep = None
-                    token_prob = None
+                    raw_block_prob = raw_block_keep
+                    raw_token_keep = None
+                    raw_token_prob = None
                     if self.use_token_policy:
-                        token_keep = torch.ones(
+                        raw_token_keep = torch.ones(
                             batch_size,
                             x_list[0].shape[1] - self.num_prefix_tokens,
                             device=device,
                             dtype=dtype,
                         )
-                        token_prob = token_keep
-                    # Run block forward without any runtime head policy so the
-                    # baseline path is active (PolicyAwareSelfAttention with
-                    # active_policy=None is a no-op).
-                    x_list = blk(x_list, rope_sincos)
+                        raw_token_prob = raw_token_keep
                 else:
                     policy_outputs = self.policy_nets[block_index](
                         x_list[0],
                         x_list[1],
                         num_prefix_tokens=self.num_prefix_tokens,
                     )
-                    head_prob, head_keep = self._policy_from_logits(
+                    raw_head_prob, raw_head_keep = self._policy_from_logits(
                         policy_outputs["head_logits"], kind="head"
                     )
-                    if head_keep is None:
-                        head_keep = torch.ones(
-                            batch_size,
-                            self.num_heads,
-                            device=device,
-                            dtype=dtype,
+                    if raw_head_keep is None:
+                        raw_head_keep = torch.ones(
+                            batch_size, self.num_heads, device=device, dtype=dtype,
                         )
-                    if head_prob is None:
-                        head_prob = head_keep
+                    if raw_head_prob is None:
+                        raw_head_prob = raw_head_keep
 
-                    block_prob, block_keep = self._policy_from_logits(
+                    raw_block_prob, raw_block_keep = self._policy_from_logits(
                         policy_outputs["block_logits"], kind="block"
                     )
-                    if block_keep is None:
-                        block_keep = torch.ones(
-                            batch_size,
-                            1,
-                            device=device,
-                            dtype=dtype,
+                    if raw_block_keep is None:
+                        raw_block_keep = torch.ones(
+                            batch_size, 1, device=device, dtype=dtype,
                         )
-                    if block_prob is None:
-                        block_prob = block_keep
+                    if raw_block_prob is None:
+                        raw_block_prob = raw_block_keep
 
-                    token_prob, token_keep = self._policy_from_logits(
+                    raw_token_prob, raw_token_keep = self._policy_from_logits(
                         policy_outputs["token_logits"], kind="token"
                     )
-                    if self.use_token_policy and token_keep is None:
-                        token_keep = torch.ones(
+                    if self.use_token_policy and raw_token_keep is None:
+                        raw_token_keep = torch.ones(
                             batch_size,
                             x_list[0].shape[1] - self.num_prefix_tokens,
                             device=device,
                             dtype=dtype,
                         )
-                        token_prob = token_keep
+                        raw_token_prob = raw_token_keep
 
-                    x_block_in = x_list
-                    if self.use_token_policy:
-                        x_block_in = [
-                            self._apply_token_policy_to_tokens(x_list[0], token_keep),
-                            self._apply_token_policy_to_tokens(x_list[1], token_keep),
-                        ]
-
-                    core_block = self._unwrap_transformer_block(blk)
-                    if self.use_head_policy and hasattr(
-                        core_block.attn, "set_runtime_head_policy"
-                    ):
-                        core_block.attn.set_runtime_head_policy(head_keep)
-                    try:
-                        x_block_out = blk(x_block_in, rope_sincos)
-                    finally:
-                        if hasattr(core_block.attn, "clear_runtime_head_policy"):
-                            core_block.attn.clear_runtime_head_policy()
-
-                    effective_block_policy = None
-                    if self.use_block_policy and self.block_policy_mode in {
-                        "soft_residual",
-                        "hard_skip",
-                    }:
-                        effective_block_policy = block_keep
-                    x_list = self._apply_block_policy_to_outputs(
-                        x_block_in,
-                        x_block_out,
-                        effective_block_policy,
+                # ---- ramp mix: effective = (1 - ramp) * ones + ramp * raw ----
+                if policy_ramp >= 1.0:
+                    eff_head_keep = raw_head_keep
+                    eff_block_keep = raw_block_keep
+                    eff_token_keep = raw_token_keep
+                elif policy_ramp <= 0.0:
+                    eff_head_keep = torch.ones_like(raw_head_keep)
+                    eff_block_keep = torch.ones_like(raw_block_keep)
+                    eff_token_keep = (
+                        torch.ones_like(raw_token_keep)
+                        if raw_token_keep is not None
+                        else None
                     )
+                else:
+                    eff_head_keep = (
+                        (1.0 - policy_ramp) * torch.ones_like(raw_head_keep)
+                        + policy_ramp * raw_head_keep
+                    )
+                    eff_block_keep = (
+                        (1.0 - policy_ramp) * torch.ones_like(raw_block_keep)
+                        + policy_ramp * raw_block_keep
+                    )
+                    if raw_token_keep is not None:
+                        eff_token_keep = (
+                            (1.0 - policy_ramp) * torch.ones_like(raw_token_keep)
+                            + policy_ramp * raw_token_keep
+                        )
+                    else:
+                        eff_token_keep = None
 
-                head_prob_list.append(head_prob)
-                head_keep_list.append(head_keep)
-                block_prob_list.append(block_prob)
-                block_keep_list.append(block_keep)
-                if self.use_token_policy:
-                    token_prob_list.append(token_prob)
-                    token_keep_list.append(token_keep)
+                # ---- apply effective gates ----
+                x_block_in = x_list
+                if self.use_token_policy and eff_token_keep is not None:
+                    x_block_in = [
+                        self._apply_token_policy_to_tokens(x_list[0], eff_token_keep),
+                        self._apply_token_policy_to_tokens(x_list[1], eff_token_keep),
+                    ]
+
+                core_block = self._unwrap_transformer_block(blk)
+                runtime_gate_attached = False
+                # When ramp == 0 the effective gate is all-ones so we can skip
+                # the per-head multiplication entirely (baseline attention).
+                if (
+                    self.use_head_policy
+                    and policy_ramp > 0.0
+                    and hasattr(core_block.attn, "set_runtime_head_policy")
+                ):
+                    core_block.attn.set_runtime_head_policy(eff_head_keep)
+                    runtime_gate_attached = True
+                try:
+                    x_block_out = blk(x_block_in, rope_sincos)
+                finally:
+                    if runtime_gate_attached and hasattr(
+                        core_block.attn, "clear_runtime_head_policy"
+                    ):
+                        core_block.attn.clear_runtime_head_policy()
+
+                effective_block_policy = None
+                if (
+                    self.use_block_policy
+                    and policy_ramp > 0.0
+                    and self.block_policy_mode in {"soft_residual", "hard_skip"}
+                ):
+                    effective_block_policy = eff_block_keep
+                x_list = self._apply_block_policy_to_outputs(
+                    x_block_in,
+                    x_block_out,
+                    effective_block_policy,
+                )
+
+                head_prob_list.append(raw_head_prob)
+                head_keep_raw_list.append(raw_head_keep)
+                head_keep_effective_list.append(eff_head_keep)
+                block_prob_list.append(raw_block_prob)
+                block_keep_raw_list.append(raw_block_keep)
+                block_keep_effective_list.append(eff_block_keep)
+                if self.use_token_policy and raw_token_keep is not None:
+                    token_prob_list.append(raw_token_prob)
+                    token_keep_raw_list.append(raw_token_keep)
+                    token_keep_effective_list.append(eff_token_keep)
             else:
                 x_list = blk(x_list, rope_sincos)
             if block_index in blocks_to_take_set:
@@ -1533,11 +1712,15 @@ class DINOV3Wrapper(nn.Module):
         if self.use_dynamic_policy:
             self._collect_dynamic_policy_state(
                 head_prob_list=head_prob_list,
-                head_keep_list=head_keep_list,
+                head_keep_raw_list=head_keep_raw_list,
+                head_keep_effective_list=head_keep_effective_list,
                 block_prob_list=block_prob_list,
-                block_keep_list=block_keep_list,
+                block_keep_raw_list=block_keep_raw_list,
+                block_keep_effective_list=block_keep_effective_list,
                 token_prob_list=token_prob_list,
-                token_keep_list=token_keep_list,
+                token_keep_raw_list=token_keep_raw_list,
+                token_keep_effective_list=token_keep_effective_list,
+                policy_ramp=policy_ramp,
                 device=x_list[0].device,
             )
         else:

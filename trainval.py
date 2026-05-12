@@ -737,6 +737,12 @@ class Trainval(object):
             "target_compute_ratio",
             "policy_cost",
             "policy_budget_loss",
+            "policy_budget_loss_type",
+            "policy_ramp",
+            "raw_mean_head_keep",
+            "effective_mean_head_keep",
+            "policy_cost_raw",
+            "policy_cost_effective",
             "policy_min",
             "policy_max",
             "policy_std",
@@ -752,31 +758,61 @@ class Trainval(object):
     def _record_policy_usage(self, epoch, split, summary, aux_stats):
         if not self.opt.is_main_process or not getattr(self.opt, "use_dynamic_policy", False):
             return
-        policy_cost = (
-            float(getattr(self.opt, "policy_head_weight", 1.0))
-            * float(summary.get("mean_head_keep", 1.0))
-            + float(getattr(self.opt, "policy_block_weight", 0.0))
-            * float(summary.get("mean_block_keep", 1.0))
-            + float(getattr(self.opt, "policy_token_weight", 0.0))
-            * float(summary.get("mean_token_keep", 1.0))
+        head_w = float(getattr(self.opt, "policy_head_weight", 1.0))
+        block_w = float(getattr(self.opt, "policy_block_weight", 0.0))
+        token_w = float(getattr(self.opt, "policy_token_weight", 0.0))
+        # mean_head_keep from the meter is the EFFECTIVE value (what shaped
+        # attention this epoch). raw_* comes from the last Model.forward state
+        # via aux_stats (scalar; not meter-averaged, but a close proxy).
+        mean_head_keep = float(summary.get("mean_head_keep", 1.0))
+        mean_block_keep = float(summary.get("mean_block_keep", 1.0))
+        mean_token_keep = float(summary.get("mean_token_keep", 1.0))
+        policy_cost_effective = (
+            head_w * mean_head_keep + block_w * mean_block_keep + token_w * mean_token_keep
         )
+        # aux_stats is stale for val (Model.forward is not called during
+        # inference); we report the most-recent train-time raw values so the
+        # CSV "raw_*" column is still populated for eyeballing drift.
+        raw_mean_head_keep = float(
+            aux_stats.get("dynamic_policy_raw_mean_head_keep", mean_head_keep)
+        )
+        policy_cost_raw = float(
+            aux_stats.get("dynamic_policy_cost_raw", policy_cost_effective)
+        )
+        target_ratio = float(
+            aux_stats.get("dynamic_policy_target_compute_ratio", 1.0)
+        )
+        loss_type = str(
+            getattr(self.opt, "policy_budget_loss_type", "lower_bound")
+        )
+        # Derive budget_loss from the *effective* cost so val rows reflect the
+        # val-time gate (the meter) and not a stale train-time tensor.
+        diff = policy_cost_effective - target_ratio
+        if loss_type == "l1":
+            budget_loss_val = abs(diff)
+        elif loss_type == "mse":
+            budget_loss_val = diff * diff
+        elif loss_type == "lower_bound":
+            under = max(target_ratio - policy_cost_effective, 0.0)
+            budget_loss_val = under * under
+        else:
+            budget_loss_val = 0.0
         row = {
             "epoch": int(epoch),
             "split": str(split),
-            "mean_head_keep": float(summary.get("mean_head_keep", 1.0)),
+            "mean_head_keep": mean_head_keep,
             "head_active_ratio": float(summary.get("head_active_ratio", 1.0)),
-            "mean_block_keep": float(summary.get("mean_block_keep", 1.0)),
-            "mean_token_keep": float(summary.get("mean_token_keep", 1.0)),
-            "target_compute_ratio": float(
-                aux_stats.get("dynamic_policy_target_compute_ratio", 1.0)
-            ),
-            "policy_cost": float(policy_cost),
-            "policy_budget_loss": float(
-                abs(
-                    policy_cost
-                    - float(aux_stats.get("dynamic_policy_target_compute_ratio", 1.0))
-                )
-            ),
+            "mean_block_keep": mean_block_keep,
+            "mean_token_keep": mean_token_keep,
+            "target_compute_ratio": target_ratio,
+            "policy_cost": policy_cost_effective,  # alias for backward compat
+            "policy_budget_loss": float(budget_loss_val),
+            "policy_budget_loss_type": loss_type,
+            "policy_ramp": float(aux_stats.get("dynamic_policy_ramp", 0.0)),
+            "raw_mean_head_keep": raw_mean_head_keep,
+            "effective_mean_head_keep": mean_head_keep,
+            "policy_cost_raw": policy_cost_raw,
+            "policy_cost_effective": policy_cost_effective,
             "policy_min": float(summary.get("policy_min", 1.0)),
             "policy_max": float(summary.get("policy_max", 1.0)),
             "policy_std": float(summary.get("policy_std", 0.0)),

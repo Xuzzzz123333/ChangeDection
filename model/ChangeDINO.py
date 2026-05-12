@@ -226,6 +226,9 @@ class Encoder(nn.Module):
             policy_force_keep_during_warmup=kwargs.get(
                 "policy_force_keep_during_warmup", True
             ),
+            policy_budget_loss_type=kwargs.get(
+                "policy_budget_loss_type", "lower_bound"
+            ),
             policy_hidden_dim=kwargs.get("policy_hidden_dim", 256),
             num_prefix_tokens=kwargs.get("num_prefix_tokens", -1),
             policy_head_weight=kwargs.get("policy_head_weight", 1.0),
