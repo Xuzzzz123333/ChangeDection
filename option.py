@@ -407,11 +407,11 @@ class Options:
         self.parser.add_argument(
             "--policy_budget_weight",
             type=float,
-            default=0.2,
-            help="maximum weight applied to the dynamic policy budget regularizer "
-                 "(raised from the previous 0.01 default after verifying that "
-                 "the lower-bound budget loss is too weak at 0.01 to hold actual "
-                 "keep ratio near target on SYSU-CD)",
+            default=0.5,
+            help="maximum weight applied to the dynamic policy budget regularizer. "
+                 "lower_bound (default loss type) is squared so its magnitude is "
+                 "small; 0.5 is the minimum weight that meaningfully counter-acts "
+                 "the segmentation-loss attractor on SYSU-CD.",
         )
         self.parser.add_argument(
             "--policy_budget_loss_type",
@@ -423,6 +423,28 @@ class Options:
                  "mse=(cost-target)^2, lower_bound=relu(target-cost)^2 (only "
                  "penalizes when actual keep drops below target; recommended "
                  "default for preventing gate collapse)",
+        )
+        self.parser.add_argument(
+            "--policy_budget_granularity",
+            type=str,
+            default="per_layer",
+            choices=["global", "per_layer"],
+            help="granularity of the dynamic policy budget regularizer. 'global' "
+                 "penalizes deviation of the batch/layer-averaged cost from target "
+                 "(cheap but degenerate: late layers can die as long as early "
+                 "layers compensate). 'per_layer' (default) averages the "
+                 "per-layer mean keep loss, which prevents any single layer from "
+                 "collapsing below target.",
+        )
+        self.parser.add_argument(
+            "--policy_min_keep",
+            type=float,
+            default=0.0,
+            help="hard lower bound applied to the sampled policy before the ramp "
+                 "mix. gate = policy_min_keep + (1 - policy_min_keep) * sample. "
+                 "0.0 disables it (default; preserves original AdaViT behavior); "
+                 "values in [0.3, 0.7] act as a safety net against sigmoid "
+                 "saturation and late-layer gate death.",
         )
         self.parser.add_argument(
             "--policy_warmup_epochs",

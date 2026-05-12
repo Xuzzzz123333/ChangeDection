@@ -614,6 +614,8 @@ class DINOV3Wrapper(nn.Module):
         policy_anneal_epochs=5,
         policy_force_keep_during_warmup=True,
         policy_budget_loss_type="lower_bound",
+        policy_budget_granularity="per_layer",
+        policy_min_keep=0.0,
         policy_hidden_dim=256,
         num_prefix_tokens=-1,
         image_size=256,
@@ -728,6 +730,18 @@ class DINOV3Wrapper(nn.Module):
                 f"got {policy_budget_loss_type!r}"
             )
         self.policy_budget_loss_type = str(policy_budget_loss_type)
+        if str(policy_budget_granularity) not in {"global", "per_layer"}:
+            raise ValueError(
+                "policy_budget_granularity must be one of {'global', 'per_layer'}, "
+                f"got {policy_budget_granularity!r}"
+            )
+        self.policy_budget_granularity = str(policy_budget_granularity)
+        self.policy_min_keep = float(policy_min_keep)
+        if not (0.0 <= self.policy_min_keep < 1.0):
+            raise ValueError(
+                "policy_min_keep must be in [0.0, 1.0); "
+                f"got {self.policy_min_keep!r}"
+            )
         # tracks the outer training epoch; written by create_ChangeDINO.Model
         # before every forward/inference via _sync_dynamic_policy_epoch.
         self.current_epoch = 0
@@ -1199,6 +1213,7 @@ class DINOV3Wrapper(nn.Module):
         block_weight: float | None = None,
         token_weight: float | None = None,
         loss_type: str | None = None,
+        granularity: str | None = None,
     ):
         """Compute the dynamic policy budget regularizer on the EFFECTIVE
         (post-ramp) policy cost. The raw learned policy is intentionally not
@@ -1209,6 +1224,12 @@ class DINOV3Wrapper(nn.Module):
             * l1         -> |policy_cost - target|
             * mse        -> (policy_cost - target)^2
             * lower_bound-> relu(target - policy_cost)^2  (only penalizes cost < target)
+
+        granularity controls the aggregation.
+            * global    -> single scalar: loss(mean_over_layers(mean_head_keep))
+            * per_layer -> mean over layers of loss(per_layer_mean_head_keep);
+                           prevents late layers from collapsing while early
+                           layers compensate, which the global mean cannot detect
         """
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None:
@@ -1216,25 +1237,65 @@ class DINOV3Wrapper(nn.Module):
         head_weight = self.policy_head_weight if head_weight is None else float(head_weight)
         block_weight = self.policy_block_weight if block_weight is None else float(block_weight)
         token_weight = self.policy_token_weight if token_weight is None else float(token_weight)
-        policy_cost = (
-            head_weight * state["effective_mean_head_keep"]
-            + block_weight * state["effective_mean_block_keep"]
-            + token_weight * state["effective_mean_token_keep"]
-        )
         loss_type = str(loss_type or self.policy_budget_loss_type)
-        target_tensor = policy_cost.new_tensor(float(target_ratio))
-        diff = policy_cost - target_tensor
-        if loss_type == "l1":
-            return torch.abs(diff)
-        if loss_type == "mse":
-            return diff * diff
-        if loss_type == "lower_bound":
-            # Only penalize when actual keep is BELOW the target lower bound.
-            under = torch.clamp(target_tensor - policy_cost, min=0.0)
-            return under * under
+        granularity = str(granularity or self.policy_budget_granularity)
+
+        def shape_loss(cost, target):
+            diff = cost - target
+            if loss_type == "l1":
+                return torch.abs(diff)
+            if loss_type == "mse":
+                return diff * diff
+            if loss_type == "lower_bound":
+                under = torch.clamp(target - cost, min=0.0)
+                return under * under
+            raise ValueError(
+                f"Unsupported policy_budget_loss_type: {loss_type!r}; "
+                "expected one of {'l1', 'mse', 'lower_bound'}"
+            )
+
+        if granularity == "global":
+            policy_cost = (
+                head_weight * state["effective_mean_head_keep"]
+                + block_weight * state["effective_mean_block_keep"]
+                + token_weight * state["effective_mean_token_keep"]
+            )
+            target_tensor = policy_cost.new_tensor(float(target_ratio))
+            return shape_loss(policy_cost, target_tensor)
+
+        if granularity == "per_layer":
+            # Per-layer cost tensor of shape [num_layers]. The head dimension
+            # is averaged per layer (i.e. policy_cost_layer_l =
+            # head_weight * mean_over_heads(head_keep[:, l, :]) + ...).
+            # We then apply shape_loss per-layer and average.
+            per_layer_components = []
+            head_keep_eff = state.get("head_keep_effective")
+            block_keep_eff = state.get("block_keep_effective")
+            token_keep_eff = state.get("token_keep_effective")
+            if head_keep_eff is not None and head_weight != 0.0:
+                # head_keep_eff shape: [B, num_layers, num_heads]
+                per_layer_components.append(head_weight * head_keep_eff.mean(dim=(0, 2)))
+            if block_keep_eff is not None and block_weight != 0.0:
+                # block_keep_eff shape: [B, num_layers, 1]
+                per_layer_components.append(
+                    block_weight * block_keep_eff.mean(dim=(0, 2))
+                )
+            if token_keep_eff is not None and token_weight != 0.0:
+                # token_keep_eff shape: [B, num_layers, num_patch_tokens]
+                per_layer_components.append(
+                    token_weight * token_keep_eff.mean(dim=(0, 2))
+                )
+            if not per_layer_components:
+                # Fall back to zero tensor attached to the graph so callers
+                # still get a differentiable object.
+                return state["effective_mean_head_keep"] * 0.0
+            per_layer_cost = torch.stack(per_layer_components, dim=0).sum(dim=0)
+            target_tensor = per_layer_cost.new_tensor(float(target_ratio))
+            return shape_loss(per_layer_cost, target_tensor).mean()
+
         raise ValueError(
-            f"Unsupported policy_budget_loss_type: {loss_type!r}; "
-            "expected one of {'l1', 'mse', 'lower_bound'}"
+            f"Unsupported policy_budget_granularity: {granularity!r}; "
+            "expected one of {'global', 'per_layer'}"
         )
 
     def _policy_from_logits(self, logits, kind: str):
@@ -1251,6 +1312,13 @@ class DINOV3Wrapper(nn.Module):
         )
         if (not self.training) and kind == "head" and self.head_topk_ratio is not None:
             effective = apply_topk_policy(raw_prob, self.head_topk_ratio)
+        # Hard floor / bounded sigmoid: remap sample in [0, 1] to [min_keep, 1].
+        # This prevents "gate death spiral" (sigmoid saturating at 0 -> zero
+        # gradient -> head never recovers). min_keep=0.0 is a no-op.
+        if self.policy_min_keep > 0.0:
+            min_keep = float(self.policy_min_keep)
+            raw_prob = min_keep + (1.0 - min_keep) * raw_prob
+            effective = min_keep + (1.0 - min_keep) * effective
         return raw_prob, effective
 
     def _apply_token_policy_to_tokens(self, tokens: torch.Tensor, token_policy):

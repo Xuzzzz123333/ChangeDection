@@ -746,6 +746,9 @@ class Trainval(object):
             "policy_min",
             "policy_max",
             "policy_std",
+            "policy_budget_weight",
+            "weighted_policy_budget_loss",
+            "policy_ramp_used_in_forward",
         ]
         fieldnames += [f"layer_{idx}_head_keep" for idx in range(num_layers)]
         fieldnames += [f"layer_{idx}_head_active" for idx in range(num_layers)]
@@ -816,6 +819,16 @@ class Trainval(object):
             "policy_min": float(summary.get("policy_min", 1.0)),
             "policy_max": float(summary.get("policy_max", 1.0)),
             "policy_std": float(summary.get("policy_std", 0.0)),
+            "policy_budget_weight": float(
+                getattr(self.opt, "policy_budget_weight", 0.0)
+            ),
+            "weighted_policy_budget_loss": float(
+                aux_stats.get("weighted_policy_budget_loss", 0.0)
+            ),
+            "policy_ramp_used_in_forward": float(
+                aux_stats.get("policy_ramp_used_in_forward",
+                              aux_stats.get("dynamic_policy_ramp", 0.0))
+            ),
         }
         for idx, value in enumerate(summary.get("per_layer_head_keep", [])):
             row[f"layer_{idx}_head_keep"] = float(value)
@@ -1109,6 +1122,33 @@ class Trainval(object):
                 self.last_train_policy_summary.get("mean_token_keep", 1.0)
                 if self.last_train_policy_summary is not None
                 else 1.0
+            ),
+            "dynamic_policy_ramp": float(
+                soft_gate_aux.get("dynamic_policy_ramp", 0.0)
+            ),
+            "dynamic_policy_raw_mean_head_keep": float(
+                soft_gate_aux.get("dynamic_policy_raw_mean_head_keep", 1.0)
+            ),
+            "dynamic_policy_cost_raw": float(
+                soft_gate_aux.get("dynamic_policy_cost_raw", 1.0)
+            ),
+            "dynamic_policy_cost_effective": float(
+                soft_gate_aux.get("dynamic_policy_cost_effective", 1.0)
+            ),
+            "weighted_policy_budget_loss": float(
+                soft_gate_aux.get("weighted_policy_budget_loss", 0.0)
+            ),
+            "policy_ramp_used_in_forward": float(
+                soft_gate_aux.get("policy_ramp_used_in_forward", 0.0)
+            ),
+            "policy_budget_weight": float(
+                soft_gate_aux.get("policy_budget_weight", 0.0)
+            ),
+            "effective_policy_cost": float(
+                soft_gate_aux.get("effective_policy_cost", 1.0)
+            ),
+            "raw_policy_cost": float(
+                soft_gate_aux.get("raw_policy_cost", 1.0)
             ),
         }
 

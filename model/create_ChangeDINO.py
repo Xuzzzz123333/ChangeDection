@@ -68,6 +68,8 @@ class Model(nn.Module):
             policy_anneal_epochs=opt.policy_anneal_epochs,
             policy_force_keep_during_warmup=opt.policy_force_keep_during_warmup,
             policy_budget_loss_type=opt.policy_budget_loss_type,
+            policy_budget_granularity=opt.policy_budget_granularity,
+            policy_min_keep=opt.policy_min_keep,
             policy_hidden_dim=opt.policy_hidden_dim,
             num_prefix_tokens=opt.num_prefix_tokens,
             image_size=opt.image_size,
@@ -227,6 +229,8 @@ class Model(nn.Module):
                 print(f"target_compute_ratio = {opt.target_compute_ratio}")
                 print(f"policy_budget_weight = {opt.policy_budget_weight}")
                 print(f"policy_budget_loss_type = {opt.policy_budget_loss_type}")
+                print(f"policy_budget_granularity = {opt.policy_budget_granularity}")
+                print(f"policy_min_keep = {opt.policy_min_keep}")
                 print(f"policy_warmup_epochs = {opt.policy_warmup_epochs}")
                 print(f"policy_anneal_epochs = {opt.policy_anneal_epochs}")
                 print(
@@ -1232,6 +1236,9 @@ class Model(nn.Module):
             loss_type = str(
                 getattr(self.opt, "policy_budget_loss_type", "lower_bound")
             )
+            granularity = str(
+                getattr(self.opt, "policy_budget_granularity", "per_layer")
+            )
             if dino is not None and hasattr(dino, "dynamic_policy_budget_loss"):
                 budget_loss = dino.dynamic_policy_budget_loss(
                     target_ratio=target_ratio,
@@ -1239,6 +1246,7 @@ class Model(nn.Module):
                     block_weight=self.opt.policy_block_weight,
                     token_weight=self.opt.policy_token_weight,
                     loss_type=loss_type,
+                    granularity=granularity,
                 )
             head_w = float(self.opt.policy_head_weight)
             block_w = float(self.opt.policy_block_weight)
@@ -1256,19 +1264,30 @@ class Model(nn.Module):
                 + token_w * float(dynamic_state.get("raw_mean_token_keep", 1.0))
             )
             policy_cost = policy_cost_effective  # backwards-compat alias
+            policy_ramp_used = float(dynamic_state.get("policy_ramp", 0.0))
             self.last_aux_losses["dynamic_policy_budget_lambda"] = float(budget_lambda)
+            self.last_aux_losses["dynamic_policy_budget_weight"] = float(
+                getattr(self.opt, "policy_budget_weight", 0.0)
+            )
+            self.last_aux_losses["policy_budget_weight"] = float(
+                getattr(self.opt, "policy_budget_weight", 0.0)
+            )
             self.last_aux_losses["dynamic_policy_budget_loss_type"] = loss_type
+            self.last_aux_losses["dynamic_policy_budget_granularity"] = granularity
             self.last_aux_losses["dynamic_policy_target_compute_ratio"] = float(
                 target_ratio
             )
             self.last_aux_losses["target_compute_ratio"] = float(target_ratio)
-            self.last_aux_losses["dynamic_policy_ramp"] = float(
-                dynamic_state.get("policy_ramp", 0.0)
-            )
+            self.last_aux_losses["dynamic_policy_ramp"] = policy_ramp_used
+            self.last_aux_losses["policy_ramp_used_in_forward"] = policy_ramp_used
             self.last_aux_losses["dynamic_policy_cost"] = float(policy_cost)
             self.last_aux_losses["policy_cost"] = float(policy_cost)
             self.last_aux_losses["dynamic_policy_cost_raw"] = float(policy_cost_raw)
+            self.last_aux_losses["raw_policy_cost"] = float(policy_cost_raw)
             self.last_aux_losses["dynamic_policy_cost_effective"] = float(
+                policy_cost_effective
+            )
+            self.last_aux_losses["effective_policy_cost"] = float(
                 policy_cost_effective
             )
             self.last_aux_losses["dynamic_policy_mean_head_keep"] = float(
@@ -1299,13 +1318,18 @@ class Model(nn.Module):
                 dynamic_state.get("policy_std", 0.0)
             )
             if budget_loss is not None:
-                self.last_aux_losses["dynamic_policy_budget_loss"] = float(
-                    budget_loss.detach().item()
+                bl_float = float(budget_loss.detach().item())
+                self.last_aux_losses["dynamic_policy_budget_loss"] = bl_float
+                # Post-lambda contribution that actually enters total loss. Equal
+                # to what the optimizer sees (budget_lambda * budget_loss).
+                self.last_aux_losses["weighted_policy_budget_loss"] = float(
+                    budget_lambda * bl_float
                 )
                 if budget_lambda > 0:
                     dice = dice + budget_lambda * budget_loss
             else:
                 self.last_aux_losses["dynamic_policy_budget_loss"] = 0.0
+                self.last_aux_losses["weighted_policy_budget_loss"] = 0.0
 
         if getattr(self.opt, "dino_lora_soft_gate", False):
             network = self._unwrap_model(self.model)

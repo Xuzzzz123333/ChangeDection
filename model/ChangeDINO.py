@@ -229,6 +229,10 @@ class Encoder(nn.Module):
             policy_budget_loss_type=kwargs.get(
                 "policy_budget_loss_type", "lower_bound"
             ),
+            policy_budget_granularity=kwargs.get(
+                "policy_budget_granularity", "per_layer"
+            ),
+            policy_min_keep=kwargs.get("policy_min_keep", 0.0),
             policy_hidden_dim=kwargs.get("policy_hidden_dim", 256),
             num_prefix_tokens=kwargs.get("num_prefix_tokens", -1),
             policy_head_weight=kwargs.get("policy_head_weight", 1.0),
