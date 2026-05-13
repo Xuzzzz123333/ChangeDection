@@ -1752,7 +1752,7 @@ class DINOV3Wrapper(nn.Module):
                     and policy_ramp > 0.0
                     and self.block_policy_mode in {"soft_residual", "hard_skip"}
                 ):
-                    effective_block_policy = eff_block_keep
+                    effective_block_policy = eff_block_keep.detach()
                 x_list = self._apply_block_policy_to_outputs(
                     x_block_in,
                     x_block_out,
