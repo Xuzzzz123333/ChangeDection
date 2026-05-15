@@ -726,6 +726,7 @@ class DINOV3Wrapper(nn.Module):
                 f"got {head_policy_apply_mode!r}"
             )
         self.head_policy_apply_mode = str(head_policy_apply_mode)
+        self.policy_mlp_gate = bool(kwargs.get("policy_mlp_gate", False))
         self.target_compute_ratio = float(target_compute_ratio)
         self.policy_budget_weight = float(policy_budget_weight)
         self.policy_warmup_epochs = int(max(0, policy_warmup_epochs))
@@ -1309,6 +1310,27 @@ class DINOV3Wrapper(nn.Module):
             "expected one of {'global', 'per_layer'}"
         )
 
+    def policy_entropy_loss(self):
+        """Binary entropy regularizer on head policy logits (AdaViT official).
+
+        Encourages the policy net to stay exploratory and not saturate to
+        hard 0/1 too early. Loss = -mean(p*log(p) + (1-p)*log(1-p)) where
+        p = sigmoid(logits). Maximizing entropy = keeping logits near 0.
+
+        Returns None if dynamic policy is disabled or no state available.
+        """
+        state = self.last_dynamic_policy_state
+        if not self.use_dynamic_policy or state is None:
+            return None
+        head_prob = state.get("head_prob")
+        if head_prob is None:
+            return None
+        # head_prob shape: [B, num_layers, num_heads] — raw sigmoid probs
+        eps = 1e-7
+        p = head_prob.clamp(eps, 1.0 - eps)
+        entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
+        return entropy.mean()
+
     def _policy_from_logits(self, logits, kind: str):
         if logits is None:
             return None, None
@@ -1769,6 +1791,26 @@ class DINOV3Wrapper(nn.Module):
                     x_block_out,
                     effective_block_policy,
                 )
+
+                # MLP gate: apply head policy to the MLP residual contribution.
+                # AdaViT official uses width_select_mlp to gate MLP hidden dims
+                # with the same head mask. We approximate this by gating the
+                # block residual update per-head-dim after the block forward.
+                # residual_update = x_out - x_in contains both attn (already
+                # gated inside) and MLP (not yet gated). We gate the full
+                # residual update per head dimension so MLP is also gated.
+                if self.policy_mlp_gate and policy_ramp > 0.0:
+                    head_dim = x_list[0].shape[-1] // self.num_heads
+                    # eff_head_keep: [B, num_heads]
+                    mlp_gate = eff_head_keep[:, :, None].expand(
+                        -1, -1, head_dim
+                    ).reshape(batch_size, -1)  # [B, dim]
+                    mlp_gate = mlp_gate[:, None, :]  # [B, 1, dim] for broadcast over N
+                    gated_list = []
+                    for x_out, x_in in zip(x_list, x_block_in):
+                        residual = x_out - x_in
+                        gated_list.append(x_in + residual * mlp_gate)
+                    x_list = gated_list
 
                 head_prob_list.append(raw_head_prob)
                 head_keep_raw_list.append(raw_head_keep)

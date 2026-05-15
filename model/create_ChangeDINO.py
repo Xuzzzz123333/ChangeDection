@@ -71,6 +71,8 @@ class Model(nn.Module):
             policy_budget_loss_type=opt.policy_budget_loss_type,
             policy_budget_granularity=opt.policy_budget_granularity,
             policy_min_keep=opt.policy_min_keep,
+            policy_entropy_weight=opt.policy_entropy_weight,
+            policy_mlp_gate=opt.policy_mlp_gate,
             policy_hidden_dim=opt.policy_hidden_dim,
             num_prefix_tokens=opt.num_prefix_tokens,
             image_size=opt.image_size,
@@ -1331,6 +1333,24 @@ class Model(nn.Module):
             else:
                 self.last_aux_losses["dynamic_policy_budget_loss"] = 0.0
                 self.last_aux_losses["weighted_policy_budget_loss"] = 0.0
+
+            # Entropy regularizer (AdaViT official: encourages exploration)
+            entropy_weight = float(
+                getattr(self.opt, "policy_entropy_weight", 0.0)
+            )
+            if entropy_weight > 0 and dino is not None and hasattr(dino, "policy_entropy_loss"):
+                entropy_loss = dino.policy_entropy_loss()
+                if entropy_loss is not None:
+                    self.last_aux_losses["dynamic_policy_entropy_loss"] = float(
+                        entropy_loss.detach().item()
+                    )
+                    # Negative sign: we MAXIMIZE entropy (subtract from loss)
+                    if budget_lambda > 0:
+                        dice = dice - entropy_weight * entropy_loss
+                else:
+                    self.last_aux_losses["dynamic_policy_entropy_loss"] = 0.0
+            else:
+                self.last_aux_losses["dynamic_policy_entropy_loss"] = 0.0
 
         if getattr(self.opt, "dino_lora_soft_gate", False):
             network = self._unwrap_model(self.model)

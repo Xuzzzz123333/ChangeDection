@@ -448,6 +448,21 @@ class Options:
                  "collapsing below target.",
         )
         self.parser.add_argument(
+            "--policy_entropy_weight",
+            type=float,
+            default=0.1,
+            help="weight for binary entropy regularizer on head policy logits "
+                 "(encourages exploration, prevents premature gate saturation). "
+                 "Matches AdaViT official head_entropy_weight=0.1. Set to 0 to disable.",
+        )
+        self.parser.add_argument(
+            "--policy_mlp_gate",
+            action="store_true",
+            help="apply the same head policy gate to the MLP output dimensions, "
+                 "matching AdaViT official width_select_mlp behavior where the "
+                 "head gate also controls MLP hidden/output width.",
+        )
+        self.parser.add_argument(
             "--policy_min_keep",
             type=float,
             default=0.0,
