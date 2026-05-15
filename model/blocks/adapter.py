@@ -1718,8 +1718,8 @@ class DINOV3Wrapper(nn.Module):
                 x_block_in = x_list
                 if self.use_token_policy and eff_token_keep is not None:
                     x_block_in = [
-                        self._apply_token_policy_to_tokens(x_list[0], eff_token_keep.detach()),
-                        self._apply_token_policy_to_tokens(x_list[1], eff_token_keep.detach()),
+                        self._apply_token_policy_to_tokens(x_list[0], eff_token_keep),
+                        self._apply_token_policy_to_tokens(x_list[1], eff_token_keep),
                     ]
 
                 core_block = self._unwrap_transformer_block(blk)
@@ -1736,7 +1736,7 @@ class DINOV3Wrapper(nn.Module):
                     # the policy net. The policy net is trained ONLY by the
                     # budget loss (which uses the non-detached effective tensors
                     # stored in _collect_dynamic_policy_state).
-                    core_block.attn.set_runtime_head_policy(eff_head_keep.detach())
+                    core_block.attn.set_runtime_head_policy(eff_head_keep)
                     runtime_gate_attached = True
                 try:
                     x_block_out = blk(x_block_in, rope_sincos)
@@ -1752,7 +1752,7 @@ class DINOV3Wrapper(nn.Module):
                     and policy_ramp > 0.0
                     and self.block_policy_mode in {"soft_residual", "hard_skip"}
                 ):
-                    effective_block_policy = eff_block_keep.detach()
+                    effective_block_policy = eff_block_keep
                 x_list = self._apply_block_policy_to_outputs(
                     x_block_in,
                     x_block_out,
