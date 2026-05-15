@@ -609,6 +609,7 @@ class DINOV3Wrapper(nn.Module):
         policy_threshold=0.5,
         head_topk_ratio=None,
         head_policy_apply_mode="output_gate",
+        policy_mlp_gate=False,
         target_compute_ratio=0.90,
         policy_budget_weight=0.01,
         policy_warmup_epochs=3,
@@ -726,7 +727,7 @@ class DINOV3Wrapper(nn.Module):
                 f"got {head_policy_apply_mode!r}"
             )
         self.head_policy_apply_mode = str(head_policy_apply_mode)
-        self.policy_mlp_gate = bool(kwargs.get("policy_mlp_gate", False))
+        self.policy_mlp_gate = bool(policy_mlp_gate)
         self.target_compute_ratio = float(target_compute_ratio)
         self.policy_budget_weight = float(policy_budget_weight)
         self.policy_warmup_epochs = int(max(0, policy_warmup_epochs))
