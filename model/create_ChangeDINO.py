@@ -62,6 +62,7 @@ class Model(nn.Module):
             policy_temperature=opt.policy_temperature,
             policy_threshold=opt.policy_threshold,
             head_topk_ratio=opt.head_topk_ratio,
+            head_policy_apply_mode=opt.head_policy_apply_mode,
             target_compute_ratio=opt.target_compute_ratio,
             policy_budget_weight=opt.policy_budget_weight,
             policy_warmup_epochs=opt.policy_warmup_epochs,

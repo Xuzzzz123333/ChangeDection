@@ -219,6 +219,9 @@ class Encoder(nn.Module):
             policy_temperature=kwargs.get("policy_temperature", 1.0),
             policy_threshold=kwargs.get("policy_threshold", 0.5),
             head_topk_ratio=kwargs.get("head_topk_ratio", None),
+            head_policy_apply_mode=kwargs.get(
+                "head_policy_apply_mode", "output_gate"
+            ),
             target_compute_ratio=kwargs.get("target_compute_ratio", 0.90),
             policy_budget_weight=kwargs.get("policy_budget_weight", 0.01),
             policy_warmup_epochs=kwargs.get("policy_warmup_epochs", 3),

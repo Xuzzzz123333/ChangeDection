@@ -129,7 +129,7 @@ class DynamicPolicyNet(nn.Module):
 
 
 class PolicyAwareSelfAttention(nn.Module):
-    def __init__(self, attn: nn.Module, layer_index: int):
+    def __init__(self, attn: nn.Module, layer_index: int, apply_mode: str = "output_gate"):
         super().__init__()
         self.layer_index = int(layer_index)
         self.num_heads = int(attn.num_heads)
@@ -139,6 +139,12 @@ class PolicyAwareSelfAttention(nn.Module):
         self.proj = attn.proj
         self.proj_drop = getattr(attn, "proj_drop", nn.Identity())
         self._runtime_head_policy = None
+        if apply_mode not in ("output_gate", "attn_identity"):
+            raise ValueError(
+                f"head_policy_apply_mode must be 'output_gate' or 'attn_identity', "
+                f"got {apply_mode!r}"
+            )
+        self.apply_mode = apply_mode
 
     @staticmethod
     def rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -202,6 +208,8 @@ class PolicyAwareSelfAttention(nn.Module):
                 )
             attn_kwargs["attn_mask"] = attn_bias
         dropout_p = float(getattr(self.attn_drop, "p", 0.0)) if self.training else 0.0
+        # Store v for attn_identity mode (identity attention output = v)
+        self._last_v = v
         try:
             x = torch.nn.functional.scaled_dot_product_attention(
                 q,
@@ -224,7 +232,34 @@ class PolicyAwareSelfAttention(nn.Module):
                     f"Runtime head policy shape mismatch at layer {self.layer_index}: "
                     f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
                 )
-            x = x * active_policy[:, None, :, None].to(dtype=x.dtype)
+            gate = active_policy[:, None, :, None].to(dtype=x.dtype)
+            if self.apply_mode == "output_gate":
+                # Mode 1 (default): dropped heads have output zeroed.
+                x = x * gate
+            else:
+                # Mode 2 (attn_identity / AdaViT official): dropped heads
+                # use identity attention, i.e. output = input value.
+                # Since we already computed attn @ v for all heads, we blend:
+                #   x_head = gate * (attn @ v) + (1 - gate) * v
+                # where v is the value before attention weighting. For identity
+                # attention each token attends only to itself, so output = v.
+                # v is still available as the last component of qkv.
+                # We stored it before the sdpa call — but we don't have it here
+                # directly. Instead we use the algebraic identity:
+                #   identity_attn_output[b,h,n,:] = v[b,h,n,:]
+                # We can recover v from qkv that was passed in. However
+                # compute_attention receives qkv already processed. The cleanest
+                # approach: store v before sdpa and use it here.
+                # Since v was computed above and is in scope via closure in the
+                # calling code path, we store it on self temporarily.
+                v_identity = getattr(self, "_last_v", None)
+                if v_identity is not None:
+                    # v_identity shape: [B, num_heads, N, head_dim] transposed to [B, N, num_heads, head_dim]
+                    v_id = v_identity.transpose(1, 2)
+                    x = gate * x + (1.0 - gate) * v_id
+                else:
+                    # Fallback: if v not available, use output_gate behavior
+                    x = x * gate
         return x.reshape(batch_size, num_tokens, dim)
 
     def forward(self, x: torch.Tensor, attn_bias=None, rope=None) -> torch.Tensor:

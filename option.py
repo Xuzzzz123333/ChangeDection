@@ -399,6 +399,17 @@ class Options:
             help="optional per-sample top-k head keep ratio used during evaluation instead of thresholding",
         )
         self.parser.add_argument(
+            "--head_policy_apply_mode",
+            type=str,
+            default="output_gate",
+            choices=["output_gate", "attn_identity"],
+            help="how the head policy mask is applied in attention. "
+                 "'output_gate' (default): dropped heads have their output "
+                 "zeroed (x = x * gate). 'attn_identity' (AdaViT official): "
+                 "dropped heads use identity attention so their output equals "
+                 "the input value (skip), preserving residual information flow.",
+        )
+        self.parser.add_argument(
             "--target_compute_ratio",
             type=float,
             default=0.90,
