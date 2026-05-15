@@ -198,6 +198,34 @@ class PolicyAwareSelfAttention(nn.Module):
         q, k, v = [tensor.transpose(1, 2) for tensor in (q, k, v)]
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
+
+        active_policy = self._runtime_head_policy if head_policy is None else head_policy
+
+        # Apply gate BEFORE attention computation (AdaViT official design).
+        # gate shape: [B, 1, num_heads, 1] broadcast over [B, num_heads, N, head_dim]
+        if active_policy is not None:
+            if active_policy.shape != (batch_size, self.num_heads):
+                raise ValueError(
+                    f"Runtime head policy shape mismatch at layer {self.layer_index}: "
+                    f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
+                )
+            gate = active_policy[:, :, None, None].to(dtype=q.dtype)  # [B, H, 1, 1]
+
+            if self.apply_mode == "output_gate":
+                # AdaViT official width_select mode: gate applied to Q/K/V
+                # before attention. Dropped heads have Q=K=V=0, so their
+                # attention output is 0 from the source.
+                q = q * gate
+                k = k * gate
+                v = v * gate
+            else:
+                # attn_identity mode: we need v BEFORE gating for the
+                # identity blend after attention. Store ungated v.
+                pass
+
+        # Store ungated v for attn_identity mode
+        self._last_v = v
+
         attn_kwargs = {}
         if attn_bias is not None:
             if not torch.is_tensor(attn_bias):
@@ -208,8 +236,6 @@ class PolicyAwareSelfAttention(nn.Module):
                 )
             attn_kwargs["attn_mask"] = attn_bias
         dropout_p = float(getattr(self.attn_drop, "p", 0.0)) if self.training else 0.0
-        # Store v for attn_identity mode (identity attention output = v)
-        self._last_v = v
         try:
             x = torch.nn.functional.scaled_dot_product_attention(
                 q,
@@ -223,43 +249,17 @@ class PolicyAwareSelfAttention(nn.Module):
                 f"Failed to apply scaled_dot_product_attention at layer {self.layer_index}. "
                 f"attn_bias type={type(attn_bias)!r}"
             ) from exc
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2)  # [B, N, num_heads, head_dim]
 
-        active_policy = self._runtime_head_policy if head_policy is None else head_policy
-        if active_policy is not None:
-            if active_policy.shape != (batch_size, self.num_heads):
-                raise ValueError(
-                    f"Runtime head policy shape mismatch at layer {self.layer_index}: "
-                    f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
-                )
-            gate = active_policy[:, None, :, None].to(dtype=x.dtype)
-            if self.apply_mode == "output_gate":
-                # Mode 1 (default): dropped heads have output zeroed.
-                x = x * gate
-            else:
-                # Mode 2 (attn_identity / AdaViT official): dropped heads
-                # use identity attention, i.e. output = input value.
-                # Since we already computed attn @ v for all heads, we blend:
-                #   x_head = gate * (attn @ v) + (1 - gate) * v
-                # where v is the value before attention weighting. For identity
-                # attention each token attends only to itself, so output = v.
-                # v is still available as the last component of qkv.
-                # We stored it before the sdpa call — but we don't have it here
-                # directly. Instead we use the algebraic identity:
-                #   identity_attn_output[b,h,n,:] = v[b,h,n,:]
-                # We can recover v from qkv that was passed in. However
-                # compute_attention receives qkv already processed. The cleanest
-                # approach: store v before sdpa and use it here.
-                # Since v was computed above and is in scope via closure in the
-                # calling code path, we store it on self temporarily.
-                v_identity = getattr(self, "_last_v", None)
-                if v_identity is not None:
-                    # v_identity shape: [B, num_heads, N, head_dim] transposed to [B, N, num_heads, head_dim]
-                    v_id = v_identity.transpose(1, 2)
-                    x = gate * x + (1.0 - gate) * v_id
-                else:
-                    # Fallback: if v not available, use output_gate behavior
-                    x = x * gate
+        # Post-attention policy application (only for attn_identity mode)
+        if active_policy is not None and self.apply_mode == "attn_identity":
+            gate = active_policy[:, None, :, None].to(dtype=x.dtype)  # [B, 1, H, 1]
+            # AdaViT official only_head_attn mode: dropped heads use identity
+            # attention (output = input value). Blend:
+            #   x = gate * (attn @ v) + (1 - gate) * v
+            v_id = self._last_v.transpose(1, 2)  # [B, N, H, head_dim]
+            x = gate * x + (1.0 - gate) * v_id
+
         return x.reshape(batch_size, num_tokens, dim)
 
     def forward(self, x: torch.Tensor, attn_bias=None, rope=None) -> torch.Tensor:
