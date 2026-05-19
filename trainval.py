@@ -210,12 +210,12 @@ class Trainval(object):
         if self.opt.is_main_process:
             print("#training images = %d" % train_size)
 
-        opt.phase = "val"
+        opt.phase = getattr(opt, "val_phase", "test")
         self.val_loader = DataLoader(opt)
         self.val_data = self.val_loader.load_data()
         val_size = len(self.val_loader)
         if self.opt.is_main_process:
-            print("#validation images = %d" % val_size)
+            print("#validation images (%s split) = %d" % (opt.phase, val_size))
         opt.phase = "train"
 
         self.model = create_model(opt)
@@ -1155,7 +1155,7 @@ class Trainval(object):
     def val(self, epoch):
         tbar = tqdm(self.val_data, ncols=80) if self.opt.is_main_process else self.val_data
         self.running_metric.clear()
-        self.opt.phase = "val"
+        self.opt.phase = getattr(self.opt, "val_phase", "test")
         self.model.eval()
         policy_meter = self._new_policy_meter()
 

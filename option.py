@@ -78,6 +78,14 @@ class Options:
         self.parser.add_argument("--use_morph", action='store_true')
 
         self.parser.add_argument("--phase", type=str, default="train")
+        self.parser.add_argument(
+            "--val_phase",
+            type=str,
+            default="test",
+            choices=["val", "test"],
+            help="which split to use for validation during training. "
+                 "'test' (default) matches the original ChangeDINO repo.",
+        )
         self.parser.add_argument("--backbone", type=str, default="mobilenetv2")
         self.parser.add_argument("--fpn", type=str, default="fpn")
         self.parser.add_argument("--fpn_channels", type=int, default=128)
