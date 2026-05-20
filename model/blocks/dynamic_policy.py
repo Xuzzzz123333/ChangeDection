@@ -128,6 +128,79 @@ class DynamicPolicyNet(nn.Module):
         }
 
 
+class PolicyAwareMlp(nn.Module):
+    def __init__(self, mlp: nn.Module, layer_index: int, num_heads: int):
+        super().__init__()
+        self.layer_index = int(layer_index)
+        self.num_heads = int(num_heads)
+        self._runtime_head_policy = None
+
+        if hasattr(mlp, "fc1") and hasattr(mlp, "fc2"):
+            self.impl_type = "mlp"
+            self.fc1 = mlp.fc1
+            self.act = mlp.act
+            self.fc2 = mlp.fc2
+            self.drop = mlp.drop
+        elif hasattr(mlp, "w1") and hasattr(mlp, "w2") and hasattr(mlp, "w3"):
+            self.impl_type = "swiglu"
+            self.w1 = mlp.w1
+            self.w2 = mlp.w2
+            self.w3 = mlp.w3
+        else:
+            raise TypeError(
+                f"Unsupported MLP module for policy gating at layer {self.layer_index}: "
+                f"{type(mlp).__name__}"
+            )
+
+    def set_runtime_head_policy(self, head_policy: Optional[torch.Tensor]):
+        self._runtime_head_policy = head_policy
+
+    def clear_runtime_head_policy(self):
+        self._runtime_head_policy = None
+
+    def _apply_input_gate(self, x: torch.Tensor) -> torch.Tensor:
+        active_policy = self._runtime_head_policy
+        if active_policy is None:
+            return x
+        batch_size, _, dim = x.shape
+        if active_policy.shape != (batch_size, self.num_heads):
+            raise ValueError(
+                f"Runtime MLP head policy shape mismatch at layer {self.layer_index}: "
+                f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
+            )
+        if dim % self.num_heads != 0:
+            raise ValueError(
+                f"MLP input dim {dim} is not divisible by num_heads={self.num_heads} "
+                f"at layer {self.layer_index}."
+            )
+        head_dim = dim // self.num_heads
+        gate = active_policy[:, :, None].expand(-1, -1, head_dim).reshape(batch_size, 1, dim)
+        return x * gate.to(dtype=x.dtype)
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        if self.impl_type == "mlp":
+            x = self.fc1(x)
+            x = self.act(x)
+            x = self.drop(x)
+            x = self.fc2(x)
+            x = self.drop(x)
+            return x
+        x1 = self.w1(x)
+        x2 = self.w2(x)
+        hidden = torch.nn.functional.silu(x1) * x2
+        return self.w3(hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._apply_input_gate(x)
+        return self._forward_impl(x)
+
+    def forward_list(self, x_list: List[torch.Tensor]) -> List[torch.Tensor]:
+        gated_list = [self._apply_input_gate(x) for x in x_list]
+        x_flat, shapes, num_tokens = cat_keep_shapes(gated_list)
+        x_flat = self._forward_impl(x_flat)
+        return uncat_with_shapes(x_flat, shapes, num_tokens)
+
+
 class PolicyAwareSelfAttention(nn.Module):
     def __init__(self, attn: nn.Module, layer_index: int, apply_mode: str = "output_gate"):
         super().__init__()
@@ -201,8 +274,9 @@ class PolicyAwareSelfAttention(nn.Module):
 
         active_policy = self._runtime_head_policy if head_policy is None else head_policy
 
-        # Apply gate BEFORE attention computation (AdaViT official design).
-        # gate shape: [B, 1, num_heads, 1] broadcast over [B, num_heads, N, head_dim]
+        # Apply gate before attention computation. This matches the
+        # attention-side masking used by AdaViT-style head policies, but it
+        # does not physically prune the qkv/proj compute.
         if active_policy is not None:
             if active_policy.shape != (batch_size, self.num_heads):
                 raise ValueError(
@@ -212,9 +286,8 @@ class PolicyAwareSelfAttention(nn.Module):
             gate = active_policy[:, :, None, None].to(dtype=q.dtype)  # [B, H, 1, 1]
 
             if self.apply_mode == "output_gate":
-                # AdaViT official width_select mode: gate applied to Q/K/V
-                # before attention. Dropped heads have Q=K=V=0, so their
-                # attention output is 0 from the source.
+                # QKV-gated approximation of AdaViT width_select on the
+                # attention branch. Dropped heads have Q=K=V=0.
                 q = q * gate
                 k = k * gate
                 v = v * gate

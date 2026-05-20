@@ -233,6 +233,12 @@ class Model(nn.Module):
                 print(f"policy_budget_weight = {opt.policy_budget_weight}")
                 print(f"policy_budget_loss_type = {opt.policy_budget_loss_type}")
                 print(f"policy_budget_granularity = {opt.policy_budget_granularity}")
+                print(f"policy_entropy_weight = {opt.policy_entropy_weight}")
+                print(f"policy_diverse_weight = {opt.policy_diverse_weight}")
+                print(f"policy_minimal_weight = {opt.policy_minimal_weight}")
+                print(f"policy_minimal_target = {opt.policy_minimal_target}")
+                print(f"policy_mlp_gate = {opt.policy_mlp_gate}")
+                print(f"head_policy_apply_mode = {opt.head_policy_apply_mode}")
                 print(f"policy_min_keep = {opt.policy_min_keep}")
                 print(f"policy_warmup_epochs = {opt.policy_warmup_epochs}")
                 print(f"policy_anneal_epochs = {opt.policy_anneal_epochs}")
@@ -1320,37 +1326,82 @@ class Model(nn.Module):
             self.last_aux_losses["dynamic_policy_std"] = float(
                 dynamic_state.get("policy_std", 0.0)
             )
-            if budget_loss is not None:
-                bl_float = float(budget_loss.detach().item())
-                self.last_aux_losses["dynamic_policy_budget_loss"] = bl_float
-                # Post-lambda contribution that actually enters total loss. Equal
-                # to what the optimizer sees (budget_lambda * budget_loss).
-                self.last_aux_losses["weighted_policy_budget_loss"] = float(
-                    budget_lambda * bl_float
-                )
-                if budget_lambda > 0:
-                    dice = dice + budget_lambda * budget_loss
-            else:
-                self.last_aux_losses["dynamic_policy_budget_loss"] = 0.0
-                self.last_aux_losses["weighted_policy_budget_loss"] = 0.0
+            diverse_weight = float(getattr(self.opt, "policy_diverse_weight", 0.0))
+            minimal_weight = float(getattr(self.opt, "policy_minimal_weight", 0.0))
+            minimal_target = float(getattr(self.opt, "policy_minimal_target", 0.0))
+            entropy_weight = float(getattr(self.opt, "policy_entropy_weight", 0.0))
 
-            # Entropy regularizer (AdaViT official: encourages exploration)
-            entropy_weight = float(
-                getattr(self.opt, "policy_entropy_weight", 0.0)
-            )
+            diverse_loss = None
+            if (
+                diverse_weight > 0
+                and dino is not None
+                and hasattr(dino, "dynamic_policy_diverse_loss")
+            ):
+                diverse_loss = dino.dynamic_policy_diverse_loss(target_ratio=target_ratio)
+
+            minimal_loss = None
+            if (
+                minimal_weight > 0
+                and minimal_target > 0
+                and dino is not None
+                and hasattr(dino, "dynamic_policy_minimal_loss")
+            ):
+                minimal_loss = dino.dynamic_policy_minimal_loss(minimal_keep=minimal_target)
+
+            entropy_loss = None
             if entropy_weight > 0 and dino is not None and hasattr(dino, "policy_entropy_loss"):
                 entropy_loss = dino.policy_entropy_loss()
-                if entropy_loss is not None:
-                    self.last_aux_losses["dynamic_policy_entropy_loss"] = float(
-                        entropy_loss.detach().item()
-                    )
-                    # Negative sign: we MAXIMIZE entropy (subtract from loss)
-                    if budget_lambda > 0:
-                        dice = dice - entropy_weight * entropy_loss
-                else:
-                    self.last_aux_losses["dynamic_policy_entropy_loss"] = 0.0
-            else:
-                self.last_aux_losses["dynamic_policy_entropy_loss"] = 0.0
+
+            self.last_aux_losses["dynamic_policy_budget_loss"] = (
+                float(budget_loss.detach().item()) if budget_loss is not None else 0.0
+            )
+            self.last_aux_losses["dynamic_policy_diverse_loss"] = (
+                float(diverse_loss.detach().item()) if diverse_loss is not None else 0.0
+            )
+            self.last_aux_losses["dynamic_policy_minimal_loss"] = (
+                float(minimal_loss.detach().item()) if minimal_loss is not None else 0.0
+            )
+            self.last_aux_losses["dynamic_policy_entropy_loss"] = (
+                float(entropy_loss.detach().item()) if entropy_loss is not None else 0.0
+            )
+            self.last_aux_losses["weighted_policy_budget_loss"] = float(
+                budget_lambda * self.last_aux_losses["dynamic_policy_budget_loss"]
+            )
+
+            policy_loss = None
+            if budget_loss is not None:
+                policy_loss = budget_loss
+            if diverse_loss is not None:
+                policy_loss = (
+                    diverse_weight * diverse_loss
+                    if policy_loss is None
+                    else policy_loss + diverse_weight * diverse_loss
+                )
+            if minimal_loss is not None:
+                policy_loss = (
+                    minimal_weight * minimal_loss
+                    if policy_loss is None
+                    else policy_loss + minimal_weight * minimal_loss
+                )
+            if entropy_loss is not None:
+                policy_loss = (
+                    -entropy_weight * entropy_loss
+                    if policy_loss is None
+                    else policy_loss - entropy_weight * entropy_loss
+                )
+
+            self.last_aux_losses["dynamic_policy_total_loss"] = (
+                float(policy_loss.detach().item()) if policy_loss is not None else 0.0
+            )
+            self.last_aux_losses["weighted_dynamic_policy_loss"] = float(
+                budget_lambda * self.last_aux_losses["dynamic_policy_total_loss"]
+            )
+            self.last_aux_losses["policy_diverse_weight"] = float(diverse_weight)
+            self.last_aux_losses["policy_minimal_weight"] = float(minimal_weight)
+            self.last_aux_losses["policy_minimal_target"] = float(minimal_target)
+
+            if budget_lambda > 0 and policy_loss is not None:
+                dice = dice + budget_lambda * policy_loss
 
         if getattr(self.opt, "dino_lora_soft_gate", False):
             network = self._unwrap_model(self.model)
@@ -1454,10 +1505,22 @@ class Model(nn.Module):
             )
         else:
             checkpoint = torch.load(
-                save_path, map_location="cpu", weights_only=True
+                save_path, map_location="cpu", weights_only=False
             )
             self._unwrap_model(network).load_state_dict(checkpoint["network"], strict=False)
-            print("load pre-trained")
+            loaded_epoch = checkpoint.get("epoch", None)
+            if loaded_epoch is None and getattr(self.opt, "use_dynamic_policy", False):
+                loaded_epoch = int(
+                    max(
+                        getattr(self.opt, "policy_warmup_epochs", 0)
+                        + getattr(self.opt, "policy_anneal_epochs", 0),
+                        0,
+                    )
+                )
+            if loaded_epoch is not None:
+                self.current_epoch = int(loaded_epoch)
+            self._sync_dynamic_policy_epoch()
+            print(f"load pre-trained (epoch={self.current_epoch})")
 
     def _serializable_opt_dict(self):
         serializable = {}

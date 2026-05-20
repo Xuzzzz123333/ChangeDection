@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from .dynamic_policy import (
     DynamicPolicyNet,
+    PolicyAwareMlp,
     PolicyAwareSelfAttention,
     apply_topk_policy,
     infer_num_prefix_tokens,
@@ -923,6 +924,12 @@ class DINOV3Wrapper(nn.Module):
                     layer_index=layer_index,
                     apply_mode=self.head_policy_apply_mode,
                 )
+            if self.policy_mlp_gate and not isinstance(core_block.mlp, PolicyAwareMlp):
+                core_block.mlp = PolicyAwareMlp(
+                    core_block.mlp,
+                    layer_index=layer_index,
+                    num_heads=self.num_heads,
+                )
 
     @staticmethod
     def _get_depth_bucket_label(layer_index: int, num_layers: int, num_buckets: int) -> str:
@@ -1311,24 +1318,38 @@ class DINOV3Wrapper(nn.Module):
             "expected one of {'global', 'per_layer'}"
         )
 
-    def policy_entropy_loss(self):
-        """Binary entropy regularizer on head policy logits (AdaViT official).
-
-        Encourages the policy net to stay exploratory and not saturate to
-        hard 0/1 too early. Loss = -mean(p*log(p) + (1-p)*log(1-p)) where
-        p = sigmoid(logits). Maximizing entropy = keeping logits near 0.
-
-        Returns None if dynamic policy is disabled or no state available.
-        """
+    def dynamic_policy_diverse_loss(self, target_ratio: float):
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None:
             return None
-        head_prob = state.get("head_prob")
-        if head_prob is None:
+        head_keep_eff = state.get("head_keep_effective")
+        if head_keep_eff is None:
             return None
-        # head_prob shape: [B, num_layers, num_heads] — raw sigmoid probs
+        head_mean = head_keep_eff.mean(dim=0)
+        target = head_mean.new_tensor(float(target_ratio))
+        return torch.abs(head_mean - target).mean()
+
+    def dynamic_policy_minimal_loss(self, minimal_keep: float):
+        state = self.last_dynamic_policy_state
+        if not self.use_dynamic_policy or state is None or minimal_keep <= 0.0:
+            return None
+        head_keep_eff = state.get("head_keep_effective")
+        if head_keep_eff is None:
+            return None
+        head_mean = head_keep_eff.mean(dim=0)
+        target = head_mean.new_tensor(float(minimal_keep))
+        return torch.clamp(target - head_mean, min=0.0).sum()
+
+    def policy_entropy_loss(self):
+        """Binary entropy regularizer on the raw head logits, following AdaViT."""
+        state = self.last_dynamic_policy_state
+        if not self.use_dynamic_policy or state is None:
+            return None
+        head_logits = state.get("head_logits")
+        if head_logits is None:
+            return None
         eps = 1e-7
-        p = head_prob.clamp(eps, 1.0 - eps)
+        p = torch.sigmoid(head_logits).clamp(eps, 1.0 - eps)
         entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
         return entropy.mean()
 
@@ -1395,6 +1416,7 @@ class DINOV3Wrapper(nn.Module):
 
     def _collect_dynamic_policy_state(
         self,
+        head_logits_list,
         head_prob_list,
         head_keep_raw_list,
         head_keep_effective_list,
@@ -1420,6 +1442,7 @@ class DINOV3Wrapper(nn.Module):
         refer to the effective tensors (what the meter and downstream
         visualizations want); raw copies are exposed as ``*_raw`` fields.
         """
+        head_logits = torch.stack(head_logits_list, dim=1) if head_logits_list else None
         head_prob = torch.stack(head_prob_list, dim=1) if head_prob_list else None
         head_keep_raw = (
             torch.stack(head_keep_raw_list, dim=1) if head_keep_raw_list else None
@@ -1544,6 +1567,7 @@ class DINOV3Wrapper(nn.Module):
 
         self.last_dynamic_policy_state = {
             "batch_size": torch.tensor(float(batch_size), device=device),
+            "head_logits": head_logits,
             "head_prob": head_prob,
             # Backwards-compat aliases: head_keep / mean_head_keep == effective
             "head_keep": head_keep_effective,
@@ -1617,6 +1641,7 @@ class DINOV3Wrapper(nn.Module):
             hw_list.append(hw_tuple)
 
         outputs = []
+        head_logits_list = []
         head_prob_list = []
         head_keep_raw_list = []
         head_keep_effective_list = []
@@ -1661,6 +1686,7 @@ class DINOV3Wrapper(nn.Module):
                 device = x_list[0].device
                 dtype = x_list[0].dtype
 
+                raw_head_logits = None
                 if force_keep_shortcut:
                     raw_head_keep = torch.ones(
                         batch_size, self.num_heads, device=device, dtype=dtype,
@@ -1686,8 +1712,9 @@ class DINOV3Wrapper(nn.Module):
                         x_list[1],
                         num_prefix_tokens=self.num_prefix_tokens,
                     )
+                    raw_head_logits = policy_outputs["head_logits"]
                     raw_head_prob, raw_head_keep = self._policy_from_logits(
-                        policy_outputs["head_logits"], kind="head"
+                        raw_head_logits, kind="head"
                     )
                     if raw_head_keep is None:
                         raw_head_keep = torch.ones(
@@ -1758,20 +1785,25 @@ class DINOV3Wrapper(nn.Module):
 
                 core_block = self._unwrap_transformer_block(blk)
                 runtime_gate_attached = False
+                runtime_mlp_gate_attached = False
                 # When ramp == 0 the effective gate is all-ones so we can skip
-                # the per-head multiplication entirely (baseline attention).
+                # attaching runtime gates entirely and fall back to the baseline
+                # attention/MLP block.
                 if (
                     self.use_head_policy
                     and policy_ramp > 0.0
                     and hasattr(core_block.attn, "set_runtime_head_policy")
                 ):
-                    # DETACH the gate for the attention forward pass so that
-                    # segmentation loss cannot backprop through the gate into
-                    # the policy net. The policy net is trained ONLY by the
-                    # budget loss (which uses the non-detached effective tensors
-                    # stored in _collect_dynamic_policy_state).
                     core_block.attn.set_runtime_head_policy(eff_head_keep)
                     runtime_gate_attached = True
+                if (
+                    self.policy_mlp_gate
+                    and self.use_head_policy
+                    and policy_ramp > 0.0
+                    and hasattr(core_block.mlp, "set_runtime_head_policy")
+                ):
+                    core_block.mlp.set_runtime_head_policy(eff_head_keep)
+                    runtime_mlp_gate_attached = True
                 try:
                     x_block_out = blk(x_block_in, rope_sincos)
                 finally:
@@ -1779,6 +1811,10 @@ class DINOV3Wrapper(nn.Module):
                         core_block.attn, "clear_runtime_head_policy"
                     ):
                         core_block.attn.clear_runtime_head_policy()
+                    if runtime_mlp_gate_attached and hasattr(
+                        core_block.mlp, "clear_runtime_head_policy"
+                    ):
+                        core_block.mlp.clear_runtime_head_policy()
 
                 effective_block_policy = None
                 if (
@@ -1793,26 +1829,8 @@ class DINOV3Wrapper(nn.Module):
                     effective_block_policy,
                 )
 
-                # MLP gate: apply head policy to the MLP residual contribution.
-                # AdaViT official uses width_select_mlp to gate MLP hidden dims
-                # with the same head mask. We approximate this by gating the
-                # block residual update per-head-dim after the block forward.
-                # residual_update = x_out - x_in contains both attn (already
-                # gated inside) and MLP (not yet gated). We gate the full
-                # residual update per head dimension so MLP is also gated.
-                if self.policy_mlp_gate and policy_ramp > 0.0:
-                    head_dim = x_list[0].shape[-1] // self.num_heads
-                    # eff_head_keep: [B, num_heads]
-                    mlp_gate = eff_head_keep[:, :, None].expand(
-                        -1, -1, head_dim
-                    ).reshape(batch_size, -1)  # [B, dim]
-                    mlp_gate = mlp_gate[:, None, :]  # [B, 1, dim] for broadcast over N
-                    gated_list = []
-                    for x_out, x_in in zip(x_list, x_block_in):
-                        residual = x_out - x_in
-                        gated_list.append(x_in + residual * mlp_gate)
-                    x_list = gated_list
-
+                if raw_head_logits is not None:
+                    head_logits_list.append(raw_head_logits)
                 head_prob_list.append(raw_head_prob)
                 head_keep_raw_list.append(raw_head_keep)
                 head_keep_effective_list.append(eff_head_keep)
@@ -1838,6 +1856,7 @@ class DINOV3Wrapper(nn.Module):
             )
         if self.use_dynamic_policy:
             self._collect_dynamic_policy_state(
+                head_logits_list=head_logits_list,
                 head_prob_list=head_prob_list,
                 head_keep_raw_list=head_keep_raw_list,
                 head_keep_effective_list=head_keep_effective_list,

@@ -30,3 +30,6 @@ dinov3/weights/*
 
 # Backup of the original Windows-worktree .git pointer; do not publish
 .git.orig_winworktree
+node_modules/
+package-lock.json
+package.json

@@ -459,9 +459,29 @@ class Options:
             "--policy_entropy_weight",
             type=float,
             default=0.1,
-            help="weight for binary entropy regularizer on head policy logits "
+            help="weight for binary entropy regularizer on raw head logits "
                  "(encourages exploration, prevents premature gate saturation). "
-                 "Matches AdaViT official head_entropy_weight=0.1. Set to 0 to disable.",
+                 "Set to 0 to disable.",
+        )
+        self.parser.add_argument(
+            "--policy_diverse_weight",
+            type=float,
+            default=0.0,
+            help="AdaViT-style per-layer/per-head diverse loss weight. "
+                 "Adds mean(|layer_head_keep - target_compute_ratio|) on the effective head gate.",
+        )
+        self.parser.add_argument(
+            "--policy_minimal_weight",
+            type=float,
+            default=0.0,
+            help="AdaViT-style soft minimal-keep weight on the effective head gate. "
+                 "This is a loss term, not a hard quota.",
+        )
+        self.parser.add_argument(
+            "--policy_minimal_target",
+            type=float,
+            default=0.0,
+            help="target lower bound used by the soft minimal-keep loss; typical values are in [0, 1].",
         )
         self.parser.add_argument(
             "--policy_mlp_gate",
@@ -1403,6 +1423,12 @@ class Options:
             raise ValueError("--target_compute_ratio must be in (0, 1].")
         if self.opt.policy_budget_weight < 0:
             raise ValueError("--policy_budget_weight must be >= 0.")
+        if self.opt.policy_diverse_weight < 0:
+            raise ValueError("--policy_diverse_weight must be >= 0.")
+        if self.opt.policy_minimal_weight < 0:
+            raise ValueError("--policy_minimal_weight must be >= 0.")
+        if not (0.0 <= self.opt.policy_minimal_target <= 1.0):
+            raise ValueError("--policy_minimal_target must be in [0, 1].")
         if self.opt.policy_warmup_epochs < 0:
             raise ValueError("--policy_warmup_epochs must be >= 0.")
         if self.opt.policy_anneal_epochs < 0:
