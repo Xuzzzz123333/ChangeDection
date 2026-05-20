@@ -1379,6 +1379,18 @@ class DINOV3Wrapper(nn.Module):
             effective = min_keep + (1.0 - min_keep) * effective
         return raw_prob, effective
 
+    def _expand_gate_with_prefix(self, gate: torch.Tensor) -> torch.Tensor:
+        """Expand a per-token gate [B, N_patch, H] to [B, N_total, H] by
+        prepending ones for prefix tokens (CLS/register). This is only needed
+        for runtime gating in token granularity mode. Budget/logging should
+        use the patch-only gate to avoid inflating cost with constant-1 prefix.
+        """
+        if gate.ndim != 3 or self.num_prefix_tokens <= 0:
+            return gate
+        B, N_patch, H = gate.shape
+        prefix_ones = torch.ones(B, self.num_prefix_tokens, H, device=gate.device, dtype=gate.dtype)
+        return torch.cat([prefix_ones, gate], dim=1)
+
     def _apply_token_policy_to_tokens(self, tokens: torch.Tensor, token_policy):
         if token_policy is None:
             return tokens
@@ -1450,11 +1462,23 @@ class DINOV3Wrapper(nn.Module):
         head_keep_raw = (
             torch.stack(head_keep_raw_list, dim=1) if head_keep_raw_list else None
         )
+        # Reduce token dim for logits/prob too (token mode → 4D → mean → 3D)
+        if head_logits is not None and head_logits.ndim == 4:
+            head_logits = head_logits.mean(dim=2)
+        if head_prob is not None and head_prob.ndim == 4:
+            head_prob = head_prob.mean(dim=2)
         head_keep_effective = (
             torch.stack(head_keep_effective_list, dim=1)
             if head_keep_effective_list
             else None
         )
+        # Token granularity produces [B, L, N_patch, H] after stacking.
+        # Reduce to [B, L, H] (mean over patch tokens) for budget/logging
+        # so all downstream code sees the same shape as image mode.
+        if head_keep_effective is not None and head_keep_effective.ndim == 4:
+            head_keep_effective = head_keep_effective.mean(dim=2)
+        if head_keep_raw is not None and head_keep_raw.ndim == 4:
+            head_keep_raw = head_keep_raw.mean(dim=2)
         block_prob = torch.stack(block_prob_list, dim=1) if block_prob_list else None
         block_keep_raw = (
             torch.stack(block_keep_raw_list, dim=1) if block_keep_raw_list else None
@@ -1691,9 +1715,16 @@ class DINOV3Wrapper(nn.Module):
 
                 raw_head_logits = None
                 if force_keep_shortcut:
-                    raw_head_keep = torch.ones(
-                        batch_size, self.num_heads, device=device, dtype=dtype,
-                    )
+                    # Shape matches policy_granularity: [B, H] for image, [B, N_patch, H] for token
+                    if self.policy_granularity == "token":
+                        n_patch = x_list[0].shape[1] - self.num_prefix_tokens
+                        raw_head_keep = torch.ones(
+                            batch_size, n_patch, self.num_heads, device=device, dtype=dtype,
+                        )
+                    else:
+                        raw_head_keep = torch.ones(
+                            batch_size, self.num_heads, device=device, dtype=dtype,
+                        )
                     raw_head_prob = raw_head_keep
                     raw_block_keep = torch.ones(
                         batch_size, 1, device=device, dtype=dtype,
@@ -1789,15 +1820,19 @@ class DINOV3Wrapper(nn.Module):
                 core_block = self._unwrap_transformer_block(blk)
                 runtime_gate_attached = False
                 runtime_mlp_gate_attached = False
-                # When ramp == 0 the effective gate is all-ones so we can skip
-                # attaching runtime gates entirely and fall back to the baseline
-                # attention/MLP block.
+                # For token granularity, expand patch-only gate to full token
+                # sequence (prefix tokens get gate=1) before passing to attn/MLP.
+                runtime_gate = (
+                    self._expand_gate_with_prefix(eff_head_keep)
+                    if eff_head_keep.ndim == 3
+                    else eff_head_keep
+                )
                 if (
                     self.use_head_policy
                     and policy_ramp > 0.0
                     and hasattr(core_block.attn, "set_runtime_head_policy")
                 ):
-                    core_block.attn.set_runtime_head_policy(eff_head_keep)
+                    core_block.attn.set_runtime_head_policy(runtime_gate)
                     runtime_gate_attached = True
                 if (
                     self.policy_mlp_gate
@@ -1805,7 +1840,7 @@ class DINOV3Wrapper(nn.Module):
                     and policy_ramp > 0.0
                     and hasattr(core_block.mlp, "set_runtime_head_policy")
                 ):
-                    core_block.mlp.set_runtime_head_policy(eff_head_keep)
+                    core_block.mlp.set_runtime_head_policy(runtime_gate)
                     runtime_mlp_gate_attached = True
                 try:
                     x_block_out = blk(x_block_in, rope_sincos)
