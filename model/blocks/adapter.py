@@ -611,6 +611,7 @@ class DINOV3Wrapper(nn.Module):
         head_topk_ratio=None,
         head_policy_apply_mode="output_gate",
         policy_mlp_gate=False,
+        policy_granularity="image",
         target_compute_ratio=0.90,
         policy_budget_weight=0.01,
         policy_warmup_epochs=3,
@@ -729,6 +730,7 @@ class DINOV3Wrapper(nn.Module):
             )
         self.head_policy_apply_mode = str(head_policy_apply_mode)
         self.policy_mlp_gate = bool(policy_mlp_gate)
+        self.policy_granularity = str(policy_granularity)
         self.target_compute_ratio = float(target_compute_ratio)
         self.policy_budget_weight = float(policy_budget_weight)
         self.policy_warmup_epochs = int(max(0, policy_warmup_epochs))
@@ -850,6 +852,7 @@ class DINOV3Wrapper(nn.Module):
                         use_head_policy=self.use_head_policy,
                         use_block_policy=self.use_block_policy,
                         use_token_policy=self.use_token_policy,
+                        policy_granularity=self.policy_granularity,
                     )
                     for _ in range(self.n_layers)
                 ]

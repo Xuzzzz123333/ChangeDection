@@ -491,6 +491,18 @@ class Options:
                  "head gate also controls MLP hidden/output width.",
         )
         self.parser.add_argument(
+            "--policy_granularity",
+            type=str,
+            default="image",
+            choices=["image", "token"],
+            help="granularity of the head policy decision. "
+                 "'image' (default, AdaViT-style): one gate per sample per head, "
+                 "all tokens share the same gate. "
+                 "'token': per-token per-head gate, each spatial position has "
+                 "independent head keep/drop decisions based on local bi-temporal "
+                 "relation features.",
+        )
+        self.parser.add_argument(
             "--policy_min_keep",
             type=float,
             default=0.0,

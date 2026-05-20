@@ -73,6 +73,7 @@ class Model(nn.Module):
             policy_min_keep=opt.policy_min_keep,
             policy_entropy_weight=opt.policy_entropy_weight,
             policy_mlp_gate=opt.policy_mlp_gate,
+            policy_granularity=opt.policy_granularity,
             policy_hidden_dim=opt.policy_hidden_dim,
             num_prefix_tokens=opt.num_prefix_tokens,
             image_size=opt.image_size,

@@ -76,6 +76,7 @@ class DynamicPolicyNet(nn.Module):
         use_block_policy: bool = False,
         use_token_policy: bool = False,
         init_keep_prob: float = DEFAULT_POLICY_INIT_KEEP_PROB,
+        policy_granularity: str = "image",
     ):
         super().__init__()
         hidden_dim = max(int(hidden_dim), 1)
@@ -84,6 +85,7 @@ class DynamicPolicyNet(nn.Module):
         self.use_head_policy = bool(use_head_policy)
         self.use_block_policy = bool(use_block_policy)
         self.use_token_policy = bool(use_token_policy)
+        self.policy_granularity = str(policy_granularity)
 
         self.fc1 = nn.Linear(embed_dim * 4, hidden_dim)
         self.act = nn.GELU()
@@ -114,17 +116,40 @@ class DynamicPolicyNet(nn.Module):
 
         x1_patch = x1[:, num_prefix_tokens:]
         x2_patch = x2[:, num_prefix_tokens:]
-        p1 = x1_patch.mean(dim=1)
-        p2 = x2_patch.mean(dim=1)
-        pd = torch.abs(x1_patch - x2_patch).mean(dim=1)
-        pm = (x1_patch * x2_patch).mean(dim=1)
 
-        rel = torch.cat([p1, p2, pd, pm], dim=-1)
-        hidden = self.act(self.fc1(rel))
+        if self.policy_granularity == "token":
+            # Per-token: compute relation features at each spatial position
+            # rel shape: [B, N_patch, 4*C]
+            rel = torch.cat([
+                x1_patch,
+                x2_patch,
+                torch.abs(x1_patch - x2_patch),
+                x1_patch * x2_patch,
+            ], dim=-1)
+            # hidden: [B, N_patch, hidden_dim]
+            hidden = self.act(self.fc1(rel))
+            # head_logits: [B, N_patch, num_heads]
+            head_logits = self.head_head(hidden) if self.head_head is not None else None
+            # block/token logits still use pooled (global decision)
+            hidden_pooled = hidden.mean(dim=1)
+            block_logits = self.block_head(hidden_pooled) if self.block_head is not None else None
+            token_logits = self.token_head(hidden_pooled) if self.token_head is not None else None
+        else:
+            # Per-image (AdaViT default): pool then predict
+            p1 = x1_patch.mean(dim=1)
+            p2 = x2_patch.mean(dim=1)
+            pd = torch.abs(x1_patch - x2_patch).mean(dim=1)
+            pm = (x1_patch * x2_patch).mean(dim=1)
+            rel = torch.cat([p1, p2, pd, pm], dim=-1)
+            hidden = self.act(self.fc1(rel))
+            head_logits = self.head_head(hidden) if self.head_head is not None else None
+            block_logits = self.block_head(hidden) if self.block_head is not None else None
+            token_logits = self.token_head(hidden) if self.token_head is not None else None
+
         return {
-            "head_logits": self.head_head(hidden) if self.head_head is not None else None,
-            "block_logits": self.block_head(hidden) if self.block_head is not None else None,
-            "token_logits": self.token_head(hidden) if self.token_head is not None else None,
+            "head_logits": head_logits,
+            "block_logits": block_logits,
+            "token_logits": token_logits,
         }
 
 
@@ -162,19 +187,28 @@ class PolicyAwareMlp(nn.Module):
         active_policy = self._runtime_head_policy
         if active_policy is None:
             return x
-        batch_size, _, dim = x.shape
-        if active_policy.shape != (batch_size, self.num_heads):
-            raise ValueError(
-                f"Runtime MLP head policy shape mismatch at layer {self.layer_index}: "
-                f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
-            )
+        batch_size, num_tokens, dim = x.shape
         if dim % self.num_heads != 0:
             raise ValueError(
                 f"MLP input dim {dim} is not divisible by num_heads={self.num_heads} "
                 f"at layer {self.layer_index}."
             )
         head_dim = dim // self.num_heads
-        gate = active_policy[:, :, None].expand(-1, -1, head_dim).reshape(batch_size, 1, dim)
+        if active_policy.ndim == 2:
+            # per-image: [B, H] → [B, 1, dim]
+            if active_policy.shape != (batch_size, self.num_heads):
+                raise ValueError(
+                    f"Runtime MLP head policy shape mismatch at layer {self.layer_index}: "
+                    f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
+                )
+            gate = active_policy[:, :, None].expand(-1, -1, head_dim).reshape(batch_size, 1, dim)
+        elif active_policy.ndim == 3:
+            # per-token: [B, N, H] → [B, N, dim]
+            gate = active_policy[:, :, :, None].expand(-1, -1, -1, head_dim).reshape(batch_size, num_tokens, dim)
+        else:
+            raise ValueError(
+                f"Unexpected MLP head policy ndim={active_policy.ndim} at layer {self.layer_index}."
+            )
         return x * gate.to(dtype=x.dtype)
 
     def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
@@ -278,19 +312,29 @@ class PolicyAwareSelfAttention(nn.Module):
         # attention-side masking used by AdaViT-style head policies, but it
         # does not physically prune the qkv/proj compute.
         if active_policy is not None:
-            if active_policy.shape != (batch_size, self.num_heads):
+            # Support both per-image [B, H] and per-token [B, N, H] gates.
+            if active_policy.ndim == 2:
+                # per-image: [B, H] → [B, H, 1, 1] for broadcast over [B, H, N, Dh]
+                if active_policy.shape != (batch_size, self.num_heads):
+                    raise ValueError(
+                        f"Runtime head policy shape mismatch at layer {self.layer_index}: "
+                        f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
+                    )
+                gate_qkv = active_policy[:, :, None, None].to(dtype=q.dtype)
+            elif active_policy.ndim == 3:
+                # per-token: [B, N, H] → [B, H, N, 1] for broadcast over [B, H, N, Dh]
+                gate_qkv = active_policy.permute(0, 2, 1).unsqueeze(-1).to(dtype=q.dtype)
+            else:
                 raise ValueError(
-                    f"Runtime head policy shape mismatch at layer {self.layer_index}: "
-                    f"expected {(batch_size, self.num_heads)}, got {tuple(active_policy.shape)}."
+                    f"Unexpected head policy ndim={active_policy.ndim} at layer {self.layer_index}."
                 )
-            gate = active_policy[:, :, None, None].to(dtype=q.dtype)  # [B, H, 1, 1]
 
             if self.apply_mode == "output_gate":
                 # QKV-gated approximation of AdaViT width_select on the
                 # attention branch. Dropped heads have Q=K=V=0.
-                q = q * gate
-                k = k * gate
-                v = v * gate
+                q = q * gate_qkv
+                k = k * gate_qkv
+                v = v * gate_qkv
             else:
                 # attn_identity mode: we need v BEFORE gating for the
                 # identity blend after attention. Store ungated v.
@@ -326,12 +370,13 @@ class PolicyAwareSelfAttention(nn.Module):
 
         # Post-attention policy application (only for attn_identity mode)
         if active_policy is not None and self.apply_mode == "attn_identity":
-            gate = active_policy[:, None, :, None].to(dtype=x.dtype)  # [B, 1, H, 1]
-            # AdaViT official only_head_attn mode: dropped heads use identity
-            # attention (output = input value). Blend:
-            #   x = gate * (attn @ v) + (1 - gate) * v
+            # x shape: [B, N, H, Dh]. Gate needs to broadcast accordingly.
+            if active_policy.ndim == 2:
+                gate_out = active_policy[:, None, :, None].to(dtype=x.dtype)  # [B, 1, H, 1]
+            else:
+                gate_out = active_policy[:, :, :, None].to(dtype=x.dtype)  # [B, N, H, 1]
             v_id = self._last_v.transpose(1, 2)  # [B, N, H, head_dim]
-            x = gate * x + (1.0 - gate) * v_id
+            x = gate_out * x + (1.0 - gate_out) * v_id
 
         return x.reshape(batch_size, num_tokens, dim)
 
