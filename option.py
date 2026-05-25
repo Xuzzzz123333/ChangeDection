@@ -503,6 +503,30 @@ class Options:
                  "relation features.",
         )
         self.parser.add_argument(
+            "--head_policy_baseline",
+            type=str,
+            default="learned",
+            choices=["learned", "random_dynamic", "random_fixed"],
+            help="source of the head gate. "
+                 "'learned' uses DynamicPolicyNet logits (default). "
+                 "'random_dynamic' samples a fresh Bernoulli head mask every forward. "
+                 "'random_fixed' uses one deterministic random mask per layer for the whole run. "
+                 "All modes keep the same apply_mode/granularity/runtime path; only the head-gate source changes.",
+        )
+        self.parser.add_argument(
+            "--random_head_keep_ratio",
+            type=float,
+            default=None,
+            help="expected keep probability used by random head-policy baselines. "
+                 "Required when --head_policy_baseline is random_dynamic or random_fixed.",
+        )
+        self.parser.add_argument(
+            "--random_head_policy_seed",
+            type=int,
+            default=0,
+            help="seed used by the deterministic random_fixed head-policy baseline.",
+        )
+        self.parser.add_argument(
             "--policy_min_keep",
             type=float,
             default=0.0,
@@ -1431,6 +1455,25 @@ class Options:
             raise ValueError("--policy_threshold must be in [0, 1].")
         if self.opt.head_topk_ratio is not None and not (0.0 < self.opt.head_topk_ratio <= 1.0):
             raise ValueError("--head_topk_ratio must be in (0, 1].")
+        if self.opt.head_policy_baseline not in {"learned", "random_dynamic", "random_fixed"}:
+            raise ValueError(
+                "--head_policy_baseline must be one of {'learned', 'random_dynamic', 'random_fixed'}."
+            )
+        if self.opt.head_policy_baseline != "learned":
+            if not self.opt.use_dynamic_policy or not self.opt.use_head_policy:
+                raise ValueError(
+                    "--head_policy_baseline requires --use_dynamic_policy and --use_head_policy."
+                )
+            if self.opt.random_head_keep_ratio is None:
+                raise ValueError(
+                    "--random_head_keep_ratio is required when --head_policy_baseline is random_dynamic or random_fixed."
+                )
+            if self.opt.head_topk_ratio is not None:
+                raise ValueError(
+                    "--head_topk_ratio is not supported with random head-policy baselines."
+                )
+        if self.opt.random_head_keep_ratio is not None and not (0.0 < self.opt.random_head_keep_ratio <= 1.0):
+            raise ValueError("--random_head_keep_ratio must be in (0, 1].")
         if not (0.0 < self.opt.target_compute_ratio <= 1.0):
             raise ValueError("--target_compute_ratio must be in (0, 1].")
         if self.opt.policy_budget_weight < 0:
@@ -1750,6 +1793,19 @@ class Options:
             raise ValueError("--dino_temporal_exchange_p must be > 0.")
         if not self.opt.dino_temporal_exchange_layers:
             raise ValueError("--dino_temporal_exchange_layers expects at least one index.")
+        if self.opt.dino_temporal_exchange_enable and (
+            self.opt.decoder_cgla_prior_enable
+            or self.opt.decoder_cgla_bifpn_enable
+            or self.opt.cgla_temporal_reg_enable
+        ):
+            raise ValueError(
+                "--dino_temporal_exchange_enable cannot currently be combined with "
+                "--decoder_cgla_prior_enable, --decoder_cgla_bifpn_enable, or "
+                "--cgla_temporal_reg_enable because the current implementation "
+                "extracts CGLA priors before temporal exchange, which would make "
+                "decoder guidance / temporal regularization act on a different "
+                "feature state than the one consumed by the detector."
+            )
         if self.opt.pairlocal_rf_enable and not self.opt.pairlocal_enable:
             raise ValueError("--pairlocal_rf_enable requires --pairlocal_enable to be enabled.")
         if self.opt.pairlocal_rf_num_branches <= 0:

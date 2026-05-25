@@ -74,6 +74,9 @@ class Model(nn.Module):
             policy_entropy_weight=opt.policy_entropy_weight,
             policy_mlp_gate=opt.policy_mlp_gate,
             policy_granularity=opt.policy_granularity,
+            head_policy_baseline=opt.head_policy_baseline,
+            random_head_keep_ratio=opt.random_head_keep_ratio,
+            random_head_policy_seed=opt.random_head_policy_seed,
             policy_hidden_dim=opt.policy_hidden_dim,
             num_prefix_tokens=opt.num_prefix_tokens,
             image_size=opt.image_size,
@@ -239,6 +242,10 @@ class Model(nn.Module):
                 print(f"policy_minimal_weight = {opt.policy_minimal_weight}")
                 print(f"policy_minimal_target = {opt.policy_minimal_target}")
                 print(f"policy_mlp_gate = {opt.policy_mlp_gate}")
+                print(f"policy_granularity = {opt.policy_granularity}")
+                print(f"head_policy_baseline = {opt.head_policy_baseline}")
+                print(f"random_head_keep_ratio = {opt.random_head_keep_ratio}")
+                print(f"random_head_policy_seed = {opt.random_head_policy_seed}")
                 print(f"head_policy_apply_mode = {opt.head_policy_apply_mode}")
                 print(f"policy_min_keep = {opt.policy_min_keep}")
                 print(f"policy_warmup_epochs = {opt.policy_warmup_epochs}")
@@ -1241,6 +1248,18 @@ class Model(nn.Module):
             dino = getattr(getattr(network, "encoder", None), "dino", None)
             dynamic_state = self._collect_dynamic_policy_state() or {}
             budget_loss = None
+            random_head_policy_baseline = bool(
+                dino is not None
+                and getattr(dino, "use_head_policy", False)
+                and getattr(dino, "head_policy_baseline", "learned") != "learned"
+            )
+            has_learned_non_head_policy = bool(
+                dino is not None
+                and (
+                    getattr(dino, "use_block_policy", False)
+                    or getattr(dino, "use_token_policy", False)
+                )
+            )
             target_ratio = self._dynamic_policy_target_ratio(self.current_epoch)
             budget_lambda = self._dynamic_policy_budget_lambda(self.current_epoch)
             loss_type = str(
@@ -1249,7 +1268,11 @@ class Model(nn.Module):
             granularity = str(
                 getattr(self.opt, "policy_budget_granularity", "per_layer")
             )
-            if dino is not None and hasattr(dino, "dynamic_policy_budget_loss"):
+            if (
+                ((not random_head_policy_baseline) or has_learned_non_head_policy)
+                and dino is not None
+                and hasattr(dino, "dynamic_policy_budget_loss")
+            ):
                 budget_loss = dino.dynamic_policy_budget_loss(
                     target_ratio=target_ratio,
                     head_weight=self.opt.policy_head_weight,
@@ -1334,7 +1357,8 @@ class Model(nn.Module):
 
             diverse_loss = None
             if (
-                diverse_weight > 0
+                (not random_head_policy_baseline)
+                and diverse_weight > 0
                 and dino is not None
                 and hasattr(dino, "dynamic_policy_diverse_loss")
             ):
@@ -1342,7 +1366,8 @@ class Model(nn.Module):
 
             minimal_loss = None
             if (
-                minimal_weight > 0
+                (not random_head_policy_baseline)
+                and minimal_weight > 0
                 and minimal_target > 0
                 and dino is not None
                 and hasattr(dino, "dynamic_policy_minimal_loss")
@@ -1350,7 +1375,12 @@ class Model(nn.Module):
                 minimal_loss = dino.dynamic_policy_minimal_loss(minimal_keep=minimal_target)
 
             entropy_loss = None
-            if entropy_weight > 0 and dino is not None and hasattr(dino, "policy_entropy_loss"):
+            if (
+                (not random_head_policy_baseline)
+                and entropy_weight > 0
+                and dino is not None
+                and hasattr(dino, "policy_entropy_loss")
+            ):
                 entropy_loss = dino.policy_entropy_loss()
 
             self.last_aux_losses["dynamic_policy_budget_loss"] = (

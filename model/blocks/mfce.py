@@ -795,13 +795,28 @@ class TemporalFeatureExchange(nn.Module):
         self.p = max(1, int(p))
         self.layers = tuple(sorted(set(int(index) for index in layers)))
 
+    def _effective_mode(self) -> str:
+        if self.training:
+            return self.mode
+        # Random temporal exchange is a training-time regularizer. During
+        # validation/test we fall back to the deterministic counterpart so the
+        # same checkpoint yields stable metrics across repeated eval runs.
+        if self.mode == "rand_layer":
+            return "layer"
+        if self.mode == "rand_channel":
+            return "channel"
+        if self.mode == "rand_spatial":
+            return "spatial"
+        return self.mode
+
     @staticmethod
     def _swap_by_mask(feat1, feat2, mask):
         return torch.where(mask, feat2, feat1), torch.where(mask, feat1, feat2)
 
     def _channel_mask(self, feat):
         channels = feat.shape[1]
-        if self.mode == "rand_channel":
+        mode = self._effective_mode()
+        if mode == "rand_channel":
             mask = torch.rand(channels, device=feat.device) < self.thresh
         else:
             mask = torch.zeros(channels, dtype=torch.bool, device=feat.device)
@@ -810,7 +825,8 @@ class TemporalFeatureExchange(nn.Module):
 
     def _spatial_mask(self, feat):
         height, width = feat.shape[-2:]
-        if self.mode == "rand_spatial":
+        mode = self._effective_mode()
+        if mode == "rand_spatial":
             mask = torch.rand(height, width, device=feat.device) < self.thresh
         else:
             mask = torch.zeros(height, width, dtype=torch.bool, device=feat.device)
@@ -821,12 +837,14 @@ class TemporalFeatureExchange(nn.Module):
     def _should_swap_layer(self, layer_index: int):
         if layer_index not in self.layers:
             return False
-        if self.mode == "layer":
+        mode = self._effective_mode()
+        if mode == "layer":
             return layer_index % 2 == 0
         return torch.rand(1, device="cpu").item() < self.thresh
 
     def forward(self, feats1, feats2):
-        if self.mode == "none":
+        mode = self._effective_mode()
+        if mode == "none":
             return tuple(feats1), tuple(feats2)
         if len(feats1) != len(feats2):
             raise ValueError(
@@ -837,7 +855,7 @@ class TemporalFeatureExchange(nn.Module):
         out2 = list(feats2)
 
         for layer_index, (feat1, feat2) in enumerate(zip(out1, out2)):
-            if self.mode in {"layer", "rand_layer"}:
+            if mode in {"layer", "rand_layer"}:
                 if self._should_swap_layer(layer_index):
                     out1[layer_index], out2[layer_index] = feat2, feat1
                 continue
@@ -845,7 +863,7 @@ class TemporalFeatureExchange(nn.Module):
             if layer_index not in self.layers:
                 continue
 
-            if self.mode in {"channel", "rand_channel"}:
+            if mode in {"channel", "rand_channel"}:
                 mask = self._channel_mask(feat1)
             else:
                 mask = self._spatial_mask(feat1)

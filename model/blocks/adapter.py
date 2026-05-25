@@ -612,6 +612,9 @@ class DINOV3Wrapper(nn.Module):
         head_policy_apply_mode="output_gate",
         policy_mlp_gate=False,
         policy_granularity="image",
+        head_policy_baseline="learned",
+        random_head_keep_ratio=None,
+        random_head_policy_seed=0,
         target_compute_ratio=0.90,
         policy_budget_weight=0.01,
         policy_warmup_epochs=3,
@@ -731,6 +734,20 @@ class DINOV3Wrapper(nn.Module):
         self.head_policy_apply_mode = str(head_policy_apply_mode)
         self.policy_mlp_gate = bool(policy_mlp_gate)
         self.policy_granularity = str(policy_granularity)
+        if str(head_policy_baseline) not in {"learned", "random_dynamic", "random_fixed"}:
+            raise ValueError(
+                "head_policy_baseline must be one of {'learned', 'random_dynamic', 'random_fixed'}, "
+                f"got {head_policy_baseline!r}"
+            )
+        self.head_policy_baseline = str(head_policy_baseline)
+        self.random_head_keep_ratio = (
+            None if random_head_keep_ratio is None else float(random_head_keep_ratio)
+        )
+        self.random_head_policy_seed = int(random_head_policy_seed)
+        if self.head_policy_baseline != "learned" and not self.use_head_policy:
+            raise ValueError(
+                "random head-policy baselines require use_head_policy=True."
+            )
         self.target_compute_ratio = float(target_compute_ratio)
         self.policy_budget_weight = float(policy_budget_weight)
         self.policy_warmup_epochs = int(max(0, policy_warmup_epochs))
@@ -1290,14 +1307,27 @@ class DINOV3Wrapper(nn.Module):
             # Per-layer cost tensor of shape [num_layers]. The head dimension
             # is averaged per layer (i.e. policy_cost_layer_l =
             # head_weight * mean_over_heads(head_keep[:, l, :]) + ...).
-            # We then apply shape_loss per-layer and average.
+            # We then apply shape_loss per-layer and average. For token
+            # granularity we preserve the patch-token axis, producing
+            # [num_layers, num_patch_tokens], so each spatial position is
+            # regularized instead of only its layer-wise average.
             per_layer_components = []
-            head_keep_eff = state.get("head_keep_effective")
+            head_keep_eff = self._head_keep_for_policy_losses(
+                state, effective=True
+            )
             block_keep_eff = state.get("block_keep_effective")
             token_keep_eff = state.get("token_keep_effective")
             if head_keep_eff is not None and head_weight != 0.0:
-                # head_keep_eff shape: [B, num_layers, num_heads]
-                per_layer_components.append(head_weight * head_keep_eff.mean(dim=(0, 2)))
+                if head_keep_eff.ndim == 4:
+                    # [B, L, N_patch, H] -> [L, N_patch]
+                    per_layer_components.append(
+                        head_weight * head_keep_eff.mean(dim=(0, 3))
+                    )
+                else:
+                    # [B, L, H] -> [L]
+                    per_layer_components.append(
+                        head_weight * head_keep_eff.mean(dim=(0, 2))
+                    )
             if block_keep_eff is not None and block_weight != 0.0:
                 # block_keep_eff shape: [B, num_layers, 1]
                 per_layer_components.append(
@@ -1312,6 +1342,18 @@ class DINOV3Wrapper(nn.Module):
                 # Fall back to zero tensor attached to the graph so callers
                 # still get a differentiable object.
                 return state["effective_mean_head_keep"] * 0.0
+            if any(component.ndim == 2 for component in per_layer_components):
+                num_patch_tokens = next(
+                    component.shape[1]
+                    for component in per_layer_components
+                    if component.ndim == 2
+                )
+                per_layer_components = [
+                    component
+                    if component.ndim == 2
+                    else component[:, None].expand(-1, num_patch_tokens)
+                    for component in per_layer_components
+                ]
             per_layer_cost = torch.stack(per_layer_components, dim=0).sum(dim=0)
             target_tensor = per_layer_cost.new_tensor(float(target_ratio))
             return shape_loss(per_layer_cost, target_tensor).mean()
@@ -1325,7 +1367,7 @@ class DINOV3Wrapper(nn.Module):
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None:
             return None
-        head_keep_eff = state.get("head_keep_effective")
+        head_keep_eff = self._head_keep_for_policy_losses(state, effective=True)
         if head_keep_eff is None:
             return None
         head_mean = head_keep_eff.mean(dim=0)
@@ -1336,7 +1378,7 @@ class DINOV3Wrapper(nn.Module):
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None or minimal_keep <= 0.0:
             return None
-        head_keep_eff = state.get("head_keep_effective")
+        head_keep_eff = self._head_keep_for_policy_losses(state, effective=True)
         if head_keep_eff is None:
             return None
         head_mean = head_keep_eff.mean(dim=0)
@@ -1344,17 +1386,126 @@ class DINOV3Wrapper(nn.Module):
         return torch.clamp(target - head_mean, min=0.0).sum()
 
     def policy_entropy_loss(self):
-        """Binary entropy regularizer on the raw head logits, following AdaViT."""
+        """Binary entropy regularizer on raw head logits.
+
+        For token granularity we keep the unreduced ``[B, L, N_patch, H]``
+        logits so entropy is computed per token/head before averaging. Using
+        ``sigmoid(mean(logits))`` would let confident positive/negative token
+        logits cancel each other and artificially inflate entropy.
+        """
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None:
             return None
-        head_logits = state.get("head_logits")
+        head_logits = state.get("head_logits_unreduced")
+        if head_logits is None:
+            head_logits = state.get("head_logits")
         if head_logits is None:
             return None
         eps = 1e-7
         p = torch.sigmoid(head_logits).clamp(eps, 1.0 - eps)
         entropy = -(p * p.log() + (1.0 - p) * (1.0 - p).log())
         return entropy.mean()
+
+    def _head_keep_for_policy_losses(
+        self,
+        state: dict | None,
+        *,
+        effective: bool,
+    ):
+        if state is None:
+            return None
+        if effective:
+            tensor = state.get("head_keep_effective_unreduced")
+            if tensor is not None:
+                return tensor
+            return state.get("head_keep_effective")
+        tensor = state.get("head_keep_raw_unreduced")
+        if tensor is not None:
+            return tensor
+        return state.get("head_keep_raw")
+
+    def uses_random_head_policy_baseline(self) -> bool:
+        return self.use_head_policy and self.head_policy_baseline != "learned"
+
+    def _random_head_policy_prob(
+        self,
+        batch_size: int,
+        num_patch_tokens: int,
+        device,
+        dtype,
+    ):
+        keep_ratio = float(
+            1.0 if self.random_head_keep_ratio is None else self.random_head_keep_ratio
+        )
+        if self.policy_granularity == "token":
+            return torch.full(
+                (batch_size, num_patch_tokens, self.num_heads),
+                keep_ratio,
+                device=device,
+                dtype=dtype,
+            )
+        return torch.full(
+            (batch_size, self.num_heads),
+            keep_ratio,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _sample_random_head_policy(
+        self,
+        batch_size: int,
+        num_patch_tokens: int,
+        device,
+        dtype,
+        *,
+        layer_index: int,
+    ):
+        keep_ratio = float(
+            1.0 if self.random_head_keep_ratio is None else self.random_head_keep_ratio
+        )
+        if self.head_policy_baseline == "random_dynamic":
+            if self.policy_granularity == "token":
+                sample = torch.rand(
+                    batch_size,
+                    num_patch_tokens,
+                    self.num_heads,
+                    device=device,
+                ) < keep_ratio
+            else:
+                sample = torch.rand(
+                    batch_size,
+                    self.num_heads,
+                    device=device,
+                ) < keep_ratio
+            return sample.to(dtype=dtype)
+        if self.head_policy_baseline == "random_fixed":
+            if self.policy_granularity == "token":
+                base_shape = (num_patch_tokens, self.num_heads)
+            else:
+                base_shape = (self.num_heads,)
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(
+                int(self.random_head_policy_seed)
+                + 1009 * int(layer_index)
+                + 1000003 * int(max(1, num_patch_tokens))
+            )
+            sample = (torch.rand(base_shape, generator=generator) < keep_ratio).to(
+                device=device,
+                dtype=dtype,
+            )
+            if self.policy_granularity == "token":
+                return sample.unsqueeze(0).expand(batch_size, -1, -1)
+            return sample.unsqueeze(0).expand(batch_size, -1)
+        raise ValueError(
+            f"Unsupported head_policy_baseline: {self.head_policy_baseline!r}"
+        )
+
+    def _apply_policy_min_keep(self, raw_prob, effective):
+        if self.policy_min_keep > 0.0:
+            min_keep = float(self.policy_min_keep)
+            raw_prob = min_keep + (1.0 - min_keep) * raw_prob
+            effective = min_keep + (1.0 - min_keep) * effective
+        return raw_prob, effective
 
     def _policy_from_logits(self, logits, kind: str):
         if logits is None:
@@ -1370,26 +1521,51 @@ class DINOV3Wrapper(nn.Module):
         )
         if (not self.training) and kind == "head" and self.head_topk_ratio is not None:
             effective = apply_topk_policy(raw_prob, self.head_topk_ratio)
-        # Hard floor / bounded sigmoid: remap sample in [0, 1] to [min_keep, 1].
-        # This prevents "gate death spiral" (sigmoid saturating at 0 -> zero
-        # gradient -> head never recovers). min_keep=0.0 is a no-op.
-        if self.policy_min_keep > 0.0:
-            min_keep = float(self.policy_min_keep)
-            raw_prob = min_keep + (1.0 - min_keep) * raw_prob
-            effective = min_keep + (1.0 - min_keep) * effective
+        raw_prob, effective = self._apply_policy_min_keep(raw_prob, effective)
         return raw_prob, effective
 
-    def _expand_gate_with_prefix(self, gate: torch.Tensor) -> torch.Tensor:
+    def _expand_gate_with_prefix(
+        self,
+        gate: torch.Tensor,
+        expected_total_tokens: int | None = None,
+    ) -> torch.Tensor:
         """Expand a per-token gate [B, N_patch, H] to [B, N_total, H] by
-        prepending ones for prefix tokens (CLS/register). This is only needed
-        for runtime gating in token granularity mode. Budget/logging should
-        use the patch-only gate to avoid inflating cost with constant-1 prefix.
+        prepending ones for prefix tokens (CLS/register).
+
+        This is only needed for runtime gating in token granularity mode.
+        Budget/logging should use the patch-only gate to avoid inflating cost
+        with constant-1 prefix rows.
         """
-        if gate.ndim != 3 or self.num_prefix_tokens <= 0:
+        if gate.ndim != 3:
             return gate
-        B, N_patch, H = gate.shape
-        prefix_ones = torch.ones(B, self.num_prefix_tokens, H, device=gate.device, dtype=gate.dtype)
-        return torch.cat([prefix_ones, gate], dim=1)
+        if gate.shape[-1] != self.num_heads:
+            raise ValueError(
+                f"Per-token head gate shape mismatch: expected num_heads={self.num_heads}, "
+                f"got {tuple(gate.shape)}."
+            )
+        if self.num_prefix_tokens <= 0:
+            if expected_total_tokens is not None and gate.shape[1] != int(expected_total_tokens):
+                raise ValueError(
+                    "Per-token head gate length does not match the runtime token count. "
+                    f"gate={tuple(gate.shape)}, expected_total_tokens={int(expected_total_tokens)}"
+                )
+            return gate
+        batch_size, num_patch_tokens, num_heads = gate.shape
+        prefix_ones = torch.ones(
+            batch_size,
+            self.num_prefix_tokens,
+            num_heads,
+            device=gate.device,
+            dtype=gate.dtype,
+        )
+        expanded = torch.cat([prefix_ones, gate], dim=1)
+        if expected_total_tokens is not None and expanded.shape[1] != int(expected_total_tokens):
+            raise ValueError(
+                "Expanded per-token head gate length does not match the runtime token count. "
+                f"gate={tuple(gate.shape)}, expanded={tuple(expanded.shape)}, "
+                f"expected_total_tokens={int(expected_total_tokens)}"
+            )
+        return expanded
 
     def _apply_token_policy_to_tokens(self, tokens: torch.Tensor, token_policy):
         if token_policy is None:
@@ -1457,21 +1633,31 @@ class DINOV3Wrapper(nn.Module):
         refer to the effective tensors (what the meter and downstream
         visualizations want); raw copies are exposed as ``*_raw`` fields.
         """
-        head_logits = torch.stack(head_logits_list, dim=1) if head_logits_list else None
-        head_prob = torch.stack(head_prob_list, dim=1) if head_prob_list else None
-        head_keep_raw = (
+        head_logits_unreduced = (
+            torch.stack(head_logits_list, dim=1) if head_logits_list else None
+        )
+        head_logits = head_logits_unreduced
+        head_prob_unreduced = (
+            torch.stack(head_prob_list, dim=1) if head_prob_list else None
+        )
+        head_prob = head_prob_unreduced
+        head_keep_raw_unreduced = (
             torch.stack(head_keep_raw_list, dim=1) if head_keep_raw_list else None
         )
-        # Reduce token dim for logits/prob too (token mode → 4D → mean → 3D)
+        head_keep_raw = head_keep_raw_unreduced
+        # Reduce token dim for logging/meter compatibility, but keep the
+        # unreduced tensors so token granularity losses can still operate on
+        # the original [B, L, N_patch, H] head policy.
         if head_logits is not None and head_logits.ndim == 4:
             head_logits = head_logits.mean(dim=2)
         if head_prob is not None and head_prob.ndim == 4:
             head_prob = head_prob.mean(dim=2)
-        head_keep_effective = (
+        head_keep_effective_unreduced = (
             torch.stack(head_keep_effective_list, dim=1)
             if head_keep_effective_list
             else None
         )
+        head_keep_effective = head_keep_effective_unreduced
         # Token granularity produces [B, L, N_patch, H] after stacking.
         # Reduce to [B, L, H] (mean over patch tokens) for budget/logging
         # so all downstream code sees the same shape as image mode.
@@ -1595,11 +1781,15 @@ class DINOV3Wrapper(nn.Module):
         self.last_dynamic_policy_state = {
             "batch_size": torch.tensor(float(batch_size), device=device),
             "head_logits": head_logits,
+            "head_logits_unreduced": head_logits_unreduced,
             "head_prob": head_prob,
+            "head_prob_unreduced": head_prob_unreduced,
             # Backwards-compat aliases: head_keep / mean_head_keep == effective
             "head_keep": head_keep_effective,
             "head_keep_raw": head_keep_raw,
+            "head_keep_raw_unreduced": head_keep_raw_unreduced,
             "head_keep_effective": head_keep_effective,
+            "head_keep_effective_unreduced": head_keep_effective_unreduced,
             "block_prob": block_prob,
             "block_keep": block_keep_effective,
             "block_keep_raw": block_keep_raw,
@@ -1714,10 +1904,10 @@ class DINOV3Wrapper(nn.Module):
                 dtype = x_list[0].dtype
 
                 raw_head_logits = None
+                n_patch = x_list[0].shape[1] - self.num_prefix_tokens
                 if force_keep_shortcut:
                     # Shape matches policy_granularity: [B, H] for image, [B, N_patch, H] for token
                     if self.policy_granularity == "token":
-                        n_patch = x_list[0].shape[1] - self.num_prefix_tokens
                         raw_head_keep = torch.ones(
                             batch_size, n_patch, self.num_heads, device=device, dtype=dtype,
                         )
@@ -1735,27 +1925,68 @@ class DINOV3Wrapper(nn.Module):
                     if self.use_token_policy:
                         raw_token_keep = torch.ones(
                             batch_size,
-                            x_list[0].shape[1] - self.num_prefix_tokens,
+                            n_patch,
                             device=device,
                             dtype=dtype,
                         )
                         raw_token_prob = raw_token_keep
                 else:
-                    policy_outputs = self.policy_nets[block_index](
-                        x_list[0],
-                        x_list[1],
-                        num_prefix_tokens=self.num_prefix_tokens,
+                    needs_policy_outputs = (
+                        (not self.uses_random_head_policy_baseline())
+                        or self.use_block_policy
+                        or self.use_token_policy
                     )
-                    raw_head_logits = policy_outputs["head_logits"]
-                    raw_head_prob, raw_head_keep = self._policy_from_logits(
-                        raw_head_logits, kind="head"
-                    )
-                    if raw_head_keep is None:
-                        raw_head_keep = torch.ones(
-                            batch_size, self.num_heads, device=device, dtype=dtype,
+                    if needs_policy_outputs:
+                        policy_outputs = self.policy_nets[block_index](
+                            x_list[0],
+                            x_list[1],
+                            num_prefix_tokens=self.num_prefix_tokens,
                         )
-                    if raw_head_prob is None:
-                        raw_head_prob = raw_head_keep
+                    else:
+                        policy_outputs = {
+                            "head_logits": None,
+                            "block_logits": None,
+                            "token_logits": None,
+                        }
+
+                    if self.uses_random_head_policy_baseline():
+                        raw_head_prob = self._random_head_policy_prob(
+                            batch_size,
+                            n_patch,
+                            device,
+                            dtype,
+                        )
+                        raw_head_keep = self._sample_random_head_policy(
+                            batch_size,
+                            n_patch,
+                            device,
+                            dtype,
+                            layer_index=block_index,
+                        )
+                        raw_head_prob, raw_head_keep = self._apply_policy_min_keep(
+                            raw_head_prob,
+                            raw_head_keep,
+                        )
+                    else:
+                        raw_head_logits = policy_outputs["head_logits"]
+                        raw_head_prob, raw_head_keep = self._policy_from_logits(
+                            raw_head_logits, kind="head"
+                        )
+                        if raw_head_keep is None:
+                            if self.policy_granularity == "token":
+                                raw_head_keep = torch.ones(
+                                    batch_size,
+                                    n_patch,
+                                    self.num_heads,
+                                    device=device,
+                                    dtype=dtype,
+                                )
+                            else:
+                                raw_head_keep = torch.ones(
+                                    batch_size, self.num_heads, device=device, dtype=dtype,
+                                )
+                        if raw_head_prob is None:
+                            raw_head_prob = raw_head_keep
 
                     raw_block_prob, raw_block_keep = self._policy_from_logits(
                         policy_outputs["block_logits"], kind="block"
@@ -1773,7 +2004,7 @@ class DINOV3Wrapper(nn.Module):
                     if self.use_token_policy and raw_token_keep is None:
                         raw_token_keep = torch.ones(
                             batch_size,
-                            x_list[0].shape[1] - self.num_prefix_tokens,
+                            n_patch,
                             device=device,
                             dtype=dtype,
                         )
@@ -1822,8 +2053,12 @@ class DINOV3Wrapper(nn.Module):
                 runtime_mlp_gate_attached = False
                 # For token granularity, expand patch-only gate to full token
                 # sequence (prefix tokens get gate=1) before passing to attn/MLP.
+                expected_total_tokens = int(x_block_in[0].shape[1]) if x_block_in else None
                 runtime_gate = (
-                    self._expand_gate_with_prefix(eff_head_keep)
+                    self._expand_gate_with_prefix(
+                        eff_head_keep,
+                        expected_total_tokens=expected_total_tokens,
+                    )
                     if eff_head_keep.ndim == 3
                     else eff_head_keep
                 )
