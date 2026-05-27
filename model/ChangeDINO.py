@@ -238,6 +238,8 @@ class Encoder(nn.Module):
             policy_min_keep=kwargs.get("policy_min_keep", 0.0),
             policy_mlp_gate=kwargs.get("policy_mlp_gate", False),
             policy_granularity=kwargs.get("policy_granularity", "image"),
+            policy_cgla_prior_enable=kwargs.get("policy_cgla_prior_enable", False),
+            policy_cgla_prior_source=kwargs.get("policy_cgla_prior_source", "delta"),
             head_policy_baseline=kwargs.get("head_policy_baseline", "learned"),
             random_head_keep_ratio=kwargs.get("random_head_keep_ratio", None),
             random_head_policy_seed=kwargs.get("random_head_policy_seed", 0),

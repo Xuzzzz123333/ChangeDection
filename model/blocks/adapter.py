@@ -612,6 +612,8 @@ class DINOV3Wrapper(nn.Module):
         head_policy_apply_mode="output_gate",
         policy_mlp_gate=False,
         policy_granularity="image",
+        policy_cgla_prior_enable=False,
+        policy_cgla_prior_source="delta",
         head_policy_baseline="learned",
         random_head_keep_ratio=None,
         random_head_policy_seed=0,
@@ -734,6 +736,14 @@ class DINOV3Wrapper(nn.Module):
         self.head_policy_apply_mode = str(head_policy_apply_mode)
         self.policy_mlp_gate = bool(policy_mlp_gate)
         self.policy_granularity = str(policy_granularity)
+        self.policy_cgla_prior_enable = bool(policy_cgla_prior_enable)
+        self.policy_cgla_prior_source = str(policy_cgla_prior_source)
+        if self.policy_cgla_prior_source not in {"delta", "spatial", "local"}:
+            raise ValueError(
+                "policy_cgla_prior_source must be one of {'delta', 'spatial', 'local'}, "
+                f"got {policy_cgla_prior_source!r}"
+            )
+        self.policy_cgla_prior_summary_dim = 2 if self.policy_cgla_prior_enable else 0
         if str(head_policy_baseline) not in {"learned", "random_dynamic", "random_fixed"}:
             raise ValueError(
                 "head_policy_baseline must be one of {'learned', 'random_dynamic', 'random_fixed'}, "
@@ -870,6 +880,7 @@ class DINOV3Wrapper(nn.Module):
                         use_block_policy=self.use_block_policy,
                         use_token_policy=self.use_token_policy,
                         policy_granularity=self.policy_granularity,
+                        extra_feature_dim=self.policy_cgla_prior_summary_dim,
                     )
                     for _ in range(self.n_layers)
                 ]
@@ -1567,6 +1578,22 @@ class DINOV3Wrapper(nn.Module):
             )
         return expanded
 
+    def _summarize_policy_cgla_prior(self, prior, *, device, dtype):
+        if not self.policy_cgla_prior_enable or prior is None:
+            return None
+        response = prior.get(self.policy_cgla_prior_source)
+        if response is None:
+            return None
+        if response.ndim != 4:
+            raise ValueError(
+                f"Expected CGLA prior map with shape [B, C, H, W], got {tuple(response.shape)}."
+            )
+        response = response.to(device=device, dtype=dtype)
+        flat = response.flatten(2)
+        mean = flat.mean(dim=-1)
+        peak = flat.amax(dim=-1)
+        return torch.cat([mean, peak], dim=-1)
+
     def _apply_token_policy_to_tokens(self, tokens: torch.Tensor, token_policy):
         if token_policy is None:
             return tokens
@@ -1882,6 +1909,7 @@ class DINOV3Wrapper(nn.Module):
         # This replaces the previous step change from force_keep=1 to
         # learned, which let the gate collapse the moment anneal started.
         policy_ramp = self._compute_policy_ramp() if self.use_dynamic_policy else 0.0
+        latest_policy_prior_feature = None
         for block_index, blk in enumerate(self.model.blocks):
             if self.model.rope_embed is not None:
                 rope_sincos = [
@@ -1941,6 +1969,7 @@ class DINOV3Wrapper(nn.Module):
                             x_list[0],
                             x_list[1],
                             num_prefix_tokens=self.num_prefix_tokens,
+                            extra_features=latest_policy_prior_feature,
                         )
                     else:
                         policy_outputs = {
@@ -2101,6 +2130,15 @@ class DINOV3Wrapper(nn.Module):
                     x_block_out,
                     effective_block_policy,
                 )
+
+                if self.policy_cgla_prior_enable:
+                    current_policy_prior_feature = self._summarize_policy_cgla_prior(
+                        getattr(blk, "last_change_prior", None),
+                        device=device,
+                        dtype=dtype,
+                    )
+                    if current_policy_prior_feature is not None:
+                        latest_policy_prior_feature = current_policy_prior_feature
 
                 if raw_head_logits is not None:
                     head_logits_list.append(raw_head_logits)

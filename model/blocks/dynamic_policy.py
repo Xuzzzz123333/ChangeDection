@@ -77,6 +77,7 @@ class DynamicPolicyNet(nn.Module):
         use_token_policy: bool = False,
         init_keep_prob: float = DEFAULT_POLICY_INIT_KEEP_PROB,
         policy_granularity: str = "image",
+        extra_feature_dim: int = 0,
     ):
         super().__init__()
         hidden_dim = max(int(hidden_dim), 1)
@@ -86,9 +87,16 @@ class DynamicPolicyNet(nn.Module):
         self.use_block_policy = bool(use_block_policy)
         self.use_token_policy = bool(use_token_policy)
         self.policy_granularity = str(policy_granularity)
+        self.extra_feature_dim = max(int(extra_feature_dim), 0)
 
         self.fc1 = nn.Linear(embed_dim * 4, hidden_dim)
         self.act = nn.GELU()
+        self.head_extra_proj = None
+        if self.use_head_policy and self.extra_feature_dim > 0:
+            self.head_extra_proj = nn.Sequential(
+                nn.Linear(self.extra_feature_dim, hidden_dim),
+                nn.GELU(),
+            )
         self.head_head = nn.Linear(hidden_dim, self.num_heads) if self.use_head_policy else None
         self.block_head = nn.Linear(hidden_dim, 1) if self.use_block_policy else None
         self.token_head = nn.Linear(hidden_dim, self.num_patch_tokens) if self.use_token_policy else None
@@ -97,6 +105,9 @@ class DynamicPolicyNet(nn.Module):
     def reset_parameters(self, init_keep_prob: float = DEFAULT_POLICY_INIT_KEEP_PROB):
         nn.init.trunc_normal_(self.fc1.weight, std=0.02)
         nn.init.zeros_(self.fc1.bias)
+        if self.head_extra_proj is not None:
+            nn.init.trunc_normal_(self.head_extra_proj[0].weight, std=0.02)
+            nn.init.zeros_(self.head_extra_proj[0].bias)
         init_bias = safe_inverse_sigmoid(init_keep_prob)
         for head in (self.head_head, self.block_head, self.token_head):
             if head is None:
@@ -104,7 +115,68 @@ class DynamicPolicyNet(nn.Module):
             nn.init.zeros_(head.weight)
             nn.init.constant_(head.bias, init_bias)
 
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor, num_prefix_tokens: int) -> Dict[str, Optional[torch.Tensor]]:
+    def _prepare_extra_features(
+        self,
+        extra_features: Optional[torch.Tensor],
+        batch_size: int,
+        num_patch_tokens: int,
+        device,
+        dtype,
+    ) -> Optional[torch.Tensor]:
+        if self.head_extra_proj is None or self.extra_feature_dim <= 0:
+            return None
+        if extra_features is None:
+            if self.policy_granularity == "token":
+                return torch.zeros(
+                    batch_size,
+                    num_patch_tokens,
+                    self.extra_feature_dim,
+                    device=device,
+                    dtype=dtype,
+                )
+            return torch.zeros(
+                batch_size,
+                self.extra_feature_dim,
+                device=device,
+                dtype=dtype,
+            )
+
+        if self.policy_granularity == "token":
+            if extra_features.ndim == 2:
+                if extra_features.shape != (batch_size, self.extra_feature_dim):
+                    raise ValueError(
+                        f"Expected per-image extra policy features of shape {(batch_size, self.extra_feature_dim)}, "
+                        f"got {tuple(extra_features.shape)}."
+                    )
+                extra_features = extra_features[:, None, :].expand(-1, num_patch_tokens, -1)
+            elif extra_features.ndim != 3 or extra_features.shape != (
+                batch_size,
+                num_patch_tokens,
+                self.extra_feature_dim,
+            ):
+                raise ValueError(
+                    f"Expected per-token extra policy features of shape "
+                    f"{(batch_size, num_patch_tokens, self.extra_feature_dim)}, "
+                    f"got {tuple(extra_features.shape)}."
+                )
+        else:
+            if extra_features.ndim != 2 or extra_features.shape != (
+                batch_size,
+                self.extra_feature_dim,
+            ):
+                raise ValueError(
+                    f"Expected per-image extra policy features of shape {(batch_size, self.extra_feature_dim)}, "
+                    f"got {tuple(extra_features.shape)}."
+                )
+        return extra_features.to(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        num_prefix_tokens: int,
+        extra_features: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
         if x1.shape != x2.shape:
             raise ValueError(f"Expected matching token shapes, got {x1.shape} vs {x2.shape}.")
         if x1.ndim != 3:
@@ -116,33 +188,42 @@ class DynamicPolicyNet(nn.Module):
 
         x1_patch = x1[:, num_prefix_tokens:]
         x2_patch = x2[:, num_prefix_tokens:]
+        batch_size = int(x1.shape[0])
+        num_patch_tokens = int(x1_patch.shape[1])
+        extra = self._prepare_extra_features(
+            extra_features,
+            batch_size=batch_size,
+            num_patch_tokens=num_patch_tokens,
+            device=x1.device,
+            dtype=x1.dtype,
+        )
 
         if self.policy_granularity == "token":
-            # Per-token: compute relation features at each spatial position
-            # rel shape: [B, N_patch, 4*C]
             rel = torch.cat([
                 x1_patch,
                 x2_patch,
                 torch.abs(x1_patch - x2_patch),
                 x1_patch * x2_patch,
             ], dim=-1)
-            # hidden: [B, N_patch, hidden_dim]
             hidden = self.act(self.fc1(rel))
-            # head_logits: [B, N_patch, num_heads]
-            head_logits = self.head_head(hidden) if self.head_head is not None else None
-            # block/token logits still use pooled (global decision)
+            head_hidden = hidden
+            if self.head_extra_proj is not None and extra is not None:
+                head_hidden = head_hidden + self.head_extra_proj(extra)
+            head_logits = self.head_head(head_hidden) if self.head_head is not None else None
             hidden_pooled = hidden.mean(dim=1)
             block_logits = self.block_head(hidden_pooled) if self.block_head is not None else None
             token_logits = self.token_head(hidden_pooled) if self.token_head is not None else None
         else:
-            # Per-image (AdaViT default): pool then predict
             p1 = x1_patch.mean(dim=1)
             p2 = x2_patch.mean(dim=1)
             pd = torch.abs(x1_patch - x2_patch).mean(dim=1)
             pm = (x1_patch * x2_patch).mean(dim=1)
             rel = torch.cat([p1, p2, pd, pm], dim=-1)
             hidden = self.act(self.fc1(rel))
-            head_logits = self.head_head(hidden) if self.head_head is not None else None
+            head_hidden = hidden
+            if self.head_extra_proj is not None and extra is not None:
+                head_hidden = head_hidden + self.head_extra_proj(extra)
+            head_logits = self.head_head(head_hidden) if self.head_head is not None else None
             block_logits = self.block_head(hidden) if self.block_head is not None else None
             token_logits = self.token_head(hidden) if self.token_head is not None else None
 

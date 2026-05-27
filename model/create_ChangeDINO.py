@@ -74,6 +74,8 @@ class Model(nn.Module):
             policy_entropy_weight=opt.policy_entropy_weight,
             policy_mlp_gate=opt.policy_mlp_gate,
             policy_granularity=opt.policy_granularity,
+            policy_cgla_prior_enable=opt.policy_cgla_prior_enable,
+            policy_cgla_prior_source=opt.policy_cgla_prior_source,
             head_policy_baseline=opt.head_policy_baseline,
             random_head_keep_ratio=opt.random_head_keep_ratio,
             random_head_policy_seed=opt.random_head_policy_seed,
@@ -243,6 +245,8 @@ class Model(nn.Module):
                 print(f"policy_minimal_target = {opt.policy_minimal_target}")
                 print(f"policy_mlp_gate = {opt.policy_mlp_gate}")
                 print(f"policy_granularity = {opt.policy_granularity}")
+                print(f"policy_cgla_prior_enable = {opt.policy_cgla_prior_enable}")
+                print(f"policy_cgla_prior_source = {opt.policy_cgla_prior_source}")
                 print(f"head_policy_baseline = {opt.head_policy_baseline}")
                 print(f"random_head_keep_ratio = {opt.random_head_keep_ratio}")
                 print(f"random_head_policy_seed = {opt.random_head_policy_seed}")

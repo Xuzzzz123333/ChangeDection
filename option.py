@@ -503,6 +503,21 @@ class Options:
                  "relation features.",
         )
         self.parser.add_argument(
+            "--policy_cgla_prior_enable",
+            action="store_true",
+            help="augment the learned head-policy input with the previous available "
+                 "CGLA prior summary (route-A delayed prior injection). "
+                 "Current first version only supports per-image learned head policy.",
+        )
+        self.parser.add_argument(
+            "--policy_cgla_prior_source",
+            type=str,
+            default="delta",
+            choices=["delta", "spatial", "local"],
+            help="which CGLA prior map to summarize and feed into the head policy "
+                 "when --policy_cgla_prior_enable is used.",
+        )
+        self.parser.add_argument(
             "--head_policy_baseline",
             type=str,
             default="learned",
@@ -1471,6 +1486,23 @@ class Options:
             if self.opt.head_topk_ratio is not None:
                 raise ValueError(
                     "--head_topk_ratio is not supported with random head-policy baselines."
+                )
+        if self.opt.policy_cgla_prior_enable:
+            if not self.opt.use_dynamic_policy or not self.opt.use_head_policy:
+                raise ValueError(
+                    "--policy_cgla_prior_enable requires --use_dynamic_policy and --use_head_policy."
+                )
+            if self.opt.head_policy_baseline != "learned":
+                raise ValueError(
+                    "--policy_cgla_prior_enable currently supports only --head_policy_baseline learned."
+                )
+            if self.opt.policy_granularity != "image":
+                raise ValueError(
+                    "--policy_cgla_prior_enable currently supports only --policy_granularity image."
+                )
+            if not self.opt.dino_local_conv_change_aware_enable:
+                raise ValueError(
+                    "--policy_cgla_prior_enable requires --dino_local_conv_change_aware_enable."
                 )
         if self.opt.random_head_keep_ratio is not None and not (0.0 < self.opt.random_head_keep_ratio <= 1.0):
             raise ValueError("--random_head_keep_ratio must be in (0, 1].")
