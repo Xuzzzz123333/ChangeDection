@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dinov3.utils import cat_keep_shapes, uncat_with_shapes
 
 
@@ -371,6 +372,120 @@ class PolicyAwareSelfAttention(nn.Module):
     def clear_runtime_head_policy(self):
         self._runtime_head_policy = None
 
+    @staticmethod
+    def _is_binary_gate(head_policy: torch.Tensor, atol: float = 1e-6) -> bool:
+        if head_policy.dtype == torch.bool:
+            return True
+        rounded = head_policy.round()
+        return bool(torch.all(torch.abs(head_policy - rounded) <= atol).item())
+
+    def _can_use_attn_identity_qk_skip(
+        self,
+        x: torch.Tensor,
+        head_policy: Optional[torch.Tensor],
+    ) -> bool:
+        if self.apply_mode != "attn_identity":
+            return False
+        if self.training:
+            return False
+        if head_policy is None or head_policy.ndim != 2:
+            return False
+        if x.ndim != 3:
+            return False
+        if head_policy.shape != (x.shape[0], self.num_heads):
+            return False
+        if not self._is_binary_gate(head_policy):
+            return False
+        if bool(torch.all(head_policy > 0.5).item()):
+            return False
+        return True
+
+    def _split_qkv_parameters(self) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        dim = int(self.qkv.in_features)
+        q_weight, k_weight, v_weight = self.qkv.weight.split(dim, dim=0)
+        if self.qkv.bias is None:
+            return q_weight, k_weight, v_weight, None, None, None
+        q_bias, k_bias, v_bias = self.qkv.bias.split(dim, dim=0)
+        return q_weight, k_weight, v_weight, q_bias, k_bias, v_bias
+
+    def _compute_attn_identity_qk_skip(
+        self,
+        x: torch.Tensor,
+        attn_bias=None,
+        rope=None,
+        head_policy: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        active_policy = self._runtime_head_policy if head_policy is None else head_policy
+        if not self._can_use_attn_identity_qk_skip(x, active_policy):
+            raise ValueError(
+                'attn_identity Q/K skip path requires eval-time per-image binary head gates.'
+            )
+
+        batch_size, num_tokens, dim = x.shape
+        head_dim = dim // self.num_heads
+        q_weight, k_weight, v_weight, q_bias, k_bias, v_bias = self._split_qkv_parameters()
+        q_weight = q_weight.reshape(self.num_heads, head_dim, dim)
+        k_weight = k_weight.reshape(self.num_heads, head_dim, dim)
+
+        v_flat = F.linear(x, v_weight, v_bias)
+        v_all = v_flat.reshape(batch_size, num_tokens, self.num_heads, head_dim)
+        outputs = []
+
+        attn_kwargs = {}
+        if attn_bias is not None:
+            if not torch.is_tensor(attn_bias):
+                raise ValueError(
+                    f"Unsupported attn_bias type at layer {self.layer_index}: "
+                    f"{type(attn_bias)!r}. Expected a Tensor compatible with "
+                    "torch.nn.functional.scaled_dot_product_attention(attn_mask=...)."
+                )
+            attn_kwargs["attn_mask"] = attn_bias
+
+        for batch_index in range(batch_size):
+            x_b = x[batch_index]
+            gate_b = active_policy[batch_index] > 0.5
+            out_heads = v_all[batch_index].clone()
+            active_indices = torch.nonzero(gate_b, as_tuple=False).flatten()
+            if active_indices.numel() > 0:
+                q_weight_active = q_weight.index_select(0, active_indices).reshape(-1, dim)
+                k_weight_active = k_weight.index_select(0, active_indices).reshape(-1, dim)
+                q_bias_active = None
+                if q_bias is not None:
+                    q_bias_active = q_bias.reshape(self.num_heads, head_dim).index_select(0, active_indices).reshape(-1)
+                k_bias_active = None
+                if k_bias is not None:
+                    k_bias_active = k_bias.reshape(self.num_heads, head_dim).index_select(0, active_indices).reshape(-1)
+
+                q_active = F.linear(x_b, q_weight_active, q_bias_active)
+                k_active = F.linear(x_b, k_weight_active, k_bias_active)
+                q_active = q_active.view(num_tokens, active_indices.numel(), head_dim).permute(1, 0, 2).unsqueeze(0)
+                k_active = k_active.view(num_tokens, active_indices.numel(), head_dim).permute(1, 0, 2).unsqueeze(0)
+                v_active = out_heads.index_select(1, active_indices).permute(1, 0, 2).unsqueeze(0)
+
+                if rope is not None:
+                    q_active, k_active = self.apply_rope(q_active, k_active, rope)
+
+                attn_active = torch.nn.functional.scaled_dot_product_attention(
+                    q_active,
+                    k_active,
+                    v_active,
+                    dropout_p=0.0,
+                    **attn_kwargs,
+                )
+                attn_active = attn_active.squeeze(0).permute(1, 0, 2)
+                out_heads[:, active_indices, :] = attn_active
+
+            outputs.append(out_heads.reshape(num_tokens, dim))
+
+        return torch.stack(outputs, dim=0)
+
     def compute_attention(
         self,
         qkv: torch.Tensor,
@@ -462,8 +577,17 @@ class PolicyAwareSelfAttention(nn.Module):
         return x.reshape(batch_size, num_tokens, dim)
 
     def forward(self, x: torch.Tensor, attn_bias=None, rope=None) -> torch.Tensor:
-        qkv = self.qkv(x)
-        attn_v = self.compute_attention(qkv=qkv, attn_bias=attn_bias, rope=rope)
+        active_policy = self._runtime_head_policy
+        if self._can_use_attn_identity_qk_skip(x, active_policy):
+            attn_v = self._compute_attn_identity_qk_skip(
+                x,
+                attn_bias=attn_bias,
+                rope=rope,
+                head_policy=active_policy,
+            )
+        else:
+            qkv = self.qkv(x)
+            attn_v = self.compute_attention(qkv=qkv, attn_bias=attn_bias, rope=rope)
         x = self.proj(attn_v)
         x = self.proj_drop(x)
         return x
@@ -472,6 +596,12 @@ class PolicyAwareSelfAttention(nn.Module):
         if rope_list is None:
             rope_list = [None] * len(x_list)
         assert len(x_list) == len(rope_list)
+        active_policy = self._runtime_head_policy
+        if all(self._can_use_attn_identity_qk_skip(x, active_policy) for x in x_list):
+            return [
+                self.forward(x, attn_bias=attn_bias, rope=rope)
+                for x, rope in zip(x_list, rope_list)
+            ]
         x_flat, shapes, num_tokens = cat_keep_shapes(x_list)
         qkv_flat = self.qkv(x_flat)
         qkv_list = uncat_with_shapes(qkv_flat, shapes, num_tokens)
