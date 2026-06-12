@@ -63,13 +63,15 @@ def reduce_confusion_matrix(confusion_matrix, device):
 
 
 class DynamicPolicyUsageMeter:
-    def __init__(self, metadata, enabled, use_block_policy, use_token_policy):
+    def __init__(self, metadata, enabled, use_block_policy, use_token_policy, use_mlp_policy):
         self.enabled = bool(enabled)
         self.num_layers = int(metadata.get("num_layers", 0)) if metadata else 0
         self.num_heads = int(metadata.get("num_heads", 0)) if metadata else 0
         self.num_patch_tokens = int(metadata.get("num_patch_tokens", 0)) if metadata else 0
+        self.num_mlp_chunks = int(metadata.get("num_mlp_chunks", 0)) if metadata else 0
         self.use_block_policy = bool(use_block_policy)
         self.use_token_policy = bool(use_token_policy)
+        self.use_mlp_policy = bool(use_mlp_policy)
         self.reset()
 
     def reset(self):
@@ -78,6 +80,7 @@ class DynamicPolicyUsageMeter:
         self.head_active_sum = np.zeros((self.num_layers, self.num_heads), dtype=np.float64)
         self.block_sum = np.zeros((self.num_layers,), dtype=np.float64)
         self.token_sum = 0.0
+        self.mlp_sum = np.zeros((self.num_layers, self.num_mlp_chunks), dtype=np.float64)
         self.value_sum = 0.0
         self.value_sq_sum = 0.0
         self.value_count = 0
@@ -91,6 +94,7 @@ class DynamicPolicyUsageMeter:
         head_keep = policy_state.get("head_keep")
         block_keep = policy_state.get("block_keep")
         token_keep = policy_state.get("token_keep")
+        mlp_keep = policy_state.get("mlp_keep")
 
         batch_size = 0
         if head_keep is not None:
@@ -129,10 +133,20 @@ class DynamicPolicyUsageMeter:
                 self.value_count += int(token_keep.size)
                 self.value_min = min(self.value_min, float(token_keep.min()))
                 self.value_max = max(self.value_max, float(token_keep.max()))
+        if mlp_keep is not None:
+            mlp_keep = mlp_keep.detach().float().cpu().numpy()
+            if batch_size == 0:
+                batch_size = int(mlp_keep.shape[0])
+            self.mlp_sum += mlp_keep.sum(axis=0)
+            self.value_sum += float(mlp_keep.sum())
+            self.value_sq_sum += float(np.square(mlp_keep).sum())
+            self.value_count += int(mlp_keep.size)
+            self.value_min = min(self.value_min, float(mlp_keep.min()))
+            self.value_max = max(self.value_max, float(mlp_keep.max()))
         self.num_samples += batch_size
 
     def summary(self):
-        if not self.enabled or self.num_samples <= 0 or self.num_layers <= 0 or self.num_heads <= 0:
+        if not self.enabled or self.num_samples <= 0 or self.num_layers <= 0:
             return {
                 "mean_head_keep": 1.0,
                 "head_active_ratio": 1.0,
@@ -142,20 +156,31 @@ class DynamicPolicyUsageMeter:
                 "mean_block_keep": 1.0,
                 "per_layer_block_keep": [1.0] * self.num_layers,
                 "mean_token_keep": 1.0,
+                "mean_mlp_keep": 1.0,
+                "per_layer_mlp_keep": [1.0] * self.num_layers,
                 "policy_min": 1.0,
                 "policy_max": 1.0,
                 "policy_std": 0.0,
                 "token_example": None,
             }
 
-        head_heatmap = (self.head_sum / max(self.num_samples, 1)).astype(np.float32)
-        head_active_heatmap = (self.head_active_sum / max(self.num_samples, 1)).astype(np.float32)
-        per_layer_head_keep = head_heatmap.mean(axis=1).tolist()
-        per_layer_head_active_ratio = head_active_heatmap.mean(axis=1).tolist()
-        mean_head_keep = float(self.head_sum.sum() / max(self.num_samples * self.num_layers * self.num_heads, 1))
-        head_active_ratio = float(
-            self.head_active_sum.sum() / max(self.num_samples * self.num_layers * self.num_heads, 1)
-        )
+        if self.num_heads > 0:
+            head_heatmap = (self.head_sum / max(self.num_samples, 1)).astype(np.float32)
+            head_active_heatmap = (self.head_active_sum / max(self.num_samples, 1)).astype(np.float32)
+            per_layer_head_keep = head_heatmap.mean(axis=1).tolist()
+            per_layer_head_active_ratio = head_active_heatmap.mean(axis=1).tolist()
+            mean_head_keep = float(
+                self.head_sum.sum() / max(self.num_samples * self.num_layers * self.num_heads, 1)
+            )
+            head_active_ratio = float(
+                self.head_active_sum.sum() / max(self.num_samples * self.num_layers * self.num_heads, 1)
+            )
+        else:
+            head_heatmap = np.ones((self.num_layers, 0), dtype=np.float32)
+            per_layer_head_keep = [1.0] * self.num_layers
+            per_layer_head_active_ratio = [1.0] * self.num_layers
+            mean_head_keep = 1.0
+            head_active_ratio = 1.0
 
         if self.use_block_policy:
             per_layer_block_keep = (self.block_sum / max(self.num_samples, 1)).astype(np.float32).tolist()
@@ -169,6 +194,16 @@ class DynamicPolicyUsageMeter:
             mean_token_keep = float(self.token_sum / denom)
         else:
             mean_token_keep = 1.0
+
+        if self.use_mlp_policy and self.num_mlp_chunks > 0:
+            mlp_keep = (self.mlp_sum / max(self.num_samples, 1)).astype(np.float32)
+            per_layer_mlp_keep = mlp_keep.mean(axis=1).tolist()
+            mean_mlp_keep = float(
+                self.mlp_sum.sum() / max(self.num_samples * self.num_layers * self.num_mlp_chunks, 1)
+            )
+        else:
+            per_layer_mlp_keep = [1.0] * self.num_layers
+            mean_mlp_keep = 1.0
 
         if self.value_count > 0:
             mean_value = self.value_sum / float(self.value_count)
@@ -190,6 +225,8 @@ class DynamicPolicyUsageMeter:
             "mean_block_keep": mean_block_keep,
             "per_layer_block_keep": per_layer_block_keep,
             "mean_token_keep": mean_token_keep,
+            "mean_mlp_keep": mean_mlp_keep,
+            "per_layer_mlp_keep": per_layer_mlp_keep,
             "policy_min": policy_min,
             "policy_max": policy_max,
             "policy_std": policy_std,
@@ -210,12 +247,13 @@ class Trainval(object):
         if self.opt.is_main_process:
             print("#training images = %d" % train_size)
 
-        opt.phase = "val"
+        self.eval_phase = str(getattr(opt, "eval_phase", "val"))
+        opt.phase = self.eval_phase
         self.val_loader = DataLoader(opt)
         self.val_data = self.val_loader.load_data()
         val_size = len(self.val_loader)
         if self.opt.is_main_process:
-            print("#validation images = %d" % val_size)
+            print(f"#{self.eval_phase} images = {val_size}")
         opt.phase = "train"
 
         self.model = create_model(opt)
@@ -551,18 +589,40 @@ class Trainval(object):
 
     def _save_checkpoint_path(self, path, epoch, scores, extra=None):
         normalized_scores = self._normalize_scores(scores)
+        checkpoint_extra = dict(extra or {})
+        if getattr(self.opt, "use_dynamic_policy", False) and self.last_val_policy_summary is not None:
+            checkpoint_extra["dynamic_policy_summary"] = self._checkpointable_policy_summary(
+                self.last_val_policy_summary
+            )
         self.model.save_checkpoint(
             path,
             epoch=int(epoch),
             scores=normalized_scores,
-            extra=extra,
+            extra=checkpoint_extra,
         )
-        metric_name = (extra or {}).get("metric_name", "metric")
-        metric_value = float((extra or {}).get("metric_value", float("nan")))
+        metric_name = checkpoint_extra.get("metric_name", "metric")
+        metric_value = float(checkpoint_extra.get("metric_value", float("nan")))
         print(
             f"Saved checkpoint: {path}, metric_name={metric_name}, "
             f"metric_value={metric_value:.6f}, epoch={int(epoch)}"
         )
+
+    @staticmethod
+    def _checkpointable_policy_summary(summary):
+        if summary is None:
+            return None
+        payload = {}
+        for key, value in summary.items():
+            if isinstance(value, np.ndarray):
+                payload[key] = value.tolist()
+            elif isinstance(value, (list, tuple)):
+                payload[key] = [
+                    item.tolist() if isinstance(item, np.ndarray) else item
+                    for item in value
+                ]
+            else:
+                payload[key] = value
+        return payload
 
     def _cleanup_multi_best_artifacts(self):
         metric_names = set(getattr(self.opt, "save_best_metrics", []) or [])
@@ -716,6 +776,7 @@ class Trainval(object):
             enabled=getattr(self.opt, "use_dynamic_policy", False),
             use_block_policy=getattr(self.opt, "use_block_policy", False),
             use_token_policy=getattr(self.opt, "use_token_policy", False),
+            use_mlp_policy=getattr(self.opt, "use_mlp_policy", False),
         )
 
     def _write_policy_usage_csv(self):
@@ -729,6 +790,7 @@ class Trainval(object):
             "head_active_ratio",
             "mean_block_keep",
             "mean_token_keep",
+            "mean_mlp_keep",
             "target_compute_ratio",
             "policy_cost",
             "policy_budget_loss",
@@ -738,6 +800,7 @@ class Trainval(object):
         ]
         fieldnames += [f"layer_{idx}_head_keep" for idx in range(num_layers)]
         fieldnames += [f"layer_{idx}_head_active" for idx in range(num_layers)]
+        fieldnames += [f"layer_{idx}_mlp_keep" for idx in range(num_layers)]
         with open(self.policy_usage_csv_path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -754,6 +817,8 @@ class Trainval(object):
             * float(summary.get("mean_block_keep", 1.0))
             + float(getattr(self.opt, "policy_token_weight", 0.0))
             * float(summary.get("mean_token_keep", 1.0))
+            + float(getattr(self.opt, "policy_mlp_weight", 0.0))
+            * float(summary.get("mean_mlp_keep", 1.0))
         )
         row = {
             "epoch": int(epoch),
@@ -762,6 +827,7 @@ class Trainval(object):
             "head_active_ratio": float(summary.get("head_active_ratio", 1.0)),
             "mean_block_keep": float(summary.get("mean_block_keep", 1.0)),
             "mean_token_keep": float(summary.get("mean_token_keep", 1.0)),
+            "mean_mlp_keep": float(summary.get("mean_mlp_keep", 1.0)),
             "target_compute_ratio": float(
                 aux_stats.get("dynamic_policy_target_compute_ratio", 1.0)
             ),
@@ -780,6 +846,8 @@ class Trainval(object):
             row[f"layer_{idx}_head_keep"] = float(value)
         for idx, value in enumerate(summary.get("per_layer_head_active_ratio", [])):
             row[f"layer_{idx}_head_active"] = float(value)
+        for idx, value in enumerate(summary.get("per_layer_mlp_keep", [])):
+            row[f"layer_{idx}_mlp_keep"] = float(value)
         self.policy_usage_rows.append(row)
         self._write_policy_usage_csv()
 
@@ -1074,7 +1142,7 @@ class Trainval(object):
     def val(self, epoch):
         tbar = tqdm(self.val_data, ncols=80) if self.opt.is_main_process else self.val_data
         self.running_metric.clear()
-        self.opt.phase = "val"
+        self.opt.phase = self.eval_phase
         self.model.eval()
         policy_meter = self._new_policy_meter()
 
@@ -1099,7 +1167,7 @@ class Trainval(object):
                         val_pred,
                         data["cd_label"],
                         epoch,
-                        "val",
+                        self.eval_phase,
                     )
 
         local_confusion = (
@@ -1239,7 +1307,7 @@ if __name__ == "__main__":
                 )
                 trainval._record_policy_usage(
                     epoch,
-                    "val",
+                    trainval.eval_phase,
                     trainval.last_val_policy_summary or {},
                     getattr(trainval.model, "last_aux_losses", {}),
                 )

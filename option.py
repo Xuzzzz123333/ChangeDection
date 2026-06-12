@@ -78,6 +78,13 @@ class Options:
         self.parser.add_argument("--use_morph", action='store_true')
 
         self.parser.add_argument("--phase", type=str, default="train")
+        self.parser.add_argument(
+            "--eval_phase",
+            type=str,
+            default="val",
+            choices=["val", "test", "val-ori"],
+            help="dataset split used by train-time evaluation and checkpoint ranking",
+        )
         self.parser.add_argument("--backbone", type=str, default="mobilenetv2")
         self.parser.add_argument("--fpn", type=str, default="fpn")
         self.parser.add_argument("--fpn_channels", type=int, default=128)
@@ -369,6 +376,24 @@ class Options:
             help="enable token-policy logits; first version applies soft patch-token weighting instead of token removal",
         )
         self.parser.add_argument(
+            "--use_mlp_policy",
+            action="store_true",
+            help="enable FFN/MLP chunk keep policies on top of the DINO encoder",
+        )
+        self.parser.add_argument(
+            "--mlp_num_chunks",
+            type=int,
+            default=4,
+            help="number of contiguous FFN hidden chunks used by the dynamic MLP policy",
+        )
+        self.parser.add_argument(
+            "--mlp_policy_scope",
+            type=str,
+            default="batch_shared",
+            choices=["batch_shared", "sample"],
+            help="whether the FFN chunk keep policy is shared by the whole batch or predicted per sample",
+        )
+        self.parser.add_argument(
             "--policy_mode",
             type=str,
             default="soft",
@@ -457,6 +482,12 @@ class Options:
             type=float,
             default=0.0,
             help="token-policy contribution to the dynamic policy compute-cost estimate",
+        )
+        self.parser.add_argument(
+            "--policy_mlp_weight",
+            type=float,
+            default=0.0,
+            help="MLP-policy contribution to the dynamic policy compute-cost estimate",
         )
         self.parser.add_argument("--dino_lora_r", type=int, default=8)
         self.parser.add_argument("--dino_lora_alpha", type=int, default=16)
@@ -1303,16 +1334,20 @@ class Options:
             self.opt.use_head_policy
             or self.opt.use_block_policy
             or self.opt.use_token_policy
+            or self.opt.use_mlp_policy
         ):
             self.opt.use_head_policy = True
         if (
             self.opt.use_head_policy
             or self.opt.use_block_policy
             or self.opt.use_token_policy
+            or self.opt.use_mlp_policy
         ) and not self.opt.use_dynamic_policy:
             raise ValueError(
-                "--use_head_policy/--use_block_policy/--use_token_policy require --use_dynamic_policy."
+                "--use_head_policy/--use_block_policy/--use_token_policy/--use_mlp_policy require --use_dynamic_policy."
             )
+        if self.opt.mlp_num_chunks <= 0:
+            raise ValueError("--mlp_num_chunks must be >= 1.")
         if self.opt.policy_temperature <= 0:
             raise ValueError("--policy_temperature must be > 0.")
         if not (0.0 <= self.opt.policy_threshold <= 1.0):
@@ -1333,6 +1368,8 @@ class Options:
             raise ValueError("--policy_block_weight must be >= 0.")
         if self.opt.policy_token_weight < 0:
             raise ValueError("--policy_token_weight must be >= 0.")
+        if self.opt.policy_mlp_weight < 0:
+            raise ValueError("--policy_mlp_weight must be >= 0.")
         if self.opt.num_prefix_tokens < -1:
             raise ValueError("--num_prefix_tokens must be >= -1.")
         if self.opt.policy_image_size < 0:

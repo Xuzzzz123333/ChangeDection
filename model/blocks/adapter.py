@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from .dynamic_policy import (
     DynamicPolicyNet,
+    PolicyAwareMLP,
     PolicyAwareSelfAttention,
     apply_topk_policy,
     infer_num_prefix_tokens,
@@ -603,6 +604,9 @@ class DINOV3Wrapper(nn.Module):
         use_block_policy=False,
         block_policy_mode="record_only",
         use_token_policy=False,
+        use_mlp_policy=False,
+        mlp_num_chunks=4,
+        mlp_policy_scope="batch_shared",
         policy_mode="soft",
         policy_hard=False,
         policy_temperature=1.0,
@@ -619,6 +623,7 @@ class DINOV3Wrapper(nn.Module):
         policy_head_weight=1.0,
         policy_block_weight=0.0,
         policy_token_weight=0.0,
+        policy_mlp_weight=0.0,
     ):
         super().__init__()
         self.device = device
@@ -703,11 +708,17 @@ class DINOV3Wrapper(nn.Module):
         self.use_head_policy = bool(use_head_policy) if self.use_dynamic_policy else False
         self.use_block_policy = bool(use_block_policy) if self.use_dynamic_policy else False
         self.use_token_policy = bool(use_token_policy) if self.use_dynamic_policy else False
+        self.use_mlp_policy = bool(use_mlp_policy) if self.use_dynamic_policy else False
         if self.use_dynamic_policy and not (
-            self.use_head_policy or self.use_block_policy or self.use_token_policy
+            self.use_head_policy
+            or self.use_block_policy
+            or self.use_token_policy
+            or self.use_mlp_policy
         ):
             self.use_head_policy = True
         self.block_policy_mode = str(block_policy_mode)
+        self.mlp_num_chunks = int(max(1, mlp_num_chunks))
+        self.mlp_policy_scope = str(mlp_policy_scope)
         self.policy_mode = str(policy_mode)
         self.policy_hard = bool(policy_hard)
         self.policy_temperature = float(max(1e-6, policy_temperature))
@@ -723,6 +734,7 @@ class DINOV3Wrapper(nn.Module):
         self.policy_head_weight = float(policy_head_weight)
         self.policy_block_weight = float(policy_block_weight)
         self.policy_token_weight = float(policy_token_weight)
+        self.policy_mlp_weight = float(policy_mlp_weight)
         self.num_prefix_tokens_override = int(num_prefix_tokens)
         self.image_size = int(image_size)
         self.policy_image_size = int(policy_image_size)
@@ -814,6 +826,8 @@ class DINOV3Wrapper(nn.Module):
                         use_head_policy=self.use_head_policy,
                         use_block_policy=self.use_block_policy,
                         use_token_policy=self.use_token_policy,
+                        use_mlp_policy=self.use_mlp_policy,
+                        num_mlp_chunks=self.mlp_num_chunks,
                     )
                     for _ in range(self.n_layers)
                 ]
@@ -875,6 +889,8 @@ class DINOV3Wrapper(nn.Module):
             raise ValueError(
                 "block_policy_mode must be one of {'record_only', 'soft_residual', 'hard_skip'}."
             )
+        if self.mlp_policy_scope not in {"batch_shared", "sample"}:
+            raise ValueError("mlp_policy_scope must be one of {'batch_shared', 'sample'}.")
         if self.policy_mode not in {"soft", "gumbel"}:
             raise ValueError("policy_mode must be one of {'soft', 'gumbel'}.")
         if self.head_topk_ratio is not None and not (0.0 < self.head_topk_ratio <= 1.0):
@@ -884,6 +900,13 @@ class DINOV3Wrapper(nn.Module):
             core_block = self._unwrap_transformer_block(block)
             if not isinstance(core_block.attn, PolicyAwareSelfAttention):
                 core_block.attn = PolicyAwareSelfAttention(core_block.attn, layer_index=layer_index)
+            if self.use_mlp_policy and not isinstance(core_block.mlp, PolicyAwareMLP):
+                core_block.mlp = PolicyAwareMLP(
+                    core_block.mlp,
+                    layer_index=layer_index,
+                    num_chunks=self.mlp_num_chunks,
+                    policy_threshold=self.policy_threshold,
+                )
 
     @staticmethod
     def _get_depth_bucket_label(layer_index: int, num_layers: int, num_buckets: int) -> str:
@@ -1152,6 +1175,7 @@ class DINOV3Wrapper(nn.Module):
             "num_heads": int(self.num_heads),
             "num_prefix_tokens": int(self.num_prefix_tokens),
             "num_patch_tokens": int(self.num_patch_tokens),
+            "num_mlp_chunks": int(self.mlp_num_chunks),
         }
 
     def dynamic_policy_debug_state(self):
@@ -1163,6 +1187,7 @@ class DINOV3Wrapper(nn.Module):
         head_weight: float | None = None,
         block_weight: float | None = None,
         token_weight: float | None = None,
+        mlp_weight: float | None = None,
     ):
         state = self.last_dynamic_policy_state
         if not self.use_dynamic_policy or state is None:
@@ -1170,10 +1195,12 @@ class DINOV3Wrapper(nn.Module):
         head_weight = self.policy_head_weight if head_weight is None else float(head_weight)
         block_weight = self.policy_block_weight if block_weight is None else float(block_weight)
         token_weight = self.policy_token_weight if token_weight is None else float(token_weight)
+        mlp_weight = self.policy_mlp_weight if mlp_weight is None else float(mlp_weight)
         policy_cost = (
             head_weight * state["mean_head_keep"]
             + block_weight * state["mean_block_keep"]
             + token_weight * state["mean_token_keep"]
+            + mlp_weight * state["mean_mlp_keep"]
         )
         return torch.abs(policy_cost - float(target_ratio))
 
@@ -1192,6 +1219,13 @@ class DINOV3Wrapper(nn.Module):
         if (not self.training) and kind == "head" and self.head_topk_ratio is not None:
             effective = apply_topk_policy(raw_prob, self.head_topk_ratio)
         return raw_prob, effective
+
+    def _aggregate_mlp_logits(self, logits):
+        if logits is None:
+            return None
+        if self.mlp_policy_scope == "batch_shared":
+            return logits.mean(dim=0, keepdim=True)
+        return logits
 
     def _apply_token_policy_to_tokens(self, tokens: torch.Tensor, token_policy):
         if token_policy is None:
@@ -1239,6 +1273,8 @@ class DINOV3Wrapper(nn.Module):
         block_keep_list,
         token_prob_list,
         token_keep_list,
+        mlp_prob_list,
+        mlp_keep_list,
         device,
     ):
         head_prob = torch.stack(head_prob_list, dim=1) if head_prob_list else None
@@ -1247,6 +1283,8 @@ class DINOV3Wrapper(nn.Module):
         block_keep = torch.stack(block_keep_list, dim=1) if block_keep_list else None
         token_prob = torch.stack(token_prob_list, dim=1) if token_prob_list else None
         token_keep = torch.stack(token_keep_list, dim=1) if token_keep_list else None
+        mlp_prob = torch.stack(mlp_prob_list, dim=1) if mlp_prob_list else None
+        mlp_keep = torch.stack(mlp_keep_list, dim=1) if mlp_keep_list else None
 
         if head_keep is not None:
             reference = head_keep
@@ -1285,6 +1323,17 @@ class DINOV3Wrapper(nn.Module):
             mean_token_keep = torch.ones((), device=device)
             token_example = None
 
+        if mlp_keep is not None:
+            mean_mlp_keep = mlp_keep.mean()
+            per_layer_mlp_keep = mlp_keep.mean(dim=(0, 2))
+            if reference is None:
+                reference = mlp_keep
+            if batch_size <= 0:
+                batch_size = int(mlp_keep.shape[0])
+        else:
+            mean_mlp_keep = torch.ones((), device=device)
+            per_layer_mlp_keep = torch.ones(self.n_layers, device=device)
+
         if reference is None:
             policy_min = torch.ones((), device=device)
             policy_max = torch.ones((), device=device)
@@ -1302,6 +1351,8 @@ class DINOV3Wrapper(nn.Module):
             "block_keep": block_keep,
             "token_prob": token_prob,
             "token_keep": token_keep,
+            "mlp_prob": mlp_prob,
+            "mlp_keep": mlp_keep,
             "mean_head_keep": mean_head_keep,
             "hard_head_active_ratio": hard_head_active_ratio,
             "per_layer_head_keep": per_layer_head_keep,
@@ -1310,6 +1361,8 @@ class DINOV3Wrapper(nn.Module):
             "mean_block_keep": mean_block_keep,
             "per_layer_block_keep": per_layer_block_keep,
             "mean_token_keep": mean_token_keep,
+            "mean_mlp_keep": mean_mlp_keep,
+            "per_layer_mlp_keep": per_layer_mlp_keep,
             "policy_min": policy_min,
             "policy_max": policy_max,
             "policy_std": policy_std,
@@ -1359,6 +1412,8 @@ class DINOV3Wrapper(nn.Module):
         block_keep_list = []
         token_prob_list = []
         token_keep_list = []
+        mlp_prob_list = []
+        mlp_keep_list = []
         total_block_len = len(self.model.blocks)
         blocks_to_take = (
             range(total_block_len - n, total_block_len) if isinstance(n, int) else n
@@ -1418,6 +1473,17 @@ class DINOV3Wrapper(nn.Module):
                     )
                     token_prob = token_keep
 
+                mlp_logits = self._aggregate_mlp_logits(policy_outputs.get("mlp_logits"))
+                mlp_prob, mlp_keep = self._policy_from_logits(mlp_logits, kind="mlp")
+                if self.use_mlp_policy and mlp_keep is None:
+                    mlp_keep = torch.ones(
+                        1 if self.mlp_policy_scope == "batch_shared" else x_list[0].shape[0],
+                        self.mlp_num_chunks,
+                        device=x_list[0].device,
+                        dtype=x_list[0].dtype,
+                    )
+                    mlp_prob = mlp_keep
+
                 x_block_in = x_list
                 if self.use_token_policy:
                     x_block_in = [
@@ -1428,11 +1494,15 @@ class DINOV3Wrapper(nn.Module):
                 core_block = self._unwrap_transformer_block(blk)
                 if self.use_head_policy and hasattr(core_block.attn, "set_runtime_head_policy"):
                     core_block.attn.set_runtime_head_policy(head_keep)
+                if self.use_mlp_policy and hasattr(core_block.mlp, "set_runtime_chunk_policy"):
+                    core_block.mlp.set_runtime_chunk_policy(mlp_keep)
                 try:
                     x_block_out = blk(x_block_in, rope_sincos)
                 finally:
                     if hasattr(core_block.attn, "clear_runtime_head_policy"):
                         core_block.attn.clear_runtime_head_policy()
+                    if hasattr(core_block.mlp, "clear_runtime_chunk_policy"):
+                        core_block.mlp.clear_runtime_chunk_policy()
 
                 effective_block_policy = None
                 if self.use_block_policy and self.block_policy_mode in {
@@ -1453,6 +1523,9 @@ class DINOV3Wrapper(nn.Module):
                 if self.use_token_policy:
                     token_prob_list.append(token_prob)
                     token_keep_list.append(token_keep)
+                if self.use_mlp_policy:
+                    mlp_prob_list.append(mlp_prob)
+                    mlp_keep_list.append(mlp_keep)
             else:
                 x_list = blk(x_list, rope_sincos)
             if block_index in blocks_to_take_set:
@@ -1474,6 +1547,8 @@ class DINOV3Wrapper(nn.Module):
                 block_keep_list=block_keep_list,
                 token_prob_list=token_prob_list,
                 token_keep_list=token_keep_list,
+                mlp_prob_list=mlp_prob_list,
+                mlp_keep_list=mlp_keep_list,
                 device=x_list[0].device,
             )
         else:

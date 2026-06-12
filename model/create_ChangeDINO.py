@@ -57,6 +57,9 @@ class Model(nn.Module):
             use_block_policy=opt.use_block_policy,
             block_policy_mode=opt.block_policy_mode,
             use_token_policy=opt.use_token_policy,
+            use_mlp_policy=opt.use_mlp_policy,
+            mlp_num_chunks=opt.mlp_num_chunks,
+            mlp_policy_scope=opt.mlp_policy_scope,
             policy_mode=opt.policy_mode,
             policy_hard=opt.policy_hard,
             policy_temperature=opt.policy_temperature,
@@ -73,6 +76,7 @@ class Model(nn.Module):
             policy_head_weight=opt.policy_head_weight,
             policy_block_weight=opt.policy_block_weight,
             policy_token_weight=opt.policy_token_weight,
+            policy_mlp_weight=opt.policy_mlp_weight,
             dino_local_conv_enable=opt.dino_local_conv_enable,
             dino_local_conv_blocks=opt.dino_local_conv_blocks,
             dino_local_conv_kernel_size=opt.dino_local_conv_kernel_size,
@@ -216,7 +220,10 @@ class Model(nn.Module):
                 print(f"use_head_policy = {opt.use_head_policy}")
                 print(f"use_block_policy = {opt.use_block_policy}")
                 print(f"use_token_policy = {opt.use_token_policy}")
+                print(f"use_mlp_policy = {opt.use_mlp_policy}")
                 print(f"block_policy_mode = {opt.block_policy_mode}")
+                print(f"mlp_num_chunks = {opt.mlp_num_chunks}")
+                print(f"mlp_policy_scope = {opt.mlp_policy_scope}")
                 print(f"policy_mode = {opt.policy_mode}")
                 print(f"policy_hard = {opt.policy_hard}")
                 print(f"policy_temperature = {opt.policy_temperature}")
@@ -226,9 +233,10 @@ class Model(nn.Module):
                 print(f"policy_budget_weight = {opt.policy_budget_weight}")
                 print(f"policy_warmup_epochs = {opt.policy_warmup_epochs}")
                 print(f"policy_anneal_epochs = {opt.policy_anneal_epochs}")
+                print(f"policy_mlp_weight = {opt.policy_mlp_weight}")
                 print(
-                    "policy note: current dynamic policy is masking/adaptive usage only, "
-                    "not physical speedup."
+                    "policy note: head/block/token policies remain masking/adaptive usage only; "
+                    "MLP policy can physically skip FFN chunks at eval when hard batch-shared gates are used."
                 )
         if opt.load_pretrain:
             self.load_ckpt(self.model, None, opt.name, opt.backbone)
@@ -1215,6 +1223,7 @@ class Model(nn.Module):
                     head_weight=self.opt.policy_head_weight,
                     block_weight=self.opt.policy_block_weight,
                     token_weight=self.opt.policy_token_weight,
+                    mlp_weight=self.opt.policy_mlp_weight,
                 )
             policy_cost = (
                 float(self.opt.policy_head_weight)
@@ -1223,6 +1232,8 @@ class Model(nn.Module):
                 * float(dynamic_state.get("mean_block_keep", 1.0))
                 + float(self.opt.policy_token_weight)
                 * float(dynamic_state.get("mean_token_keep", 1.0))
+                + float(self.opt.policy_mlp_weight)
+                * float(dynamic_state.get("mean_mlp_keep", 1.0))
             )
             self.last_aux_losses["dynamic_policy_budget_lambda"] = float(budget_lambda)
             self.last_aux_losses["dynamic_policy_target_compute_ratio"] = float(
@@ -1242,6 +1253,9 @@ class Model(nn.Module):
             )
             self.last_aux_losses["dynamic_policy_mean_token_keep"] = float(
                 dynamic_state.get("mean_token_keep", 1.0)
+            )
+            self.last_aux_losses["dynamic_policy_mean_mlp_keep"] = float(
+                dynamic_state.get("mean_mlp_keep", 1.0)
             )
             self.last_aux_losses["dynamic_policy_min"] = float(
                 dynamic_state.get("policy_min", 1.0)

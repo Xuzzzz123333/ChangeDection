@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dinov3.utils import cat_keep_shapes, uncat_with_shapes
 
 
@@ -75,6 +76,8 @@ class DynamicPolicyNet(nn.Module):
         use_head_policy: bool = True,
         use_block_policy: bool = False,
         use_token_policy: bool = False,
+        use_mlp_policy: bool = False,
+        num_mlp_chunks: int = 4,
         init_keep_prob: float = DEFAULT_POLICY_INIT_KEEP_PROB,
     ):
         super().__init__()
@@ -84,19 +87,22 @@ class DynamicPolicyNet(nn.Module):
         self.use_head_policy = bool(use_head_policy)
         self.use_block_policy = bool(use_block_policy)
         self.use_token_policy = bool(use_token_policy)
+        self.use_mlp_policy = bool(use_mlp_policy)
+        self.num_mlp_chunks = int(max(1, num_mlp_chunks))
 
         self.fc1 = nn.Linear(embed_dim * 4, hidden_dim)
         self.act = nn.GELU()
         self.head_head = nn.Linear(hidden_dim, self.num_heads) if self.use_head_policy else None
         self.block_head = nn.Linear(hidden_dim, 1) if self.use_block_policy else None
         self.token_head = nn.Linear(hidden_dim, self.num_patch_tokens) if self.use_token_policy else None
+        self.mlp_head = nn.Linear(hidden_dim, self.num_mlp_chunks) if self.use_mlp_policy else None
         self.reset_parameters(init_keep_prob=init_keep_prob)
 
     def reset_parameters(self, init_keep_prob: float = DEFAULT_POLICY_INIT_KEEP_PROB):
         nn.init.trunc_normal_(self.fc1.weight, std=0.02)
         nn.init.zeros_(self.fc1.bias)
         init_bias = safe_inverse_sigmoid(init_keep_prob)
-        for head in (self.head_head, self.block_head, self.token_head):
+        for head in (self.head_head, self.block_head, self.token_head, self.mlp_head):
             if head is None:
                 continue
             nn.init.zeros_(head.weight)
@@ -125,6 +131,7 @@ class DynamicPolicyNet(nn.Module):
             "head_logits": self.head_head(hidden) if self.head_head is not None else None,
             "block_logits": self.block_head(hidden) if self.block_head is not None else None,
             "token_logits": self.token_head(hidden) if self.token_head is not None else None,
+            "mlp_logits": self.mlp_head(hidden) if self.mlp_head is not None else None,
         }
 
 
@@ -248,3 +255,120 @@ class PolicyAwareSelfAttention(nn.Module):
         x_flat = self.proj(x_flat)
         x_flat = self.proj_drop(x_flat)
         return uncat_with_shapes(x_flat, shapes, num_tokens)
+
+
+class PolicyAwareMLP(nn.Module):
+    def __init__(
+        self,
+        mlp: nn.Module,
+        layer_index: int,
+        num_chunks: int = 4,
+        policy_threshold: float = 0.5,
+    ):
+        super().__init__()
+        if not hasattr(mlp, "fc1") or not hasattr(mlp, "fc2"):
+            raise TypeError(
+                f"PolicyAwareMLP currently supports Mlp-style modules with fc1/fc2, got {type(mlp).__name__}."
+            )
+        hidden_features = int(mlp.fc1.out_features)
+        if hidden_features <= 0:
+            raise ValueError(f"MLP hidden dimension must be > 0, got {hidden_features}.")
+        self.layer_index = int(layer_index)
+        self.num_chunks = int(max(1, num_chunks))
+        if hidden_features % self.num_chunks != 0:
+            raise ValueError(
+                f"MLP hidden dimension {hidden_features} must be divisible by num_chunks={self.num_chunks}."
+            )
+        self.hidden_features = hidden_features
+        self.chunk_size = hidden_features // self.num_chunks
+        self.policy_threshold = float(policy_threshold)
+        self.fc1 = mlp.fc1
+        self.act = mlp.act
+        self.fc2 = mlp.fc2
+        self.drop = getattr(mlp, "drop", nn.Identity())
+        self._runtime_chunk_policy = None
+
+    def set_runtime_chunk_policy(self, chunk_policy: Optional[torch.Tensor]):
+        self._runtime_chunk_policy = chunk_policy
+
+    def clear_runtime_chunk_policy(self):
+        self._runtime_chunk_policy = None
+
+    def _resolve_chunk_policy(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        policy = self._runtime_chunk_policy
+        if policy is None:
+            return None
+        if policy.ndim != 2:
+            raise ValueError(
+                f"Runtime MLP chunk policy for layer {self.layer_index} must have shape [B,G] or [1,G], got {tuple(policy.shape)}."
+            )
+        if policy.shape[1] != self.num_chunks:
+            raise ValueError(
+                f"Runtime MLP chunk policy chunk mismatch at layer {self.layer_index}: expected {self.num_chunks}, got {policy.shape[1]}."
+            )
+        batch_size = x.shape[0]
+        if policy.shape[0] == 1:
+            policy = policy.expand(batch_size, -1)
+        elif policy.shape[0] != batch_size:
+            raise ValueError(
+                f"Runtime MLP chunk policy batch mismatch at layer {self.layer_index}: expected 1 or {batch_size}, got {policy.shape[0]}."
+            )
+        return policy.to(device=x.device, dtype=x.dtype)
+
+    def _forward_full(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+    def _forward_soft_mask(self, x: torch.Tensor, policy: torch.Tensor) -> torch.Tensor:
+        hidden = self.fc1(x)
+        hidden = self.act(hidden)
+        hidden = self.drop(hidden)
+        batch_size, num_tokens, _ = hidden.shape
+        gate = policy[:, None, :, None].expand(
+            batch_size,
+            num_tokens,
+            self.num_chunks,
+            self.chunk_size,
+        )
+        hidden = hidden.view(batch_size, num_tokens, self.num_chunks, self.chunk_size) * gate
+        hidden = hidden.reshape(batch_size, num_tokens, self.hidden_features)
+        out = self.fc2(hidden)
+        out = self.drop(out)
+        return out
+
+    def _forward_hard_skip(self, x: torch.Tensor, policy: torch.Tensor) -> torch.Tensor:
+        active = policy[0] > self.policy_threshold
+        if torch.all(active):
+            return self._forward_full(x)
+        out = None
+        active_indices = torch.nonzero(active, as_tuple=False).flatten().tolist()
+        for chunk_index in active_indices:
+            start = chunk_index * self.chunk_size
+            end = start + self.chunk_size
+            hidden = F.linear(x, self.fc1.weight[start:end], self.fc1.bias[start:end])
+            hidden = self.act(hidden)
+            hidden = self.drop(hidden)
+            contrib = F.linear(hidden, self.fc2.weight[:, start:end], bias=None)
+            out = contrib if out is None else out + contrib
+        if out is None:
+            out = x.new_zeros(*x.shape[:-1], self.fc2.out_features)
+        if self.fc2.bias is not None:
+            out = out + self.fc2.bias.view(1, 1, -1)
+        out = self.drop(out)
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        policy = self._resolve_chunk_policy(x)
+        if policy is None:
+            return self._forward_full(x)
+        if (not self.training) and torch.allclose(
+            policy, policy[:1].expand_as(policy), atol=1e-6, rtol=0.0
+        ):
+            rounded = torch.round(policy)
+            if torch.allclose(policy, rounded, atol=1e-6, rtol=0.0):
+                return self._forward_hard_skip(x, rounded)
+        return self._forward_soft_mask(x, policy)
